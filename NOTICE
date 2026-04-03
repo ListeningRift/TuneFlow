@@ -1,0 +1,27 @@
+TuneFlow
+Copyright (c) 2026 TuneFlow Authors
+
+This project is licensed under the Apache License, Version 2.0.
+See the LICENSE file for details.
+
+Attribution and upstream references:
+
+1) Qwen architecture references
+   - This project is developed with architecture-level references to
+     Qwen2 / Qwen2.5 CausalLM implementations.
+   - Any copied or adapted source code from upstream projects must retain
+     original copyright and license notices in the corresponding files.
+
+2) Hugging Face Transformers (when applicable)
+   - Upstream project: https://github.com/huggingface/transformers
+   - License: Apache License 2.0
+
+3) Qwen upstream repositories and model pages (when applicable)
+   - https://github.com/QwenLM
+   - https://huggingface.co/Qwen
+
+Additional note:
+- TuneFlow trains from random initialization and does not require
+  official pretrained Qwen weights by default.
+- If external model weights or datasets are used in future, their
+  licenses and usage terms must be checked and complied with separately.

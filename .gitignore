@@ -1,0 +1,63 @@
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# =========================
+# Virtual env
+# =========================
+.venv/
+venv/
+env/
+
+# =========================
+# IDE / OS
+# =========================
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# =========================
+# Logs
+# =========================
+logs/
+*.log
+
+# =========================
+# Data / Outputs (ML common)
+# =========================
+data/**
+outputs/**
+
+# keep directory placeholders
+!data/**/.gitkeep
+!outputs/**/.gitkeep
+
+# =========================
+# Model artifacts
+# =========================
+*.pt
+*.pth
+*.bin
+*.ckpt
+*.safetensors
+*.onnx
+
+# =========================
+# Jupyter
+# =========================
+.ipynb_checkpoints/
