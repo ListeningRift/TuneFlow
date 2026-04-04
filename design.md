@@ -4,7 +4,7 @@
 - 构建基于 Transformer 的 Symbolic MIDI 生成模型。
 - 长期支持三种生成模式：中间补全（Infilling）、续写到结尾（Continuation）、从头生成（Free Generation）。
 - 当前阶段先聚焦 Infilling，把单任务做稳后再扩展其他模式。
-- 首版支持基础风格控制（R&B），后续扩展 Jazz。
+- 首版先不启用 `STYLE_x`，待风格标注数据就绪后再引入风格控制。
 - 建立客观评估体系，主决策不依赖主观听感。
 
 ## 2. 非目标
@@ -18,6 +18,7 @@
 MIDI Dataset
   -> 清洗与切分
   -> Tokenizer（结构化事件序列）
+  -> 乐器归类（生成 `INST_x`，先于 style）
   -> Base Model（阶段1: Infilling 单任务训练）
   -> Base Model（阶段2: 多任务扩展训练）
   -> Style LoRA 微调
@@ -46,22 +47,46 @@ MIDI Dataset
 ## 4. Tokenizer 设计
 
 ### 4.1 Token 类型（首版）
-- `BAR`
-- `POS_0..31`
-- `PITCH_21..108`
-- `DUR_1..32`
-- `VEL_0..15`
-- `TEMPO_x`
-- `STYLE_x`（可选）
+- 结构 token：
+  - `BAR`
+  - `POS_0..31`
+  - `INST_{PIANO|GUITAR|BASS|STRINGS|LEAD|PAD}`
+  - `PITCH_21..108`
+  - `DUR_{1,2,3,4,6,8,12,16,24,32}`
+  - `VEL_0..15`（16 档，非线性分桶：中间更细、两端更稀）
+- 控制 token：
+  - `TEMPO_x`（特殊控制 token）
 - 特殊 token（阶段1）：`BOS` `EOS` `FIM_HOLE` `FIM_MID`
+
+阶段1Token 约束：
+- `TEMPO_x` 只允许在两种位置出现：`BOS` 后的开头位置，或 `BAR` 后（仅当发生速度变化时）。
+- 音符事件统一为四元组顺序：`INST_x PITCH_x DUR_x VEL_x`。
+- `INST_x` 首版仅启用 6 类：`PIANO` `GUITAR` `BASS` `STRINGS` `LEAD` `PAD`。
+- `STYLE_x` 暂不启用；阶段2后按数据集可用性引入，并作为 `BOS` 后的可选单次控制 token。
+- `DUR` 在数据处理时采用“就近映射”到上述 10 个常用档位（含 triplet：`3/6/12/24`）。
+- `VEL` 使用“中心对称 μ-law 压扩 + 16 档均匀量化”（中间更细、两端更稀），固定参数：
+  - `μ = 8`，`c = 64`（中心），`r = 63`（半幅）
+  - 编码（MIDI velocity `v in [1,127]` -> `VEL_k`）：
+    - `x = (clip(v,1,127) - c) / r`
+    - `s = sign(x) * ln(1 + μ*abs(x)) / ln(1 + μ)`
+    - `k = clip(round(((s + 1) / 2) * 15), 0, 15)`
+  - 解码（`VEL_k` -> velocity）：
+    - `s_hat = 2*k/15 - 1`
+    - `x_hat = sign(s_hat) * (((1 + μ)^abs(s_hat) - 1) / μ)`
+    - `v_hat = clip(round(c + r*x_hat), 1, 127)`
+  - 约束：数据中若出现 `velocity=0`（常见于 note-off 事件）不参与音符力度建模；若被写入音符力度字段则先夹到 `1` 再编码。
 
 阶段2扩展（按需引入）：
 - 任务 token：`TASK_INFILL` `TASK_CONT` `TASK_GEN`
 
 ### 4.2 序列格式
 ```
-BAR POS_0 PITCH_60 DUR_4 VEL_10
-POS_4 PITCH_62 DUR_4 VEL_9
+BOS TEMPO_120
+BAR POS_0 INST_PIANO PITCH_60 DUR_4 VEL_10
+POS_4 INST_PIANO PITCH_62 DUR_3 VEL_9
+BAR TEMPO_128
+POS_0 INST_LEAD PITCH_67 DUR_8 VEL_11
+EOS
 ```
 
 ### 4.3 工程化定义（输入/输出/验收）
@@ -76,6 +101,11 @@ POS_4 PITCH_62 DUR_4 VEL_9
   - 100% 样本可编码；解码回 MIDI 不报错
   - 词表规模在 `200~320`
   - token 非法顺序率 `< 1%`
+
+### 4.4 乐器 Token 引入顺序（先于 Style）
+- `INST_x` 的构建放在 style 处理之前，先保证“乐器语义正确”，再做 `STYLE_x`。
+- 首阶段清洗/切分可先聚焦主轨（如 Piano/Lead）保证数据干净，后续再扩展多轨并映射到 6 类乐器。
+- 在 `STYLE_x` 引入前，`tokenize_dataset.py` 先完成 `INST_x` 的词表与样本写入。
 
 ## 5. 数据工程
 
@@ -117,18 +147,18 @@ POS_4 PITCH_62 DUR_4 VEL_9
 raw MIDI
   -> clean_dataset.py
   -> split_dataset.py
-  -> tokenize_dataset.py
+  -> tokenize_dataset.py（含 INST_x 归类）
   -> build_training_data.py
   -> train.bin / train.idx
 ```
 
 ### 6.2 分步 I/O 与验收
-| 步骤 | 脚本                     | 输入                        | 输出                                   | 验收标准                     |
-| ---- | ------------------------ | --------------------------- | -------------------------------------- | ---------------------------- |
-| 1    | `clean_dataset.py`       | `data/raw`                  | `data/clean` + `clean_report.json`     | 可用样本率、过滤原因统计完整 |
-| 2    | `split_dataset.py`       | `data/clean`                | `data/base/style/eval` 切分清单        | 无跨集合泄漏                 |
-| 3    | `tokenize_dataset.py`    | 切分清单 + `tokenizer.yaml` | `data/tokenized/*.tok` + `token_stats.json` | OOV=0，非法顺序率达标    |
-| 4    | `build_training_data.py` | `data/tokenized/*.tok`      | `data/tokenized/train.bin/.idx` 等     | 可被训练脚本直接加载         |
+| 步骤 | 脚本                     | 输入                        | 输出                                        | 验收标准                     |
+| ---- | ------------------------ | --------------------------- | ------------------------------------------- | ---------------------------- |
+| 1    | `clean_dataset.py`       | `data/raw`                  | `data/clean` + `clean_report.json`          | 可用样本率、过滤原因统计完整 |
+| 2    | `split_dataset.py`       | `data/clean`                | `data/base/style/eval` 切分清单             | 无跨集合泄漏                 |
+| 3    | `tokenize_dataset.py`    | 切分清单 + `tokenizer.yaml` | `data/tokenized/*.tok` + `token_stats.json` | OOV=0，非法顺序率达标        |
+| 4    | `build_training_data.py` | `data/tokenized/*.tok`      | `data/tokenized/train.bin/.idx` 等          | 可被训练脚本直接加载         |
 
 ### 6.3 失败处理
 - 任一步骤失败即停止，不串行跳过。
@@ -144,7 +174,7 @@ raw MIDI
 
 训练样本格式（阶段1）：
 ```
-BOS [STYLE_RNB] <PREFIX> FIM_HOLE <SUFFIX> FIM_MID <MIDDLE> EOS
+BOS [TEMPO_120] <PREFIX> FIM_HOLE <SUFFIX> FIM_MID <MIDDLE> EOS
 ```
 
 ### 7.2 阶段2（后续）：扩展 Continuation / Free Generation
@@ -152,23 +182,23 @@ BOS [STYLE_RNB] <PREFIX> FIM_HOLE <SUFFIX> FIM_MID <MIDDLE> EOS
   - 输入：`<PREFIX>`
   - 输出：`<REST_TO_EOS>`
 - Free Generation：
-  - 输入：`BOS`（可选风格 token）
+  - 输入：`BOS`（可选 `STYLE_x`，可选 `TEMPO_x`）
   - 输出：`<FULL_SEQUENCE_TO_EOS>`
 
 训练样本格式（阶段2，建议）：
 Infilling：
 ```
-TASK_INFILL BOS [STYLE_RNB] <PREFIX> FIM_HOLE <SUFFIX> FIM_MID <MIDDLE> EOS
+TASK_INFILL BOS [STYLE_x] [TEMPO_x] <PREFIX> FIM_HOLE <SUFFIX> FIM_MID <MIDDLE> EOS
 ```
 
 Continuation：
 ```
-TASK_CONT BOS [STYLE_RNB] <PREFIX> <REST_TO_EOS> EOS
+TASK_CONT BOS [STYLE_x] [TEMPO_x] <PREFIX> <REST_TO_EOS> EOS
 ```
 
 Free Generation：
 ```
-TASK_GEN BOS [STYLE_RNB] <FULL_SEQUENCE_TO_EOS> EOS
+TASK_GEN BOS [STYLE_x] [TEMPO_x] <FULL_SEQUENCE_TO_EOS> EOS
 ```
 
 ### 7.3 工程化定义（输入/输出/验收）
@@ -183,6 +213,11 @@ TASK_GEN BOS [STYLE_RNB] <FULL_SEQUENCE_TO_EOS> EOS
   - `task_loss` 稳定下降
   - 阶段1：Infilling 在固定样本上输出可解析结果
   - 阶段2：三类任务都能在固定样本上输出可解析结果
+
+### 7.4 `STYLE_x` 引入计划
+- 阶段1：不使用 `STYLE_x`（当前数据集无稳定 style 标注）。
+- 阶段2：先保持无 `STYLE_x` 的多任务训练，优先验证任务扩展稳定性。
+- 阶段3（风格数据就绪后）：引入 `STYLE_x`，位置固定为 `BOS` 后可选单次，并同步更新 `tokenizer_vocab.json` 与样本构造逻辑。
 
 ## 8. Mask 策略
 
