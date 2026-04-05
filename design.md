@@ -353,13 +353,18 @@ TuneFlow/
     train/
     eval/
   scripts/
-    clean_dataset.py
-    split_dataset.py
-    tokenize_dataset.py
-    build_training_data.py
-    train_base.py
-    train_lora.py
-    eval_infilling.py
+    data/
+      clean_dataset.py
+      split_dataset.py
+      tokenize_dataset.py
+      build_training_data.py
+      build_data.py
+      validate_data_outputs.py
+    train/
+      train_base.py
+      train_lora.py
+    eval/
+      eval_infilling.py
   src/
     model/
       modeling.py

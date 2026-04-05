@@ -1,0 +1,31 @@
+midi_root_dir: data/clean
+
+positions_per_bar: 32
+
+pitch_min: 21
+pitch_max: 108
+
+duration_bins: [1, 2, 3, 4, 6, 8, 12, 16, 24, 32]
+
+velocity_bins: 16
+velocity_mu: 8.0
+velocity_center: 64.0
+velocity_radius: 63.0
+
+tempo_min: 40
+tempo_max: 220
+tempo_step: 2
+
+# 当前阶段先固定为 Piano
+inst_classes: [PIANO]
+default_inst: PIANO
+
+special_tokens: [BOS, EOS, FIM_HOLE, FIM_MID]
+include_task_tokens: false
+task_tokens: [TASK_INFILL, TASK_CONT, TASK_GEN]
+
+split_files:
+  train: data/base/train.jsonl
+  valid: data/base/valid.jsonl
+  test: data/base/test.jsonl
+  eval: data/eval/fixed_eval.jsonl

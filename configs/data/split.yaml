@@ -1,0 +1,16 @@
+train_ratio: 0.9
+valid_ratio: 0.05
+test_ratio: 0.05
+
+# 固定评估集从 test 中抽取的比例；1.0 表示全部 test 都作为 fixed_eval
+eval_from_test_ratio: 1.0
+
+seed: 42
+recursive: true
+extensions: [".mid", ".midi"]
+
+# 与清洗阶段保持一致的时值量化精度，用于 hash 分组
+dedup_tick_resolution: 12
+
+# 当前阶段不处理风格化切分
+style_disabled: true

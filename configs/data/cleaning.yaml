@@ -1,0 +1,43 @@
+min_note_count: 50
+min_unique_pitch: 5
+drop_if_zero_duration_note: true
+
+# Additional quality guardrails
+min_duration_sec: 10.0
+min_total_bars: 8
+max_total_bars: 512
+bpm_min: 40.0
+bpm_max: 220.0
+keep_first_tempo_only: true
+
+# Keep only piano-usable pitch range
+keep_pitch_min: 21
+keep_pitch_max: 108
+
+# 主轨道选择策略：
+# - piano_first_then_most_notes（推荐）
+# - piano_only
+# - most_notes
+# - none（保留全部轨道）
+track_selection_mode: piano_first_then_most_notes
+piano_program: 0
+
+max_simultaneous_notes: 16
+
+# Drum filtering
+remove_drum_channel_10: true
+# 0-based GM programs for the "Percussive" family
+drum_programs: [112, 113, 114, 115, 116, 117, 118, 119]
+
+# Melody presence check (helps remove drum-only/noisy files)
+min_melody_tracks: 1
+min_notes_per_melody_track: 8
+min_unique_pitch_per_melody_track: 4
+
+# Deduplication on normalized note events
+deduplicate: true
+dedup_tick_resolution: 12
+
+# File scan settings
+recursive: true
+extensions: [".mid", ".midi"]

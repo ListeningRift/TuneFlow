@@ -1,0 +1,10 @@
+tokenized_dir: data/tokenized
+vocab_path: data/tokenized/tokenizer_vocab.json
+
+splits: [train, valid, test, eval]
+
+# auto: vocab<=65535 用 uint16，否则用 uint32
+dtype: auto
+
+# true: 出现 OOV 直接报错；false: 仅计数并继续
+strict_oov: true
