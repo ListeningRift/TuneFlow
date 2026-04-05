@@ -74,6 +74,11 @@ python scripts/data/validate_data_outputs.py
 - `scripts/train/`：训练相关（`train_base.py`、`train_lora.py`）
 - `scripts/eval/`：评估相关（`eval_infilling.py`）
 
+说明（当前分层约定）：
+- `scripts/` 仅保留命令行入口与参数转发（薄封装）。
+- `src/tokenizer/` 存放分词核心实现（由 `scripts/data/tokenize_dataset.py` 调用）。
+- `src/training/` 存放训练核心实现（由 `scripts/train/*.py` 调用）。
+
 ## 许可证与数据合规
 - 许可证：Apache License 2.0（见 [`LICENSE`](./LICENSE)）
 - 数据使用：请遵守各数据集许可证与使用条款
