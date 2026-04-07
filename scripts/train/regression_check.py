@@ -139,6 +139,10 @@ def _build_train_payload(
             "lr": 0.0003,
             "weight_decay": 0.01,
             "grad_clip": 1.0,
+            # 回归测试中固定启用 FIM，确保该分支被覆盖到。
+            "fim_ratio": 1.0,
+            "fim_min_span": 4,
+            "fim_max_span": 16,
             "scheduler": "none",
             "warmup_steps": 0,
             "min_lr_scale": 0.1,
@@ -159,7 +163,7 @@ def main() -> None:
     回归检查主流程：
     1) 训练 1 步并保存 checkpoint。
     2) 从 latest.pt 恢复训练到第 2 步。
-    3) 对该 run 的所有 checkpoint 执行 eval_infilling。
+    3) 对该 run 的所有 checkpoint 执行 eval_infilling 与 eval_continuation。
     4) 校验评估报告包含关键指标字段。
     """
     args = _parse_args()
@@ -167,7 +171,12 @@ def main() -> None:
 
     run_id = args.run_id or f"regression_smoke_{time.strftime('%Y%m%d_%H%M%S')}"
     output_dir = (project_root / "outputs" / "checkpoints" / "base" / run_id).resolve()
-    report_path = (project_root / "outputs" / "reports" / "eval" / f"{run_id}.json").resolve()
+    infilling_report_path = (project_root / "outputs" / "reports" / "eval" / f"{run_id}.json").resolve()
+    infilling_plot_path = infilling_report_path.with_suffix(".png")
+    continuation_report_path = (
+        project_root / "outputs" / "reports" / "eval_continuation" / f"{run_id}.json"
+    ).resolve()
+    continuation_plot_path = continuation_report_path.with_suffix(".png")
     _check_runtime_deps(args.python_exec, project_root)
 
     required = [
@@ -266,21 +275,66 @@ def main() -> None:
         ],
         cwd=project_root,
     )
+    _run_cmd(
+        [
+            args.python_exec,
+            "scripts/eval/eval_continuation.py",
+            "--checkpoint-dir",
+            str(output_dir),
+            "--run-id",
+            run_id,
+            "--device",
+            args.device,
+            "--precision",
+            args.precision,
+            "--seq-len",
+            str(args.seq_len),
+            "--batch-size",
+            str(args.batch_size),
+            "--eval-batches",
+            "1",
+            "--num-continuation-samples",
+            "2",
+            "--max-new-tokens",
+            "32",
+        ],
+        cwd=project_root,
+    )
 
-    _assert_exists(report_path, "eval report missing")
-    report = json.loads(report_path.read_text(encoding="utf-8"))
-    results = report.get("results")
-    if not isinstance(results, list) or not results:
-        raise ValueError(f"eval report has empty results: {report_path}")
+    _assert_exists(infilling_report_path, "infilling eval report missing")
+    infilling_report = json.loads(infilling_report_path.read_text(encoding="utf-8"))
+    infilling_results = infilling_report.get("results")
+    if not isinstance(infilling_results, list) or not infilling_results:
+        raise ValueError(f"infilling eval report has empty results: {infilling_report_path}")
 
-    required_keys = {"valid_loss", "ppl", "structural_validity_rate"}
-    missing = [k for k in required_keys if k not in results[0]]
-    if missing:
-        raise ValueError(f"eval result missing keys {missing}: {report_path}")
+    infilling_required_keys = {"valid_loss", "ppl", "structural_validity_rate"}
+    infilling_missing = [k for k in infilling_required_keys if k not in infilling_results[0]]
+    if infilling_missing:
+        raise ValueError(
+            f"infilling eval result missing keys {infilling_missing}: {infilling_report_path}"
+        )
+    _assert_exists(infilling_plot_path, "infilling eval plot missing")
+
+    _assert_exists(continuation_report_path, "continuation eval report missing")
+    continuation_report = json.loads(continuation_report_path.read_text(encoding="utf-8"))
+    continuation_results = continuation_report.get("results")
+    if not isinstance(continuation_results, list) or not continuation_results:
+        raise ValueError(f"continuation eval report has empty results: {continuation_report_path}")
+
+    continuation_required_keys = {"valid_loss", "ppl", "structural_validity_rate", "first_token_accuracy"}
+    continuation_missing = [k for k in continuation_required_keys if k not in continuation_results[0]]
+    if continuation_missing:
+        raise ValueError(
+            f"continuation eval result missing keys {continuation_missing}: {continuation_report_path}"
+        )
+    _assert_exists(continuation_plot_path, "continuation eval plot missing")
 
     print(f"[regression_check] PASS run_id={run_id}", flush=True)
     print(f"[regression_check] checkpoints={output_dir}", flush=True)
-    print(f"[regression_check] eval_report={report_path}", flush=True)
+    print(f"[regression_check] infilling_eval_report={infilling_report_path}", flush=True)
+    print(f"[regression_check] infilling_eval_plot={infilling_plot_path}", flush=True)
+    print(f"[regression_check] continuation_eval_report={continuation_report_path}", flush=True)
+    print(f"[regression_check] continuation_eval_plot={continuation_plot_path}", flush=True)
 
 
 if __name__ == "__main__":

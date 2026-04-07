@@ -1,4 +1,4 @@
-"""Base 训练入口文件"""
+"""Base 训练入口文件。"""
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ class TokenBinDataset:
 
     def __init__(self, idx_path: Path, bin_path_override: Path | None = None):
         self.idx_path = idx_path
-        # idx 文件里记录了 dtype / offsets / lengths / num_tokens 等元信息
+        # idx 文件中记录了 dtype / offsets / lengths / num_tokens 等元信息。
         idx_payload = json.loads(idx_path.read_text(encoding="utf-8"))
         self.dtype = str(idx_payload.get("dtype", ""))
         if self.dtype not in self._DTYPE_TO_TYPECODE:
@@ -46,16 +46,16 @@ class TokenBinDataset:
         self.num_sequences = len(self.lengths)
         self.num_tokens = int(idx_payload.get("num_tokens", 0))
 
-        # 解析 bin 路径，允许命令行显式覆盖
+        # 解析 bin 路径，允许命令行显式覆盖。
         self.bin_path = self._resolve_bin_path(idx_path, idx_payload, bin_path_override)
         if not self.bin_path.exists():
             raise FileNotFoundError(f"Binary token file not found: {self.bin_path}")
 
-        # 使用 mmap 做零拷贝读取，避免把整份语料一次性加载到内存
+        # 使用 mmap 做零拷贝读取，避免把整份语料一次性加载到内存。
         self._bin_file = self.bin_path.open("rb")
         self._mmap = mmap.mmap(self._bin_file.fileno(), length=0, access=mmap.ACCESS_READ)
         self._token_view = memoryview(self._mmap).cast(self.typecode)
-        # 缓存“长度足够采样”的序列索引，减少重复扫描开销
+        # 缓存“长度足够可采样”的序列索引，减少重复扫描开销。
         self._eligible_cache: dict[int, list[int]] = {}
 
     @staticmethod
@@ -68,8 +68,7 @@ class TokenBinDataset:
         if idx_bin.is_absolute():
             return idx_bin
 
-        # 优先使用 idx.json 中给出的路径（通常是仓库相对路径），
-        # 若不存在，再退化到“相对 idx 文件目录”的解析策略。
+        # 优先使用 idx.json 中记录的路径；不存在时退化到“相对 idx 文件目录”的解析策略。
         if idx_bin.exists():
             return idx_bin.resolve()
         return (idx_path.parent / idx_bin).resolve()
@@ -89,39 +88,134 @@ class TokenBinDataset:
         self._eligible_cache[min_len] = indices
         return indices
 
-    def sample_batch(self, torch_mod, rng: random.Random, batch_size: int, seq_len: int, device):
-        """随机采样 batch，构造自回归训练所需的 input_ids / labels。"""
-        min_len = seq_len + 1
-        candidates = self._eligible_indices(min_len)
+    def _sample_window(self, rng: random.Random, window_len: int) -> list[int]:
+        """随机抽取一个连续窗口（长度为 `window_len`）。"""
+        if window_len <= 0:
+            raise ValueError("window_len must be > 0.")
+
+        candidates = self._eligible_indices(window_len)
         if not candidates:
             raise ValueError(
-                f"No sequence in {self.idx_path} has length >= {min_len}. "
+                f"No sequence in {self.idx_path} has length >= {window_len}. "
                 "Please lower --seq-len or regenerate data."
             )
 
+        seq_idx = candidates[rng.randrange(len(candidates))]
+        seq_offset = self.offsets[seq_idx]
+        seq_total_len = self.lengths[seq_idx]
+        start_in_seq = rng.randrange(seq_total_len - window_len + 1)
+        abs_start = seq_offset + start_in_seq
+        return list(self._token_view[abs_start : abs_start + window_len])
+
+    @staticmethod
+    def _build_fim_example(
+        base_tokens: list[int],
+        rng: random.Random,
+        fim_hole_token_id: int,
+        fim_mid_token_id: int,
+        fim_min_span: int,
+        fim_max_span: int,
+    ) -> tuple[list[int], list[int]]:
+        """
+        基于基础序列构造 FIM 样本：
+        `prefix + FIM_HOLE + suffix + FIM_MID + middle`
+
+        labels 在 `FIM_MID` 之前全部置为 -100，仅对 middle 区域计入损失。
+        """
+        length = len(base_tokens)
+        if length < 4:
+            raise ValueError("FIM base sequence must contain at least 4 tokens.")
+
+        max_span = min(max(1, fim_max_span), length - 2)
+        min_span = min(max(1, fim_min_span), max_span)
+        span = min_span if min_span == max_span else rng.randint(min_span, max_span)
+
+        # 约束 hole 左右都至少保留 1 个 token，避免退化为纯前缀/纯后缀。
+        start = rng.randint(1, length - span - 1)
+        end = start + span
+
+        prefix = base_tokens[:start]
+        middle = base_tokens[start:end]
+        suffix = base_tokens[end:]
+        fim_tokens = [*prefix, fim_hole_token_id, *suffix, fim_mid_token_id, *middle]
+
+        labels = fim_tokens.copy()
+        fim_mid_pos = len(prefix) + 1 + len(suffix)
+        for idx in range(fim_mid_pos + 1):
+            labels[idx] = -100
+        return fim_tokens, labels
+
+    def sample_batch(self, torch_mod, rng: random.Random, batch_size: int, seq_len: int, device):
+        """采样 NEXT batch（labels 与 input_ids 对齐，由模型内部完成 shift）。"""
         input_rows: list[list[int]] = []
         label_rows: list[list[int]] = []
         for _ in range(batch_size):
-            # 先随机抽一条“足够长”的序列，再随机抽一个连续窗口
-            seq_idx = candidates[rng.randrange(len(candidates))]
-            seq_offset = self.offsets[seq_idx]
-            seq_total_len = self.lengths[seq_idx]
-            start_in_seq = rng.randrange(seq_total_len - min_len + 1)
-            abs_start = seq_offset + start_in_seq
-            window = self._token_view[abs_start : abs_start + min_len]
-            # 经典 next-token 训练：输入是前 N，标签是后 N
-            input_rows.append(list(window[:-1]))
-            label_rows.append(list(window[1:]))
+            window = self._sample_window(rng=rng, window_len=seq_len)
+            input_rows.append(window)
+            label_rows.append(window.copy())
 
         input_ids = torch_mod.tensor(input_rows, dtype=torch_mod.long, device=device)
         labels = torch_mod.tensor(label_rows, dtype=torch_mod.long, device=device)
         return input_ids, labels
 
+    def sample_mixed_batch(
+        self,
+        torch_mod,
+        rng: random.Random,
+        batch_size: int,
+        seq_len: int,
+        device,
+        fim_ratio: float,
+        fim_hole_token_id: int | None,
+        fim_mid_token_id: int | None,
+        fim_min_span: int,
+        fim_max_span: int,
+    ):
+        """
+        采样 NEXT + FIM 混合 batch。
+
+        返回 `(input_ids, labels, fim_examples)`，其中 `fim_examples` 为当前 batch 的 FIM 条数。
+        """
+        if not (0.0 <= fim_ratio <= 1.0):
+            raise ValueError(f"fim_ratio must be within [0, 1], got {fim_ratio}.")
+
+        use_fim = fim_ratio > 0.0 and fim_hole_token_id is not None and fim_mid_token_id is not None
+        if use_fim and seq_len <= 2:
+            raise ValueError("seq_len must be > 2 when FIM is enabled.")
+
+        input_rows: list[list[int]] = []
+        label_rows: list[list[int]] = []
+        fim_examples = 0
+
+        for _ in range(batch_size):
+            pick_fim = use_fim and (rng.random() < fim_ratio)
+            if pick_fim:
+                base_tokens = self._sample_window(rng=rng, window_len=seq_len - 2)
+                fim_input, fim_labels = self._build_fim_example(
+                    base_tokens=base_tokens,
+                    rng=rng,
+                    fim_hole_token_id=fim_hole_token_id,
+                    fim_mid_token_id=fim_mid_token_id,
+                    fim_min_span=fim_min_span,
+                    fim_max_span=fim_max_span,
+                )
+                input_rows.append(fim_input)
+                label_rows.append(fim_labels)
+                fim_examples += 1
+            else:
+                window = self._sample_window(rng=rng, window_len=seq_len)
+                input_rows.append(window)
+                label_rows.append(window.copy())
+
+        input_ids = torch_mod.tensor(input_rows, dtype=torch_mod.long, device=device)
+        labels = torch_mod.tensor(label_rows, dtype=torch_mod.long, device=device)
+        return input_ids, labels, fim_examples
+
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    """命令行参数：覆盖训练、评估、保存、恢复等核心开关。"""
+    """构建命令行参数：覆盖训练、评估、保存、恢复等核心开关。"""
     parser = argparse.ArgumentParser(description="TuneFlow base training (real-data loop).")
-    # 配置/数据路径
+    # 配置与数据路径
     parser.add_argument(
         "--model-config",
         type=Path,
@@ -174,7 +268,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Numerical precision mode.",
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
-    # 训练超参
+    # 训练超参数
     parser.add_argument(
         "--steps",
         type=int,
@@ -192,6 +286,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lr", type=float, default=3e-4, help="Peak learning rate.")
     parser.add_argument("--weight-decay", type=float, default=0.01, help="AdamW weight decay.")
     parser.add_argument("--grad-clip", type=float, default=1.0, help="Gradient clipping norm; <=0 disables.")
+    parser.add_argument(
+        "--fim-ratio",
+        type=float,
+        default=0.15,
+        help="Fraction of FIM samples in each training batch, within [0, 1].",
+    )
+    parser.add_argument(
+        "--fim-min-span",
+        type=int,
+        default=8,
+        help="Minimum FIM hole length in tokens.",
+    )
+    parser.add_argument(
+        "--fim-max-span",
+        type=int,
+        default=64,
+        help="Maximum FIM hole length in tokens.",
+    )
     # 学习率调度
     parser.add_argument(
         "--scheduler",
@@ -211,7 +323,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval-every", type=int, default=50, help="Validation interval; <=0 disables.")
     parser.add_argument("--eval-batches", type=int, default=5, help="Validation micro-batches per eval.")
     parser.add_argument("--save-every", type=int, default=100, help="Checkpoint interval; <=0 disables.")
-    # 保存/恢复行为
+    # 保存与恢复行为
     parser.add_argument(
         "--save-best",
         action="store_true",
@@ -251,14 +363,14 @@ def _autocast_context(torch_mod, use_amp: bool, device_type: str, amp_dtype):
 
 def _resolve_precision(torch_mod, requested: str, device):
     """
-    解析精度策略，返回:
+    解析精度策略，返回：
     (effective_name, use_amp, amp_dtype, use_grad_scaler)
     """
     if requested == "fp32":
         return "fp32", False, None, False
 
     if device.type != "cuda":
-        # CPU 不启用半精度 autocast（保持行为明确且稳定）
+        # CPU 不启用半精度 autocast，半精度请求会自动回退到 fp32。
         if requested in {"bf16", "fp16"}:
             print(f"[train_base] precision={requested} requested on {device.type}; fallback to fp32.")
         return "fp32", False, None, False
@@ -291,16 +403,16 @@ def _build_scheduler(torch_mod, optimizer, name: str, total_steps: int, warmup_s
     floor = min(1.0, max(0.0, float(min_lr_scale)))
 
     def lr_lambda(current_step_zero_based: int) -> float:
-        # LambdaLR 传入的是从 0 开始的 step，这里统一换算到从 1 开始
+        # LambdaLR 传入 0-based step，这里统一换算到 1-based。
         step = current_step_zero_based + 1
-        # 1) warmup 阶段线性升温
+        # 1) warmup 阶段线性升温。
         if warmup > 0 and step <= warmup:
             return float(step) / float(warmup)
 
         if total_steps <= warmup:
             return floor
 
-        # 2) warmup 后按 schedule 衰减到 floor
+        # 2) warmup 后按 schedule 衰减到 floor。
         progress = (step - warmup) / float(max(1, total_steps - warmup))
         progress = min(1.0, max(0.0, progress))
 
@@ -315,7 +427,7 @@ def _build_scheduler(torch_mod, optimizer, name: str, total_steps: int, warmup_s
 
 
 def _append_metrics(path: Path, payload: dict) -> None:
-    """以 JSONL 追加一条结构化指标记录。"""
+    """向 JSONL 追加一条结构化指标记录。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8", newline="\n") as file:
         file.write(json.dumps(payload, ensure_ascii=False) + "\n")
@@ -407,7 +519,7 @@ def _evaluate(
                 seq_len=seq_len,
                 device=device,
             )
-            # 评估路径与训练保持一致的精度策略，避免统计口径不一致
+            # 评估阶段与训练保持一致的精度策略，避免统计口径偏差。
             with _autocast_context(torch_mod, use_amp=use_amp, device_type=device.type, amp_dtype=amp_dtype):
                 outputs = model(input_ids=input_ids, labels=labels, return_dict=True)
             losses.append(float(outputs.loss.item()))
@@ -427,8 +539,14 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit("--grad-accum-steps must be > 0.")
     if args.steps <= 0:
         raise SystemExit("--steps must be > 0.")
+    if not (0.0 <= args.fim_ratio <= 1.0):
+        raise SystemExit("--fim-ratio must be within [0, 1].")
+    if args.fim_min_span <= 0:
+        raise SystemExit("--fim-min-span must be > 0.")
+    if args.fim_max_span <= 0:
+        raise SystemExit("--fim-max-span must be > 0.")
 
-    # 先设全局种子，再创建独立 run_rng（用于数据采样）
+    # 先设全局随机种子，再创建独立 run_rng（用于数据采样）。
     random.seed(args.seed)
     run_rng = random.Random(args.seed)
     torch.manual_seed(args.seed)
@@ -441,12 +559,18 @@ def main(argv: list[str] | None = None) -> None:
             f"--seq-len ({args.seq_len}) exceeds model max_position_embeddings "
             f"({config.max_position_embeddings})."
         )
+    fim_hole_token_id = config.special_token_ids.get("FIM_HOLE")
+    fim_mid_token_id = config.special_token_ids.get("FIM_MID")
+    if args.fim_ratio > 0 and (fim_hole_token_id is None or fim_mid_token_id is None):
+        raise SystemExit(
+            "--fim-ratio > 0 but FIM_HOLE/FIM_MID token id is missing in model config."
+        )
 
     train_dataset = TokenBinDataset(args.train_idx, args.train_bin)
     valid_dataset = TokenBinDataset(args.valid_idx, args.valid_bin) if args.valid_idx.exists() else None
 
     device = resolve_torch_device(torch, args.device)
-    # 精度解析：决定是否使用 AMP、使用哪种 dtype、是否启用 GradScaler
+    # 精度解析：决定是否使用 AMP、使用哪种 dtype、是否启用 GradScaler。
     precision_name, use_amp, amp_dtype, use_scaler = _resolve_precision(
         torch_mod=torch, requested=args.precision, device=device
     )
@@ -466,7 +590,7 @@ def main(argv: list[str] | None = None) -> None:
     start_step = 0
     best_valid_loss = float("inf")
     if args.resume_from is not None:
-        # 恢复训练状态（含 scheduler/scaler/RNG）
+        # 恢复训练状态（模型/优化器/scheduler/scaler/RNG）。
         if not args.resume_from.exists():
             raise FileNotFoundError(f"resume checkpoint not found: {args.resume_from}")
         ckpt = _load_checkpoint(torch, args.resume_from)
@@ -495,7 +619,7 @@ def main(argv: list[str] | None = None) -> None:
     print(
         f"[train_base] params={total_params:,} device={device} precision={precision_name} "
         f"steps={args.steps} batch={args.batch_size} grad_accum={args.grad_accum_steps} "
-        f"effective_batch={effective_batch} seq_len={args.seq_len}"
+        f"effective_batch={effective_batch} seq_len={args.seq_len} fim_ratio={args.fim_ratio:.2f}"
     )
     print(
         f"[train_base] train={train_dataset.idx_path} ({train_dataset.num_sequences} seqs, "
@@ -508,7 +632,7 @@ def main(argv: list[str] | None = None) -> None:
         )
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    # 默认把指标写到 output_dir/metrics.jsonl
+    # 默认把指标写到 output_dir/metrics.jsonl。
     metrics_path = args.metrics_path if args.metrics_path is not None else (args.output_dir / "metrics.jsonl")
     _append_metrics(
         metrics_path,
@@ -522,6 +646,9 @@ def main(argv: list[str] | None = None) -> None:
             "lr": args.lr,
             "effective_batch": effective_batch,
             "seq_len": args.seq_len,
+            "fim_ratio": args.fim_ratio,
+            "fim_min_span": args.fim_min_span,
+            "fim_max_span": args.fim_max_span,
             "resume_from": None if args.resume_from is None else str(args.resume_from),
         },
     )
@@ -536,42 +663,49 @@ def main(argv: list[str] | None = None) -> None:
             optimizer.zero_grad(set_to_none=True)
 
             step_loss = 0.0
+            step_fim_examples = 0
             for _ in range(args.grad_accum_steps):
-                input_ids, labels = train_dataset.sample_batch(
+                input_ids, labels, fim_examples = train_dataset.sample_mixed_batch(
                     torch_mod=torch,
                     rng=run_rng,
                     batch_size=args.batch_size,
                     seq_len=args.seq_len,
                     device=device,
+                    fim_ratio=args.fim_ratio,
+                    fim_hole_token_id=fim_hole_token_id,
+                    fim_mid_token_id=fim_mid_token_id,
+                    fim_min_span=args.fim_min_span,
+                    fim_max_span=args.fim_max_span,
                 )
                 with _autocast_context(
                     torch_mod=torch, use_amp=use_amp, device_type=device.type, amp_dtype=amp_dtype
                 ):
                     outputs = model(input_ids=input_ids, labels=labels, return_dict=True)
                     raw_loss = outputs.loss
-                    # 梯度累积：每个 micro-step loss 按累积步数做缩放
+                    # 梯度累积：每个 micro-step 的 loss 按累积步数缩放。
                     scaled_loss = raw_loss / args.grad_accum_steps
 
                 if not torch.isfinite(raw_loss):
                     raise FloatingPointError(f"Non-finite loss at step {step}: {float(raw_loss.item())}")
 
                 if scaler is not None:
-                    # fp16 路径：先 scale 再 backward
+                    # fp16 路径：先 scale 再 backward。
                     scaler.scale(scaled_loss).backward()
                 else:
                     scaled_loss.backward()
                 step_loss += float(raw_loss.item())
+                step_fim_examples += int(fim_examples)
 
             step_loss /= args.grad_accum_steps
 
             if scaler is not None:
-                # clip 前先 unscale，保证梯度范数语义正确
+                # clip 前先 unscale，确保梯度范数语义正确。
                 scaler.unscale_(optimizer)
             if args.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
 
             if scaler is not None:
-                # fp16 路径：step + update
+                # fp16 路径：step + update。
                 scaler.step(optimizer)
                 scaler.update()
             else:
@@ -582,6 +716,8 @@ def main(argv: list[str] | None = None) -> None:
 
             current_lr = float(optimizer.param_groups[0]["lr"])
             interval_tokens += args.batch_size * args.seq_len * args.grad_accum_steps
+            step_total_examples = args.batch_size * args.grad_accum_steps
+            step_fim_ratio = step_fim_examples / max(1, step_total_examples)
 
             should_log = step == start_step + 1 or (args.log_every > 0 and step % args.log_every == 0)
             if should_log:
@@ -592,7 +728,8 @@ def main(argv: list[str] | None = None) -> None:
                     f"[train_base] step={step}/{args.steps} "
                     f"loss={step_loss:.6f} "
                     f"lr={current_lr:.6e} "
-                    f"tok/s={toks_per_sec:.1f}"
+                    f"tok/s={toks_per_sec:.1f} "
+                    f"fim_in_batch={step_fim_examples}/{step_total_examples}({step_fim_ratio:.2f})"
                 )
                 _append_metrics(
                     metrics_path,
@@ -603,6 +740,8 @@ def main(argv: list[str] | None = None) -> None:
                         "loss": step_loss,
                         "lr": current_lr,
                         "tok_per_sec": toks_per_sec,
+                        "fim_examples": step_fim_examples,
+                        "fim_ratio_in_batch": step_fim_ratio,
                     },
                 )
                 interval_start = now
@@ -637,7 +776,7 @@ def main(argv: list[str] | None = None) -> None:
                     },
                 )
                 if args.save_best and val_loss < best_valid_loss:
-                    # 仅在指标变优时覆盖 best.pt
+                    # 仅在指标变优时覆盖 best.pt。
                     best_valid_loss = val_loss
                     best_path = args.output_dir / "best.pt"
                     _save_checkpoint(
@@ -668,7 +807,7 @@ def main(argv: list[str] | None = None) -> None:
                     model_config=config,
                     args=args,
                 )
-                # 同步一个 latest.pt 便于自动恢复
+                # 同步一份 latest.pt，便于自动恢复。
                 shutil.copy2(step_ckpt, args.output_dir / "latest.pt")
 
         final_ckpt = args.output_dir / "last.pt"
@@ -689,7 +828,7 @@ def main(argv: list[str] | None = None) -> None:
         total_elapsed = time.perf_counter() - run_start
         print(f"[train_base] done in {total_elapsed:.2f}s")
     finally:
-        # 无论训练是否异常退出，都确保释放数据句柄
+        # 无论训练是否异常退出，都确保释放数据句柄。
         train_dataset.close()
         if valid_dataset is not None:
             valid_dataset.close()
@@ -697,3 +836,6 @@ def main(argv: list[str] | None = None) -> None:
 
 if __name__ == "__main__":
     main()
+
+
+

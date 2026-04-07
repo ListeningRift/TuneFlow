@@ -20,6 +20,10 @@ train:
   lr: 0.0003
   weight_decay: 0.01
   grad_clip: 1.0
+  # NEXT + FIM 混合训练：续写为主，FIM 为辅
+  fim_ratio: 0.15
+  fim_min_span: 8
+  fim_max_span: 64
 
   # Scheduler
   scheduler: cosine

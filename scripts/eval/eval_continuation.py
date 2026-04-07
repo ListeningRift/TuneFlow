@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""评估 base 训练产物的最小闭环指标（valid_loss / ppl / 结构合法率）。"""
+"""评估 base 训练产物的 continuation/续写闭环指标。"""
 
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ def _ensure_project_root_on_path() -> Path:
 
 def _parse_args() -> argparse.Namespace:
     """解析评估命令行参数。"""
-    parser = argparse.ArgumentParser(description="对一个 run 下的全部 checkpoint 执行 infilling 评估。")
+    parser = argparse.ArgumentParser(description="对一个 run 下的全部 checkpoint 执行 continuation 评估。")
     parser.add_argument(
         "--checkpoint-dir",
         type=Path,
@@ -43,7 +43,7 @@ def _parse_args() -> argparse.Namespace:
         "--output-path",
         type=Path,
         default=None,
-        help="可选报告输出路径；默认 outputs/reports/eval/<run_id>.json。",
+        help="可选报告输出路径；默认 outputs/reports/eval_continuation/<run_id>.json。",
     )
     parser.add_argument(
         "--model-config",
@@ -67,7 +67,7 @@ def _parse_args() -> argparse.Namespace:
         "--eval-tok",
         type=Path,
         default=Path("data/tokenized/eval.tok"),
-        help="用于构造 infilling prompt 的评估 token 文件。",
+        help="用于构造 continuation prompt 的评估 token 文件。",
     )
     parser.add_argument(
         "--vocab-path",
@@ -108,16 +108,22 @@ def _parse_args() -> argparse.Namespace:
         help="每个 checkpoint 评估的验证 batch 数。",
     )
     parser.add_argument(
-        "--num-infilling-samples",
+        "--num-continuation-samples",
         type=int,
         default=32,
-        help="每个 checkpoint 用于结构合法率评估的 infilling 样本数。",
+        help="每个 checkpoint 用于续写生成评估的样本数。",
     )
     parser.add_argument(
         "--max-new-tokens",
         type=int,
         default=128,
-        help="每条 infilling prompt 最大生成 token 数。",
+        help="每条 continuation prompt 最大生成 token 数。",
+    )
+    parser.add_argument(
+        "--min-prefix-tokens",
+        type=int,
+        default=16,
+        help="构造 continuation prompt 时保留的最小 prefix token 数。",
     )
     parser.add_argument(
         "--limit-checkpoints",
@@ -155,13 +161,7 @@ def _discover_checkpoints(checkpoint_dir: Path, limit: int | None) -> list[Path]
 
 
 def _load_vocab(vocab_path: Path) -> tuple[dict[str, int], list[str]]:
-    """
-    读取词表并返回双向映射所需结构。
-
-    返回：
-    - token_to_id: dict[str, int]
-    - id_to_token: list[str]
-    """
+    """读取词表，并返回 token->id / id->token 映射。"""
     payload = json.loads(vocab_path.read_text(encoding="utf-8"))
     token_to_id = payload.get("token_to_id")
     if not isinstance(token_to_id, dict):
@@ -287,16 +287,18 @@ def _evaluate_valid_loss(
     return sum(losses) / len(losses)
 
 
-def _build_infilling_prompt(
+def _build_continuation_prompt(
     source_tokens: list[str],
     max_positions: int,
+    min_prefix_tokens: int,
     rng: random.Random,
-) -> tuple[list[str], list[str], int] | None:
+) -> tuple[list[str], list[str]] | None:
     """
-    从完整 token 序列构造 infilling prompt。
+    从完整 token 序列构造 continuation prompt。
 
-    形式：
-    `prefix + FIM_HOLE + suffix + FIM_MID`
+    返回：
+    - prompt_tokens：给模型的 prefix（不含 EOS）
+    - target_tokens：对应的真实续写目标（含 EOS）
     """
     if len(source_tokens) < 30:
         return None
@@ -304,36 +306,30 @@ def _build_infilling_prompt(
         return None
 
     core = source_tokens[1:-1]
-    if len(core) < 20:
+    suffix_floor = 8
+    if len(core) < max(min_prefix_tokens + suffix_floor, 24):
         return None
 
-    # 控制序列长度，避免超过模型上下文窗口。
-    max_core_len = max(24, max_positions - 8)
+    max_core_len = max(min_prefix_tokens + suffix_floor, max_positions - 8)
     if len(core) > max_core_len:
         start = rng.randrange(len(core) - max_core_len + 1)
         core = core[start : start + max_core_len]
 
-    seq = ["BOS", *core, "EOS"]
     core_len = len(core)
-    hole_len = max(8, int(round(core_len * 0.2)))
-    hole_len = min(hole_len, 96, core_len - 4)
-    if hole_len <= 0:
+    min_prefix = max(1, min(int(min_prefix_tokens), core_len - suffix_floor))
+    max_prefix = max(min_prefix, core_len - suffix_floor)
+    if min_prefix > max_prefix:
         return None
 
-    hole_start_core = rng.randrange(0, core_len - hole_len + 1)
-    hole_start = 1 + hole_start_core
-    hole_end = hole_start + hole_len
-
-    prefix = seq[:hole_start]
-    # suffix 不含 EOS，要求模型先生成 middle，再生成 EOS 结束。
-    suffix = seq[hole_end:-1]
-    prompt_tokens = [*prefix, "FIM_HOLE", *suffix, "FIM_MID"]
+    prefix_len = rng.randint(min_prefix, max_prefix)
+    prompt_tokens = ["BOS", *core[:prefix_len]]
+    target_tokens = [*core[prefix_len:], "EOS"]
     if len(prompt_tokens) >= max_positions:
         return None
-    return prompt_tokens, prefix, len(suffix)
+    return prompt_tokens, target_tokens
 
 
-def _generate_middle_tokens(
+def _generate_continuation_tokens(
     model,
     torch_mod,
     prompt_tokens: list[str],
@@ -346,7 +342,7 @@ def _generate_middle_tokens(
     max_positions: int,
     max_new_tokens: int,
 ) -> tuple[list[str], bool]:
-    """基于 prompt 执行贪心解码，返回 middle token 与是否遇到 EOS。"""
+    """基于 prefix 执行贪心解码，返回续写 token 与是否遇到 EOS。"""
     prompt_ids: list[int] = []
     for token in prompt_tokens:
         token_id = token_to_id.get(token)
@@ -355,12 +351,12 @@ def _generate_middle_tokens(
         prompt_ids.append(token_id)
 
     input_ids = torch_mod.tensor([prompt_ids], dtype=torch_mod.long, device=device)
-    middle_tokens: list[str] = []
+    generated_tokens: list[str] = []
     reached_eos = False
 
     max_can_generate = max(0, min(max_new_tokens, max_positions - int(input_ids.shape[1])))
     if max_can_generate <= 0:
-        return middle_tokens, reached_eos
+        return generated_tokens, reached_eos
 
     with torch_mod.no_grad():
         for _ in range(max_can_generate):
@@ -373,23 +369,23 @@ def _generate_middle_tokens(
                 outputs = model(input_ids=input_ids, return_dict=True)
             next_id = int(torch_mod.argmax(outputs.logits[:, -1, :], dim=-1).item())
             if next_id < 0 or next_id >= len(id_to_token):
-                return middle_tokens, False
+                return generated_tokens, False
 
             next_token = id_to_token[next_id]
             if next_token == "EOS":
                 reached_eos = True
                 break
-            middle_tokens.append(next_token)
+            generated_tokens.append(next_token)
 
             next_ids = torch_mod.tensor([[next_id]], dtype=torch_mod.long, device=device)
             input_ids = torch_mod.cat([input_ids, next_ids], dim=1)
             if int(input_ids.shape[1]) >= max_positions:
                 break
 
-    return middle_tokens, reached_eos
+    return generated_tokens, reached_eos
 
 
-def _evaluate_structural_validity(
+def _evaluate_continuation_quality(
     model,
     torch_mod,
     eval_rows: list[list[str]],
@@ -403,35 +399,45 @@ def _evaluate_structural_validity(
     max_positions: int,
     num_samples: int,
     max_new_tokens: int,
+    min_prefix_tokens: int,
     rng: random.Random,
-) -> tuple[float, int, int]:
+) -> tuple[float, int, int, float, int, int]:
     """
-    评估结构合法率。
+    评估续写生成质量。
 
-    流程：
-    1) 从 eval 样本随机构造 infilling prompt；
-    2) 让模型生成 middle；
-    3) 重建为完整序列并做结构语法校验。
+    输出：
+    - 结构合法率
+    - 结构合法条数
+    - 总尝试条数
+    - 首 token 命中率
+    - 首 token 命中条数
+    - 首 token 统计总数
     """
     if num_samples <= 0 or not eval_rows:
-        return float("nan"), 0, 0
+        return float("nan"), 0, 0, float("nan"), 0, 0
 
     valid_count = 0
     attempted = 0
+    first_token_hits = 0
+    first_token_total = 0
 
     retries = 0
     max_retries = max(num_samples * 10, 100)
     while attempted < num_samples and retries < max_retries:
         retries += 1
         source_tokens = eval_rows[rng.randrange(len(eval_rows))]
-        built = _build_infilling_prompt(source_tokens=source_tokens, max_positions=max_positions, rng=rng)
+        built = _build_continuation_prompt(
+            source_tokens=source_tokens,
+            max_positions=max_positions,
+            min_prefix_tokens=min_prefix_tokens,
+            rng=rng,
+        )
         if built is None:
             continue
 
-        prompt_tokens, prefix, suffix_len = built
-        # 生成预算受“剩余上下文长度”约束，避免越界。
+        prompt_tokens, target_tokens = built
         dyn_max_new = min(max_new_tokens, max(8, int(round((max_positions - len(prompt_tokens)) * 0.9))))
-        middle_tokens, reached_eos = _generate_middle_tokens(
+        generated_tokens, reached_eos = _generate_continuation_tokens(
             model=model,
             torch_mod=torch_mod,
             prompt_tokens=prompt_tokens,
@@ -445,33 +451,31 @@ def _evaluate_structural_validity(
             max_new_tokens=dyn_max_new,
         )
 
-        # 从 prompt 中提取 suffix（去掉 FIM_HOLE 与 FIM_MID）。
-        suffix = prompt_tokens[len(prefix) + 1 : len(prompt_tokens) - 1]
-        if len(suffix) != suffix_len:
-            suffix = suffix[:suffix_len]
+        target_prefixless = [token for token in target_tokens if token != "EOS"]
+        if target_prefixless:
+            first_token_total += 1
+            if generated_tokens and generated_tokens[0] == target_prefixless[0]:
+                first_token_hits += 1
 
-        reconstructed = [*prefix, *middle_tokens, *suffix, "EOS"]
-        is_valid = reached_eos and _validate_token_order(reconstructed, vocab)
-        if is_valid:
+        reconstructed = [*prompt_tokens, *generated_tokens, "EOS"] if reached_eos else [*prompt_tokens, *generated_tokens]
+        if reached_eos and _validate_token_order(reconstructed, vocab):
             valid_count += 1
         attempted += 1
 
-    if attempted == 0:
-        return float("nan"), 0, 0
-    return valid_count / attempted, valid_count, attempted
+    structural_rate = (valid_count / attempted) if attempted else float("nan")
+    first_token_accuracy = (first_token_hits / first_token_total) if first_token_total else float("nan")
+    return structural_rate, valid_count, attempted, first_token_accuracy, first_token_hits, first_token_total
 
 
 def _resolve_report_path(run_id: str, output_path: Path | None, project_root: Path) -> Path:
     """解析最终报告输出路径。"""
     if output_path is not None:
         return output_path if output_path.is_absolute() else (project_root / output_path)
-    return project_root / "outputs" / "reports" / "eval" / f"{run_id}.json"
+    return project_root / "outputs" / "reports" / "eval_continuation" / f"{run_id}.json"
 
 
 def main() -> None:
-    """
-    程序入口：按 checkpoint 逐个评估，并输出结构化 JSON 报告。
-    """
+    """程序入口：按 checkpoint 逐个评估 continuation 能力，并输出 JSON 报告。"""
     project_root = _ensure_project_root_on_path()
     os.chdir(project_root)
     args = _parse_args()
@@ -484,7 +488,6 @@ def main() -> None:
     run_id = args.run_id if args.run_id else checkpoint_dir.name
     report_path = _resolve_report_path(run_id=run_id, output_path=args.output_path, project_root=project_root).resolve()
 
-    # 懒加载 torch，确保错误信息更可读，并减少无关场景启动开销。
     from src.utils.config_io import dump_json_file
     from src.utils.report_plots import write_eval_report_plot
     from src.utils.torch_utils import lazy_import_torch, resolve_torch_device
@@ -506,14 +509,12 @@ def main() -> None:
     if not checkpoints:
         raise FileNotFoundError(f"No *.pt checkpoints found under: {checkpoint_dir}")
 
-    # 1) 准备验证集采样器（用于 valid_loss / ppl）。
     valid_idx = args.valid_idx if args.valid_idx.is_absolute() else (project_root / args.valid_idx)
     valid_bin = None
     if args.valid_bin is not None:
         valid_bin = args.valid_bin if args.valid_bin.is_absolute() else (project_root / args.valid_bin)
     valid_dataset = TokenBinDataset(valid_idx.resolve(), None if valid_bin is None else valid_bin.resolve())
 
-    # 2) 准备 infilling 评估样本与词表。
     eval_tok_path = args.eval_tok if args.eval_tok.is_absolute() else (project_root / args.eval_tok)
     eval_rows = _load_eval_tok_lines(eval_tok_path.resolve())
     if not eval_rows:
@@ -524,14 +525,16 @@ def main() -> None:
 
     results: list[dict[str, Any]] = []
     started_at = time.time()
-    print(f"[eval_infilling] run_id={run_id} checkpoints={len(checkpoints)} device={device} precision={precision_name}")
+    print(
+        f"[eval_continuation] run_id={run_id} "
+        f"checkpoints={len(checkpoints)} device={device} precision={precision_name}"
+    )
 
     try:
         for index, ckpt_path in enumerate(checkpoints, start=1):
-            print(f"[eval_infilling] ({index}/{len(checkpoints)}) checkpoint={ckpt_path.name}")
+            print(f"[eval_continuation] ({index}/{len(checkpoints)}) checkpoint={ckpt_path.name}")
             ckpt_payload = _load_checkpoint(torch, ckpt_path)
 
-            # 优先使用 checkpoint 内部保存的模型配置，保证评估与训练一致。
             ckpt_model_cfg = ckpt_payload.get("model_config")
             if isinstance(ckpt_model_cfg, dict):
                 config = DecoderConfig.from_dict(ckpt_model_cfg)
@@ -543,7 +546,6 @@ def main() -> None:
             model.load_state_dict(ckpt_payload["model_state_dict"])
             model.eval()
 
-            # 每个 checkpoint 的有效 seq_len 受对应模型最大位置长度约束。
             eval_seq_len = min(max(1, args.seq_len), int(config.max_position_embeddings))
             rng = random.Random(args.seed + index)
 
@@ -561,7 +563,7 @@ def main() -> None:
                 autocast_context_fn=_autocast_context,
             )
             ppl = _safe_perplexity(valid_loss)
-            struct_rate, struct_valid, struct_total = _evaluate_structural_validity(
+            struct_rate, struct_valid, struct_total, first_acc, first_hits, first_total = _evaluate_continuation_quality(
                 model=model,
                 torch_mod=torch,
                 eval_rows=eval_rows,
@@ -573,8 +575,9 @@ def main() -> None:
                 amp_dtype=amp_dtype,
                 autocast_context_fn=_autocast_context,
                 max_positions=int(config.max_position_embeddings),
-                num_samples=args.num_infilling_samples,
+                num_samples=args.num_continuation_samples,
                 max_new_tokens=args.max_new_tokens,
+                min_prefix_tokens=args.min_prefix_tokens,
                 rng=rng,
             )
 
@@ -587,31 +590,36 @@ def main() -> None:
                 "structural_validity_rate": struct_rate,
                 "structural_valid_count": struct_valid,
                 "structural_total_count": struct_total,
+                "first_token_accuracy": first_acc,
+                "first_token_hit_count": first_hits,
+                "first_token_total_count": first_total,
                 "seq_len": eval_seq_len,
                 "eval_batches": args.eval_batches,
-                "num_infilling_samples": args.num_infilling_samples,
+                "num_continuation_samples": args.num_continuation_samples,
+                "min_prefix_tokens": args.min_prefix_tokens,
             }
             results.append(result)
             print(
-                f"[eval_infilling] step={result['step']} "
+                f"[eval_continuation] step={result['step']} "
                 f"valid_loss={valid_loss:.6f} ppl={ppl:.6f} "
-                f"struct_valid={struct_rate:.4f} ({struct_valid}/{struct_total})"
+                f"struct_valid={struct_rate:.4f} ({struct_valid}/{struct_total}) "
+                f"first_acc={first_acc:.4f} ({first_hits}/{first_total})"
             )
 
             del model
             if device.type == "cuda":
-                # 防止多 checkpoint 连续评估时显存积压。
                 torch.cuda.empty_cache()
     finally:
         valid_dataset.close()
 
-    # 汇总 run 级别统计，便于快速看趋势与最优点。
     finite_losses = [r["valid_loss"] for r in results if math.isfinite(float(r["valid_loss"]))]
     finite_struct = [r["structural_validity_rate"] for r in results if math.isfinite(float(r["structural_validity_rate"]))]
+    finite_first = [r["first_token_accuracy"] for r in results if math.isfinite(float(r["first_token_accuracy"]))]
     summary = {
         "checkpoint_count": len(results),
         "best_valid_loss": (min(finite_losses) if finite_losses else float("nan")),
         "best_structural_validity_rate": (max(finite_struct) if finite_struct else float("nan")),
+        "best_first_token_accuracy": (max(finite_first) if finite_first else float("nan")),
         "elapsed_sec": max(0.0, time.time() - started_at),
     }
 
@@ -626,8 +634,9 @@ def main() -> None:
             "seq_len": args.seq_len,
             "batch_size": args.batch_size,
             "eval_batches": args.eval_batches,
-            "num_infilling_samples": args.num_infilling_samples,
+            "num_continuation_samples": args.num_continuation_samples,
             "max_new_tokens": args.max_new_tokens,
+            "min_prefix_tokens": args.min_prefix_tokens,
             "seed": args.seed,
             "valid_idx": str(valid_idx.resolve()),
             "valid_bin": None if valid_bin is None else str(valid_bin.resolve()),
@@ -645,15 +654,16 @@ def main() -> None:
     plot_path = write_eval_report_plot(
         report_path=report_path,
         report=report,
-        title="Infilling Eval Report",
+        title="Continuation Eval Report",
         metric_specs=[
             {"key": "valid_loss", "label": "Valid Loss", "color": "#2563eb"},
             {"key": "ppl", "label": "Perplexity", "color": "#dc2626"},
             {"key": "structural_validity_rate", "label": "Structural Validity Rate", "color": "#059669", "percent": True},
+            {"key": "first_token_accuracy", "label": "First Token Accuracy", "color": "#7c3aed", "percent": True},
         ],
     )
-    print(f"[eval_infilling] report -> {report_path}")
-    print(f"[eval_infilling] plot -> {plot_path}")
+    print(f"[eval_continuation] report -> {report_path}")
+    print(f"[eval_continuation] plot -> {plot_path}")
 
 
 if __name__ == "__main__":

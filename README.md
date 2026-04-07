@@ -1,56 +1,51 @@
 # TuneFlow
 
-TuneFlow 是一个面向 Symbolic MIDI 的音乐生成项目，目标是成为创作者的“音乐版 Copilot”：支持中间补全、续写到结尾、从头生成，并逐步实现风格可控生成。
-
+TuneFlow 是一个面向 Symbolic MIDI 的生成项目，目标是做成编曲场景里的 Copilot。
+当前重点能力包括：
+- 中间补全（Infilling）
+- 前缀续写（Continuation）
+- 从头生成（Free Generation）
 
 ## 项目定位
-- 任务：MIDI Infilling + Continuation + Free Generation
-- 方向：结构正确、可控、可评估的符号级音乐生成
-- 场景：旋律续写、编曲补洞、整段草稿生成、风格化生成
+- 任务形态：MIDI Infilling + Continuation + Free Generation
+- 能力方向：结构正确、可控、可评估的符号级音乐生成
+- 使用场景：旋律续写、片段补全、整段草稿生成、风格化生成
 
 ## Roadmap
-- M1：数据与 Tokenizer 流程打通
-- M2：基础模型达到首版验收门槛
+- M1：打通数据与 Tokenizer 流程
+- M2：基础模型达到首版可用
 - M3：风格化微调首版可用
-- M4：规模与质量持续优化
-
-## 愿景
-TuneFlow 希望把“补全”从一次性生成能力，升级为创作链路中的长期协作能力。  
-我们关注的不只是生成结果，更是创作者是否更快进入心流。
+- M4：持续优化规模、稳定性与质量
 
 ## 文档
-- 项目设计文档：[`design.md`](./design.md)
+- 设计文档：[design.md](./design.md)
 
-## 数据构建
-当前阶段（不处理风格化）建议使用一键脚本串行执行：
-
-1. 创建并激活环境（首次）
+## 环境准备
 ```bash
 conda create -n tune-flow python=3.10 -y
 conda activate tune-flow
-```
-
-2. 安装项目依赖（首次）
-```bash
 python -m pip install -r requirements.txt
 ```
 
-3. 一键执行全流程（clean -> split -> tokenize -> build -> validate）
+## 数据构建
+如果已经有完整的 `data/tokenized/*.bin`、`data/tokenized/*.idx.json`、`data/tokenized/tokenizer_vocab.json`，可以直接跳到“配置化训练”。
+
+1. 一键跑完整流程（clean -> split -> tokenize -> build -> validate）
 ```bash
 python scripts/data/build_data.py
 ```
 
-4. 冒烟测试（只跑少量样本）
+2. 冒烟模式（只处理少量样本）
 ```bash
 python scripts/data/build_data.py --clean-limit 200 --split-limit 200 --tokenize-limit-per-split 100
 ```
 
-5. 从中间步骤续跑（例如从 tokenize 开始）
+3. 从中间步骤继续（例如从 tokenize 开始）
 ```bash
 python scripts/data/build_data.py --start-from tokenize --stop-after validate
 ```
 
-可选：仍可分步手动执行
+4. 也可分步执行
 ```bash
 python scripts/data/clean_dataset.py --config configs/data/cleaning.yaml
 python scripts/data/split_dataset.py --config configs/data/split.yaml
@@ -68,31 +63,101 @@ python scripts/data/validate_data_outputs.py
 - `data/tokenized/{train,valid,test,eval}.idx.json`
 - `outputs/reports/data/validate_data_report.json`
 
-## 脚本结构
-按功能拆分为三类目录：
+## 配置化训练
+训练参数统一放到 YAML，默认配置在：
+- `configs/train/train_base_run.yaml`
 
-- `scripts/data/`：数据相关（清洗、切分、分词、打包、验收）
-- `scripts/train/`：训练相关（`train_base.py`、`train_lora.py`）
-- `scripts/eval/`：评估相关（`eval_infilling.py`）
+推荐按下面顺序执行。
 
-说明（当前分层约定）：
-- `scripts/` 仅保留命令行入口与参数转发（薄封装）。
-- `src/tokenizer/` 存放分词核心实现（由 `scripts/data/tokenize_dataset.py` 调用）。
-- `src/training/` 存放训练核心实现（由 `scripts/train/*.py` 调用）。
+1. 先检查 YAML 是否能正常展开为训练参数：
+```bash
+python scripts/train/train_base_from_config.py --config configs/train/train_base_run.yaml --dry-run
+```
 
-## 许可证与数据合规
-- 许可证：Apache License 2.0（见 [`LICENSE`](./LICENSE)）
-- 数据使用：请遵守各数据集许可证与使用条款
+2. 启动训练：
+```bash
+python scripts/train/train_base_from_config.py --config configs/train/train_base_run.yaml
+```
 
-## 回归冒烟检查
-一条命令执行最小端到端回归检查：
+3. 训练结束后，对该 run 下所有 checkpoint 做自动评估：
+```bash
+python scripts/eval/eval_infilling.py --checkpoint-dir outputs/checkpoints/base/<run_id> --run-id <run_id>
+python scripts/eval/eval_continuation.py --checkpoint-dir outputs/checkpoints/base/<run_id> --run-id <run_id>
+```
 
+4. 开长训前或改动训练代码后，建议先跑一遍最小回归检查：
+```bash
+python scripts/train/regression_check.py --device cpu --precision fp32 --seq-len 64 --batch-size 1
+```
+
+评估报告默认写到：
+- 报告路径：`outputs/reports/eval/<run_id>.json`
+- 图表路径：`outputs/reports/eval/<run_id>.png`
+- 重点关注字段：`valid_loss`、`ppl`、`structural_validity_rate`
+- 报告路径：`outputs/reports/eval_continuation/<run_id>.json`
+- 图表路径：`outputs/reports/eval_continuation/<run_id>.png`
+- 重点关注字段：`valid_loss`、`ppl`、`structural_validity_rate`、`first_token_accuracy`
+
+## 评估最小闭环（按 checkpoint）
+`eval_infilling.py` 会对 run 目录下每个 checkpoint 逐个评估，并输出：
+- `valid_loss`
+- `ppl`
+- `structural_validity_rate`
+
+示例：
+```bash
+python scripts/eval/eval_infilling.py --checkpoint-dir outputs/checkpoints/base/<run_id> --run-id <run_id>
+```
+
+评估报告默认写入：
+- `outputs/reports/eval/<run_id>.json`
+- `outputs/reports/eval/<run_id>.png`
+
+`eval_continuation.py` 会对同一批 checkpoint 逐个评估续写能力，并输出：
+- `valid_loss`
+- `ppl`
+- `structural_validity_rate`
+- `first_token_accuracy`
+
+示例：
+```bash
+python scripts/eval/eval_continuation.py --checkpoint-dir outputs/checkpoints/base/<run_id> --run-id <run_id>
+```
+
+评估报告默认写入：
+- `outputs/reports/eval_continuation/<run_id>.json`
+- `outputs/reports/eval_continuation/<run_id>.png`
+
+## 自动回归检查
+一条命令覆盖 train + save + resume + eval 的最小链路：
 ```bash
 python scripts/train/regression_check.py
 ```
 
-该命令会自动执行：
-- 真实数据采样训练 1 步
-- 保存 checkpoint，并从 `latest.pt` 恢复到第 2 步
+该检查会自动执行：
+- 真实数据采样训练 1 步并保存 checkpoint
+- 从 `latest.pt` 恢复并继续到第 2 步
 - 运行 `eval_infilling.py`
-- 写出评估报告到 `outputs/reports/eval/<run_id>.json`
+- 运行 `eval_continuation.py`
+- 校验 `outputs/reports/eval/<run_id>.json`、`outputs/reports/eval_continuation/<run_id>.json` 以及对应 `.png` 图表
+
+## 当前训练策略（NEXT + FIM）
+`train_base` 当前采用混合训练：
+- NEXT：保持前缀续写能力（主任务）
+- FIM：补充中间编辑能力（辅助任务）
+
+可在 `configs/train/train_base_run.yaml` 调整：
+- `fim_ratio`：每个 batch 中 FIM 样本比例（0~1）
+- `fim_min_span`：FIM 挖洞最小 token 长度
+- `fim_max_span`：FIM 挖洞最大 token 长度
+
+## 代码结构
+- `scripts/data/`：数据清洗、切分、分词、打包、校验
+- `scripts/train/`：训练入口与训练链路工具
+- `scripts/eval/`：评估入口与评估脚本
+- `src/tokenizer/`：分词核心实现
+- `src/training/`：训练核心实现
+
+## 许可与合规
+- 许可证：Apache License 2.0（见 [LICENSE](./LICENSE)）
+- 数据使用：请遵守各数据集许可与使用条款

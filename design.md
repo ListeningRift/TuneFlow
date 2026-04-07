@@ -3,7 +3,7 @@
 ## 1. 项目目标
 - 构建基于 Transformer 的 Symbolic MIDI 生成模型。
 - 长期支持三种生成模式：中间补全（Infilling）、续写到结尾（Continuation）、从头生成（Free Generation）。
-- 当前阶段先聚焦 Infilling，把单任务做稳后再扩展其他模式。
+- 当前阶段采用 `NEXT + FIM` 混合训练：NEXT 作为主任务，FIM 作为中间编辑辅助任务。
 - 首版先不启用 `STYLE_x`，待风格标注数据就绪后再引入风格控制。
 - 建立客观评估体系，主决策不依赖主观听感。
 
@@ -19,7 +19,7 @@ MIDI Dataset
   -> 清洗与切分
   -> Tokenizer（结构化事件序列）
   -> 乐器归类（生成 `INST_x`，先于 style）
-  -> Base Model（阶段1: Infilling 单任务训练）
+  -> Base Model（阶段1: NEXT + FIM 混合训练）
   -> Base Model（阶段2: 多任务扩展训练）
   -> Style LoRA 微调
   -> Inference（补全 / 续写 / 直接生成）
@@ -77,7 +77,7 @@ MIDI Dataset
   - 约束：数据中若出现 `velocity=0`（常见于 note-off 事件）不参与音符力度建模；若被写入音符力度字段则先夹到 `1` 再编码。
 
 阶段2扩展（按需引入）：
-- 任务 token：`TASK_INFILL` `TASK_CONT` `TASK_GEN`
+- 任务 token：`TASK_INFILL` `TASK_GEN`
 
 ### 4.2 序列格式
 ```
@@ -167,33 +167,39 @@ raw MIDI
 
 ## 7. 任务发展规划（分阶段）
 
-### 7.1 阶段1（当前）：Infilling 单任务
-- 输入：`<PREFIX> + FIM_HOLE + <SUFFIX>`
-- 输出：`<MIDDLE>`
-- 训练目标：先学稳音乐语法和结构补全能力
+### 7.1 阶段1（当前）：NEXT 主任务 + FIM 辅助
+- NEXT（主任务）：
+  - 输入：`<PREFIX>`
+  - 输出：`<NEXT_TOKENS>`
+- FIM（辅助任务）：
+  - 输入：`<PREFIX> + FIM_HOLE + <SUFFIX>`
+  - 输出：`<MIDDLE>`
+- 训练目标：优先稳定续写能力，同时补齐中间编辑能力。
+- 对应评估：
+  - `scripts/eval/eval_continuation.py`：覆盖 NEXT 主任务的续写行为
+  - `scripts/eval/eval_infilling.py`：覆盖 FIM 的中间编辑行为
 
 训练样本格式（阶段1）：
+NEXT：
+```
+BOS [TEMPO_120] <SEQUENCE> EOS
+```
+
+FIM：
 ```
 BOS [TEMPO_120] <PREFIX> FIM_HOLE <SUFFIX> FIM_MID <MIDDLE> EOS
 ```
 
-### 7.2 阶段2（后续）：扩展 Continuation / Free Generation
-- Continuation：
-  - 输入：`<PREFIX>`
-  - 输出：`<REST_TO_EOS>`
+### 7.2 阶段2（后续）：扩展 Free Generation / 条件控制
+- Continuation 行为仍由阶段1的 NEXT 统一承担，不单独新增 `TASK_CONT` 训练任务。
 - Free Generation：
   - 输入：`BOS`（可选 `STYLE_x`，可选 `TEMPO_x`）
   - 输出：`<FULL_SEQUENCE_TO_EOS>`
 
-训练样本格式（阶段2，建议）：
+训练样本格式（阶段2，建议，当前未启用）：
 Infilling：
 ```
 TASK_INFILL BOS [STYLE_x] [TEMPO_x] <PREFIX> FIM_HOLE <SUFFIX> FIM_MID <MIDDLE> EOS
-```
-
-Continuation：
-```
-TASK_CONT BOS [STYLE_x] [TEMPO_x] <PREFIX> <REST_TO_EOS> EOS
 ```
 
 Free Generation：
@@ -203,15 +209,16 @@ TASK_GEN BOS [STYLE_x] [TEMPO_x] <FULL_SEQUENCE_TO_EOS> EOS
 
 ### 7.3 工程化定义（输入/输出/验收）
 - 输入：
-  - `train.bin/.idx`（阶段1先构建 Infilling 样本）
-  - `train_base.yaml`
+  - `train.bin/.idx`（阶段1用于 NEXT + FIM 混合采样）
+  - `configs/train/train_base_run.yaml`
 - 输出：
   - `outputs/checkpoints/base/<run_id>/`
   - `outputs/metrics/base/<run_id>.json`
 - 验收标准：
   - 训练过程无 NaN/Inf
   - `task_loss` 稳定下降
-  - 阶段1：Infilling 在固定样本上输出可解析结果
+  - 阶段1：每个 checkpoint 可自动评估并产出 `valid_loss` / `ppl` / `structural_validity_rate`
+  - 阶段1：`regression_check.py` 可一键通过（采样训练 + eval + save/resume）
   - 阶段2：三类任务都能在固定样本上输出可解析结果
 
 ### 7.4 `STYLE_x` 引入计划
@@ -227,8 +234,8 @@ TASK_GEN BOS [STYLE_x] [TEMPO_x] <FULL_SEQUENCE_TO_EOS> EOS
 3. `Span Mask`（补充，约 15% token）
 
 说明：
-- 阶段1：Mask 策略仅用于 Infilling 样本构造。
-- 阶段2：`TASK_CONT` 与 `TASK_GEN` 不使用 hole mask。
+- 阶段1：Mask 策略仅用于 FIM 子样本构造，NEXT 子样本不使用 hole mask。
+- 阶段2：`TASK_GEN` 不使用 hole mask；Continuation 若保留为 NEXT 形式，同样不使用 hole mask。
 
 ### 8.2 参数约束（建议）
 - `bar_mask_prob = 0.6`
@@ -256,8 +263,8 @@ TASK_GEN BOS [STYLE_x] [TEMPO_x] <FULL_SEQUENCE_TO_EOS> EOS
 - 优化器：AdamW
 - 学习率：3e-4（warmup + cosine）
 - 精度：bf16/fp16（按硬件）
-- 阶段1：只训练 Infilling
-- 阶段2（建议）：任务混训比例 `INFILL:CONT:GEN = 6:3:1`
+- `NEXT + FIM` 混合训练（NEXT 主任务，FIM 辅助任务）
+- 配比：`NEXT:FIM = 7:3`（或按 `fim_ratio` 网格实验
 
 ### 9.2 单轮实验循环
 ```
@@ -281,6 +288,11 @@ TASK_GEN BOS [STYLE_x] [TEMPO_x] <FULL_SEQUENCE_TO_EOS> EOS
 ## 10. 验证体系设计
 
 ### 10.1 指标
+- 当前自动评估闭环指标（已落地）：
+  - `valid_loss`
+  - `ppl`
+  - `structural_validity_rate`
+
 - `Infilling Success Rate`：合法补全比例
 - `Constraint Violation Rate`：非法 token/顺序比例
 - `Masked Perplexity`：仅补全区间（Infilling）
@@ -306,10 +318,10 @@ TASK_GEN BOS [STYLE_x] [TEMPO_x] <FULL_SEQUENCE_TO_EOS> EOS
   - `data/eval/fixed_eval.jsonl`
   - 待评估 checkpoint
 - 输出：
-  - `outputs/reports/eval/<run_id>.md`
   - `outputs/reports/eval/<run_id>.json`
 - 验收标准：
-  - 每次评估自动生成同结构报告
+  - 每次评估自动生成同结构 JSON 报告
+  - 默认支持按 run 下所有 checkpoint 逐个评估
   - 指标可追溯到 checkpoint、配置、数据版本
 
 ## 11. 模型发展路线
@@ -362,9 +374,12 @@ TuneFlow/
       validate_data_outputs.py
     train/
       train_base.py
+      train_base_from_config.py
+      regression_check.py
       train_lora.py
     eval/
       eval_infilling.py
+      eval_continuation.py
   src/
     model/
       modeling.py
@@ -397,6 +412,8 @@ TuneFlow/
 ### 14.1 配置管理
 - 统一使用 YAML 配置，不在代码里硬编码关键超参。
 - 配置变更必须进入实验记录。
+- Base 训练默认配置路径：`configs/train/train_base_run.yaml`。
+- 训练入口统一为：`scripts/train/train_base_from_config.py`。
 
 ### 14.2 实验记录
 - 必填字段：
@@ -410,9 +427,10 @@ TuneFlow/
 ### 14.3 完成定义（DoD）
 - 一个实验任务完成必须同时满足：
   - 有 checkpoint
-  - 有结构化指标报告
+  - 有结构化指标报告（至少包含 infilling 与 continuation 两类评估）
   - 有结论（保留/回滚）
   - 有可复现配置
+  - 可通过自动回归检查：`scripts/train/regression_check.py`
 
 ### 14.4 回滚策略
 - 指标未达门槛且无新发现，默认回滚到上个稳定配置。
@@ -420,7 +438,7 @@ TuneFlow/
 
 ## 15. 里程碑（建议）
 1. M1（1 周）：Tokenizer + 数据 Pipeline 跑通，产出固定 eval 集
-2. M2（1~2 周）：v0 50M 完成 Infilling 单任务并通过基础验收
+2. M2（1~2 周）：v0 50M 完成 `NEXT + FIM` 基线并通过基础验收
 3. M3（1 周）：在 M2 稳定后扩展 Continuation / Free Generation
 4. M4（1 周）：R&B LoRA 首版可控生成
 5. M5（持续）：v1 扩模与指标优化
@@ -428,7 +446,8 @@ TuneFlow/
 ## 16. 总结
 这是一个“音乐版 Copilot”系统：
 - 用 Transformer 学 MIDI 语法
-- 采用“先 Infilling、后多任务扩展”的演进路线
+- 采用“先 `NEXT + FIM` 稳定基线、后多任务扩展”的演进路线
 - 用 LoRA 做风格控制
 
 工程上以“输入/输出/验收标准”驱动执行，先保证可复现，再追求更高质量。
+
