@@ -83,3 +83,16 @@ python scripts/data/validate_data_outputs.py
 ## 许可证与数据合规
 - 许可证：Apache License 2.0（见 [`LICENSE`](./LICENSE)）
 - 数据使用：请遵守各数据集许可证与使用条款
+
+## 回归冒烟检查
+一条命令执行最小端到端回归检查：
+
+```bash
+python scripts/train/regression_check.py
+```
+
+该命令会自动执行：
+- 真实数据采样训练 1 步
+- 保存 checkpoint，并从 `latest.pt` 恢复到第 2 步
+- 运行 `eval_infilling.py`
+- 写出评估报告到 `outputs/reports/eval/<run_id>.json`

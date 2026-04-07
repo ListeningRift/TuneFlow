@@ -118,7 +118,7 @@ class TokenBinDataset:
         return input_ids, labels
 
 
-def _parse_args() -> argparse.Namespace:
+def build_arg_parser() -> argparse.ArgumentParser:
     """命令行参数：覆盖训练、评估、保存、恢复等核心开关。"""
     parser = argparse.ArgumentParser(description="TuneFlow base training (real-data loop).")
     # 配置/数据路径
@@ -234,7 +234,12 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Optional JSONL metrics path; default is `<output-dir>/metrics.jsonl`.",
     )
-    return parser.parse_args()
+    return parser
+
+
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = build_arg_parser()
+    return parser.parse_args(argv)
 
 
 def _autocast_context(torch_mod, use_amp: bool, device_type: str, amp_dtype):
@@ -411,9 +416,9 @@ def _evaluate(
     return sum(losses) / len(losses)
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     """训练主流程：初始化 ->（可选恢复）-> 训练 -> 评估 -> 保存。"""
-    args = _parse_args()
+    args = _parse_args(argv)
     torch = lazy_import_torch()
 
     from src.model import DecoderConfig, DecoderForCausalLM
