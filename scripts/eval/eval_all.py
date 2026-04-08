@@ -127,6 +127,32 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="可选：限制评估的 checkpoint 数量（用于快速冒烟）。",
     )
+    parser.add_argument(
+        "--checkpoint-policy",
+        type=str,
+        default="sampled",
+        choices=["all", "sampled"],
+        help="checkpoint 评估策略：sampled 为默认快速模式，all 为全量精评模式。",
+    )
+    parser.add_argument(
+        "--sample-count",
+        type=int,
+        default=6,
+        help="当 --checkpoint-policy=sampled 时，抽样的 step_* checkpoint 数量。",
+    )
+    parser.add_argument(
+        "--valid-loss-source",
+        type=str,
+        default="metrics",
+        choices=["recompute", "metrics", "auto"],
+        help="valid_loss/ppl 来源：默认复用训练期 metrics.jsonl，加快评估。",
+    )
+    parser.add_argument(
+        "--metrics-path",
+        type=Path,
+        default=None,
+        help="可选：训练期 metrics.jsonl 路径；默认尝试使用 checkpoint 目录下的 metrics.jsonl。",
+    )
     parser.add_argument("--seed", type=int, default=42, help="随机种子。")
     parser.add_argument(
         "--python-exec",
@@ -197,6 +223,14 @@ def _build_shared_args(args: argparse.Namespace, project_root: Path) -> list[str
         args.vocab_path if args.vocab_path.is_absolute() else (project_root / args.vocab_path),
     )
     _append_optional_arg(shared, "--limit-checkpoints", args.limit_checkpoints)
+    _append_optional_arg(shared, "--checkpoint-policy", args.checkpoint_policy)
+    _append_optional_arg(shared, "--sample-count", args.sample_count)
+    _append_optional_arg(shared, "--valid-loss-source", args.valid_loss_source)
+    _append_optional_arg(
+        shared,
+        "--metrics-path",
+        None if args.metrics_path is None else (args.metrics_path if args.metrics_path.is_absolute() else (project_root / args.metrics_path)),
+    )
     return shared
 
 
@@ -246,7 +280,7 @@ def main() -> None:
     _run_cmd(infilling_cmd, cwd=project_root, dry_run=args.dry_run)
     _run_cmd(continuation_cmd, cwd=project_root, dry_run=args.dry_run)
 
-    print(f"[eval_all] infilling report dir={project_root / 'outputs' / 'reports' / 'eval'}", flush=True)
+    print(f"[eval_all] infilling report dir={project_root / 'outputs' / 'reports' / 'eval_infilling'}", flush=True)
     print(f"[eval_all] continuation report dir={project_root / 'outputs' / 'reports' / 'eval_continuation'}", flush=True)
     print(f"[eval_all] run_id={run_id}", flush=True)
 

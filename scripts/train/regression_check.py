@@ -171,7 +171,7 @@ def main() -> None:
 
     run_id = args.run_id or f"regression_smoke_{time.strftime('%Y%m%d_%H%M%S')}"
     output_dir = (project_root / "outputs" / "checkpoints" / "base" / run_id).resolve()
-    infilling_report_path = (project_root / "outputs" / "reports" / "eval" / f"{run_id}.json").resolve()
+    infilling_report_path = (project_root / "outputs" / "reports" / "eval_infilling" / f"{run_id}.json").resolve()
     infilling_plot_path = infilling_report_path.with_suffix(".png")
     continuation_report_path = (
         project_root / "outputs" / "reports" / "eval_continuation" / f"{run_id}.json"

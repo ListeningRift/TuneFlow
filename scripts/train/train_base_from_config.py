@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import json
+import math
 import os
 import shlex
 import sys
@@ -90,6 +92,45 @@ def _option_maps(parser: argparse.ArgumentParser) -> tuple[dict[str, argparse.Ac
     return action_by_dest, option_by_dest
 
 
+def _resolve_steps_alias(config_mapping: dict[str, Any], project_root: Path) -> dict[str, Any]:
+    """
+    在把配置转发给 train_base 前，先解析符号化的 `steps` 别名。
+
+    当前支持：
+    - `one_pass`：按当前数据集估算覆盖一整遍训练 token 所需步数
+    """
+    resolved = dict(config_mapping)
+    steps_value = resolved.get("steps")
+    if not isinstance(steps_value, str):
+        return resolved
+
+    alias = steps_value.strip().lower()
+    if alias != "one_pass":
+        return resolved
+
+    train_idx_value = resolved.get("train_idx", "data/tokenized/train.idx.json")
+    train_idx_path = Path(str(train_idx_value))
+    if not train_idx_path.is_absolute():
+        train_idx_path = (project_root / train_idx_path).resolve()
+    if not train_idx_path.exists():
+        raise FileNotFoundError(f"Cannot resolve steps=one_pass because train idx is missing: {train_idx_path}")
+
+    idx_payload = json.loads(train_idx_path.read_text(encoding="utf-8"))
+    train_num_tokens = int(idx_payload.get("num_tokens", 0))
+    if train_num_tokens <= 0:
+        raise ValueError(f"Cannot resolve steps=one_pass because num_tokens is invalid in {train_idx_path}")
+
+    batch_size = int(resolved.get("batch_size", 2))
+    grad_accum_steps = int(resolved.get("grad_accum_steps", 1))
+    seq_len = int(resolved.get("seq_len", 256))
+    tokens_per_step = batch_size * grad_accum_steps * seq_len
+    if tokens_per_step <= 0:
+        raise ValueError("Cannot resolve steps=one_pass because tokens_per_step <= 0.")
+
+    resolved["steps"] = int(math.ceil(train_num_tokens / tokens_per_step))
+    return resolved
+
+
 def _to_train_argv(config_mapping: dict[str, Any], parser: argparse.ArgumentParser) -> list[str]:
     """
     把 YAML 映射转换为 train_base 可直接消费的 argv 列表。
@@ -135,6 +176,37 @@ def _to_train_argv(config_mapping: dict[str, Any], parser: argparse.ArgumentPars
     return argv
 
 
+def _warn_if_output_dir_is_dirty(config_mapping: dict[str, Any], project_root: Path) -> None:
+    """
+    当本次是全新训练、但输出目录里已经存在 checkpoint 时给出提示。
+
+    这样可以避免后续评估时把旧的 `step_*.pt` 和新产物混在一起。
+    """
+    resume_from = config_mapping.get("resume_from")
+    if resume_from is not None:
+        return
+
+    output_dir_value = config_mapping.get("output_dir")
+    if output_dir_value is None:
+        return
+
+    output_dir = Path(str(output_dir_value))
+    if not output_dir.is_absolute():
+        output_dir = (project_root / output_dir).resolve()
+    if not output_dir.exists():
+        return
+
+    checkpoint_files = sorted(output_dir.glob("*.pt"))
+    if checkpoint_files:
+        names = ", ".join(path.name for path in checkpoint_files[:5])
+        suffix = "" if len(checkpoint_files) <= 5 else ", ..."
+        print(
+            "[train_base_cfg] warning: output_dir already contains checkpoints while resume_from is null. "
+            "A later eval may mix old and new artifacts from the same directory.\n"
+            f"[train_base_cfg] existing checkpoints in {output_dir}: {names}{suffix}"
+        )
+
+
 def main() -> None:
     """程序入口：读取 YAML、转换参数并调用训练主函数。"""
     project_root = _ensure_project_root_on_path()
@@ -149,7 +221,8 @@ def main() -> None:
 
     from src.training.train_base import build_arg_parser, main as train_base_main
 
-    train_mapping = _load_train_mapping(config_path)
+    train_mapping = _resolve_steps_alias(_load_train_mapping(config_path), project_root)
+    _warn_if_output_dir_is_dirty(train_mapping, project_root)
     # 基于 train_base 的真实 parser 做映射，保证参数名称与行为始终一致。
     train_argv = _to_train_argv(train_mapping, build_arg_parser())
 

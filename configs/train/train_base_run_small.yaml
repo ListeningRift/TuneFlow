@@ -1,5 +1,5 @@
 train:
-  # Model/data paths
+  # 模型与数据路径
   model_config: configs/train/model_base.yaml
   train_idx: data/tokenized/train.idx.json
   train_bin: null
@@ -7,38 +7,41 @@ train:
   valid_bin: null
   resume_from: null
 
-  # Runtime
+  # 运行环境
   device: auto
   precision: auto
   seed: 42
 
-  # Optimization
-  # 小规模正式训练：用于先验证 loss 与评估曲线是否健康。
-  steps: 200
+  # 优化配置
+  # small 档位：明显大于冒烟规模，但仍适合快速观察训练趋势和早期评估反馈。
+  steps: 5000
   batch_size: 2
   grad_accum_steps: 1
   seq_len: 256
   lr: 0.0003
   weight_decay: 0.01
   grad_clip: 1.0
-  # NEXT + FIM 混合训练：续写为主，FIM 为辅
+  # NEXT + FIM 混合训练：续写为主任务，FIM 为辅助任务。
   fim_ratio: 0.15
   fim_min_span: 8
   fim_max_span: 64
+  bos_sample_ratio: 0.1
+  eos_sample_ratio: 0.1
+  fim_eos_ratio: 1.0
 
-  # Scheduler
+  # 学习率调度
   scheduler: cosine
-  warmup_steps: 20
+  warmup_steps: 200
   min_lr_scale: 0.1
 
-  # Logging / eval / saving
-  log_every: 10
-  eval_every: 50
-  eval_batches: 5
-  save_every: 100
+  # 日志 / 评估 / 保存
+  log_every: 20
+  eval_every: 250
+  eval_batches: 10
+  save_every: 250
   save_best: true
   no_restore_rng: false
 
-  # Outputs
+  # 输出路径
   output_dir: outputs/checkpoints/base/train_base_run_small
   metrics_path: null

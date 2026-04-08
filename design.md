@@ -179,6 +179,7 @@ raw MIDI
   - `scripts/eval/eval_all.py`：统一串行执行阶段1所需的两类评估
   - `scripts/eval/eval_continuation.py`：覆盖 NEXT 主任务的续写行为
   - `scripts/eval/eval_infilling.py`：覆盖 FIM 的中间编辑行为
+  - 默认评估策略允许“抽样 checkpoint + 复用训练期 valid_loss”，以缩短阶段1实验反馈时间
 
 训练样本格式（阶段1）：
 NEXT：
@@ -319,11 +320,12 @@ TASK_GEN BOS [STYLE_x] [TEMPO_x] <FULL_SEQUENCE_TO_EOS> EOS
   - `data/eval/fixed_eval.jsonl`
   - 待评估 checkpoint
 - 输出：
-  - `outputs/reports/eval/<run_id>.json`
+  - `outputs/reports/eval_infilling/<run_id>.json`
   - `outputs/reports/eval_continuation/<run_id>.json`
 - 验收标准：
   - 每次评估自动生成同结构 JSON 报告
   - 支持统一入口 `scripts/eval/eval_all.py` 一条命令跑完整阶段1评估
+  - 日常实验默认允许采用抽样评估；需要做严谨对比时再切换到全量重评
   - 默认支持按 run 下所有 checkpoint 逐个评估
   - 指标可追溯到 checkpoint、配置、数据版本
 

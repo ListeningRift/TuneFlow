@@ -30,7 +30,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--checkpoint-dir",
         type=Path,
-        default=Path("outputs/checkpoints/base/train_base_run"),
+        default=Path("outputs/checkpoints/base/train_base_run_small"),
         help="某次训练 run 的 checkpoint 目录（包含 *.pt）。",
     )
     parser.add_argument(
@@ -131,6 +131,32 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="可选：限制评估的 checkpoint 数量（用于冒烟测试）。",
     )
+    parser.add_argument(
+        "--checkpoint-policy",
+        type=str,
+        default="all",
+        choices=["all", "sampled"],
+        help="checkpoint 选择策略：all=全量评估，sampled=抽样评估。",
+    )
+    parser.add_argument(
+        "--sample-count",
+        type=int,
+        default=6,
+        help="当 --checkpoint-policy=sampled 时，抽样的 step_* checkpoint 数量。",
+    )
+    parser.add_argument(
+        "--valid-loss-source",
+        type=str,
+        default="recompute",
+        choices=["recompute", "metrics", "auto"],
+        help="valid_loss/ppl 来源：recompute=重新评估，metrics=复用训练期 metrics.jsonl，auto=优先复用失败时再重算。",
+    )
+    parser.add_argument(
+        "--metrics-path",
+        type=Path,
+        default=None,
+        help="可选：训练期 metrics.jsonl 路径；默认尝试使用 checkpoint 目录下的 metrics.jsonl。",
+    )
     parser.add_argument("--seed", type=int, default=42, help="随机种子。")
     return parser.parse_args()
 
@@ -152,12 +178,69 @@ def _checkpoint_sort_key(path: Path) -> tuple[int, int, str]:
     return (4, 0, path.name)
 
 
-def _discover_checkpoints(checkpoint_dir: Path, limit: int | None) -> list[Path]:
-    """扫描目录中的 checkpoint 文件，并按规则排序。"""
+def _sample_step_checkpoints(step_paths: list[Path], sample_count: int) -> list[Path]:
+    """对 `step_*.pt` 做均匀抽样，保留头尾和中间代表点。"""
+    if sample_count <= 0 or len(step_paths) <= sample_count:
+        return step_paths
+    if sample_count == 1:
+        return [step_paths[-1]]
+
+    indices = {
+        round(index * (len(step_paths) - 1) / (sample_count - 1))
+        for index in range(sample_count)
+    }
+    return [step_paths[index] for index in sorted(indices)]
+
+
+def _discover_checkpoints(
+    checkpoint_dir: Path,
+    limit: int | None,
+    policy: str,
+    sample_count: int,
+) -> list[Path]:
+    """扫描目录中的 checkpoint 文件，并按规则排序或抽样。"""
     paths = sorted([p for p in checkpoint_dir.glob("*.pt") if p.is_file()], key=_checkpoint_sort_key)
+    if policy == "sampled":
+        step_paths = [p for p in paths if _STEP_RE.match(p.name)]
+        extra_paths = [p for p in paths if not _STEP_RE.match(p.name)]
+        sampled = _sample_step_checkpoints(step_paths, sample_count)
+        deduped: dict[str, Path] = {p.name: p for p in [*sampled, *extra_paths]}
+        paths = sorted(deduped.values(), key=_checkpoint_sort_key)
     if limit is not None:
         paths = paths[: max(0, limit)]
     return paths
+
+
+def _resolve_metrics_path(checkpoint_dir: Path, metrics_path: Path | None) -> Path | None:
+    """解析 metrics.jsonl 路径；若不存在则返回 `None`。"""
+    candidate = metrics_path if metrics_path is not None else (checkpoint_dir / "metrics.jsonl")
+    if not candidate.exists():
+        return None
+    return candidate.resolve()
+
+
+def _load_valid_loss_by_step(metrics_path: Path | None) -> dict[int, float]:
+    """从训练期 metrics.jsonl 中提取 `step -> valid_loss` 映射。"""
+    if metrics_path is None:
+        return {}
+
+    mapping: dict[int, float] = {}
+    with metrics_path.open("r", encoding="utf-8") as file:
+        for line in file:
+            line = line.strip()
+            if not line:
+                continue
+            payload = json.loads(line)
+            if payload.get("event") != "eval":
+                continue
+            try:
+                step = int(payload["step"])
+                valid_loss = float(payload["valid_loss"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if math.isfinite(valid_loss):
+                mapping[step] = valid_loss
+    return mapping
 
 
 def _load_vocab(vocab_path: Path) -> tuple[dict[str, int], list[str]]:
@@ -241,6 +324,34 @@ def _safe_perplexity(loss: float) -> float:
     return math.exp(loss)
 
 
+def _resolve_valid_loss(
+    *,
+    step: int,
+    args: argparse.Namespace,
+    valid_loss_by_step: dict[int, float],
+    recompute_fn,
+) -> tuple[float, str]:
+    """
+    解析当前 checkpoint 的 valid_loss 来源。
+
+    返回：
+    - valid_loss
+    - source，取值 `metrics` 或 `recompute`
+    """
+    metrics_loss = valid_loss_by_step.get(step)
+    if args.valid_loss_source == "metrics":
+        if metrics_loss is None:
+            raise ValueError(
+                f"--valid-loss-source=metrics 但在 metrics.jsonl 中未找到 step={step} 的 valid_loss。"
+            )
+        return metrics_loss, "metrics"
+
+    if args.valid_loss_source == "auto" and metrics_loss is not None:
+        return metrics_loss, "metrics"
+
+    return recompute_fn(), "recompute"
+
+
 def _evaluate_valid_loss(
     model,
     dataset,
@@ -291,6 +402,7 @@ def _build_continuation_prompt(
     source_tokens: list[str],
     max_positions: int,
     min_prefix_tokens: int,
+    max_new_tokens: int,
     rng: random.Random,
 ) -> tuple[list[str], list[str]] | None:
     """
@@ -305,23 +417,30 @@ def _build_continuation_prompt(
     if source_tokens[0] != "BOS" or source_tokens[-1] != "EOS":
         return None
 
-    core = source_tokens[1:-1]
     suffix_floor = 8
-    if len(core) < max(min_prefix_tokens + suffix_floor, 24):
-        return None
+    min_core_len = max(min_prefix_tokens + suffix_floor, 24)
+    max_core_len = max(min_core_len, max_positions - 8)
 
-    max_core_len = max(min_prefix_tokens + suffix_floor, max_positions - 8)
-    if len(core) > max_core_len:
-        start = rng.randrange(len(core) - max_core_len + 1)
-        core = core[start : start + max_core_len]
+    from src.utils.eval_windows import sample_bar_aligned_subsequence
+
+    window_tokens = sample_bar_aligned_subsequence(
+        source_tokens,
+        max_core_tokens=max_core_len,
+        min_core_tokens=min_core_len,
+        rng=rng,
+    )
+    if window_tokens is None:
+        return None
+    core = window_tokens[1:-1]
 
     core_len = len(core)
     min_prefix = max(1, min(int(min_prefix_tokens), core_len - suffix_floor))
     max_prefix = max(min_prefix, core_len - suffix_floor)
-    if min_prefix > max_prefix:
+    min_prefix_for_budget = max(min_prefix, core_len - int(max_new_tokens) + 1)
+    if min_prefix_for_budget > max_prefix:
         return None
 
-    prefix_len = rng.randint(min_prefix, max_prefix)
+    prefix_len = rng.randint(min_prefix_for_budget, max_prefix)
     prompt_tokens = ["BOS", *core[:prefix_len]]
     target_tokens = [*core[prefix_len:], "EOS"]
     if len(prompt_tokens) >= max_positions:
@@ -401,7 +520,7 @@ def _evaluate_continuation_quality(
     max_new_tokens: int,
     min_prefix_tokens: int,
     rng: random.Random,
-) -> tuple[float, int, int, float, int, int]:
+) -> tuple[float, int, int, float, int, int, int, int]:
     """
     评估续写生成质量。
 
@@ -420,6 +539,8 @@ def _evaluate_continuation_quality(
     attempted = 0
     first_token_hits = 0
     first_token_total = 0
+    eos_hits = 0
+    syntax_hits = 0
 
     retries = 0
     max_retries = max(num_samples * 10, 100)
@@ -430,13 +551,16 @@ def _evaluate_continuation_quality(
             source_tokens=source_tokens,
             max_positions=max_positions,
             min_prefix_tokens=min_prefix_tokens,
+            max_new_tokens=max_new_tokens,
             rng=rng,
         )
         if built is None:
             continue
 
         prompt_tokens, target_tokens = built
-        dyn_max_new = min(max_new_tokens, max(8, int(round((max_positions - len(prompt_tokens)) * 0.9))))
+        dyn_max_new = min(max_new_tokens, max(0, max_positions - len(prompt_tokens)))
+        if dyn_max_new <= 0:
+            continue
         generated_tokens, reached_eos = _generate_continuation_tokens(
             model=model,
             torch_mod=torch_mod,
@@ -458,13 +582,25 @@ def _evaluate_continuation_quality(
                 first_token_hits += 1
 
         reconstructed = [*prompt_tokens, *generated_tokens, "EOS"] if reached_eos else [*prompt_tokens, *generated_tokens]
+        if reached_eos:
+            eos_hits += 1
         if reached_eos and _validate_token_order(reconstructed, vocab):
+            syntax_hits += 1
             valid_count += 1
         attempted += 1
 
     structural_rate = (valid_count / attempted) if attempted else float("nan")
     first_token_accuracy = (first_token_hits / first_token_total) if first_token_total else float("nan")
-    return structural_rate, valid_count, attempted, first_token_accuracy, first_token_hits, first_token_total
+    return (
+        structural_rate,
+        valid_count,
+        attempted,
+        first_token_accuracy,
+        first_token_hits,
+        first_token_total,
+        eos_hits,
+        syntax_hits,
+    )
 
 
 def _resolve_report_path(run_id: str, output_path: Path | None, project_root: Path) -> Path:
@@ -505,7 +641,12 @@ def main() -> None:
     device = resolve_torch_device(torch, args.device)
     precision_name, use_amp, amp_dtype, _ = _resolve_precision(torch_mod=torch, requested=args.precision, device=device)
 
-    checkpoints = _discover_checkpoints(checkpoint_dir, args.limit_checkpoints)
+    checkpoints = _discover_checkpoints(
+        checkpoint_dir=checkpoint_dir,
+        limit=args.limit_checkpoints,
+        policy=args.checkpoint_policy,
+        sample_count=args.sample_count,
+    )
     if not checkpoints:
         raise FileNotFoundError(f"No *.pt checkpoints found under: {checkpoint_dir}")
 
@@ -522,12 +663,18 @@ def main() -> None:
 
     vocab_path = args.vocab_path if args.vocab_path.is_absolute() else (project_root / args.vocab_path)
     vocab, id_to_token = _load_vocab(vocab_path.resolve())
+    metrics_path = None
+    if args.metrics_path is not None:
+        metrics_path = args.metrics_path if args.metrics_path.is_absolute() else (project_root / args.metrics_path)
+    metrics_path = _resolve_metrics_path(checkpoint_dir, metrics_path)
+    valid_loss_by_step = _load_valid_loss_by_step(metrics_path)
 
     results: list[dict[str, Any]] = []
     started_at = time.time()
     print(
         f"[eval_continuation] run_id={run_id} "
-        f"checkpoints={len(checkpoints)} device={device} precision={precision_name}"
+        f"checkpoints={len(checkpoints)} device={device} precision={precision_name} "
+        f"checkpoint_policy={args.checkpoint_policy} valid_loss_source={args.valid_loss_source}"
     )
 
     try:
@@ -547,23 +694,30 @@ def main() -> None:
             model.eval()
 
             eval_seq_len = min(max(1, args.seq_len), int(config.max_position_embeddings))
-            rng = random.Random(args.seed + index)
+            valid_rng = random.Random(args.seed)
+            continuation_rng = random.Random(args.seed + 1)
 
-            valid_loss = _evaluate_valid_loss(
-                model=model,
-                dataset=valid_dataset,
-                torch_mod=torch,
-                rng=rng,
-                device=device,
-                batch_size=args.batch_size,
-                seq_len=eval_seq_len,
-                eval_batches=args.eval_batches,
-                use_amp=use_amp,
-                amp_dtype=amp_dtype,
-                autocast_context_fn=_autocast_context,
+            step = int(ckpt_payload.get("step", -1))
+            valid_loss, valid_loss_source = _resolve_valid_loss(
+                step=step,
+                args=args,
+                valid_loss_by_step=valid_loss_by_step,
+                recompute_fn=lambda: _evaluate_valid_loss(
+                    model=model,
+                    dataset=valid_dataset,
+                    torch_mod=torch,
+                    rng=valid_rng,
+                    device=device,
+                    batch_size=args.batch_size,
+                    seq_len=eval_seq_len,
+                    eval_batches=args.eval_batches,
+                    use_amp=use_amp,
+                    amp_dtype=amp_dtype,
+                    autocast_context_fn=_autocast_context,
+                ),
             )
             ppl = _safe_perplexity(valid_loss)
-            struct_rate, struct_valid, struct_total, first_acc, first_hits, first_total = _evaluate_continuation_quality(
+            struct_rate, struct_valid, struct_total, first_acc, first_hits, first_total, eos_hits, syntax_hits = _evaluate_continuation_quality(
                 model=model,
                 torch_mod=torch,
                 eval_rows=eval_rows,
@@ -578,14 +732,15 @@ def main() -> None:
                 num_samples=args.num_continuation_samples,
                 max_new_tokens=args.max_new_tokens,
                 min_prefix_tokens=args.min_prefix_tokens,
-                rng=rng,
+                rng=continuation_rng,
             )
 
             result = {
                 "checkpoint_name": ckpt_path.name,
                 "checkpoint_path": str(ckpt_path),
-                "step": int(ckpt_payload.get("step", -1)),
+                "step": step,
                 "valid_loss": valid_loss,
+                "valid_loss_source": valid_loss_source,
                 "ppl": ppl,
                 "structural_validity_rate": struct_rate,
                 "structural_valid_count": struct_valid,
@@ -593,6 +748,10 @@ def main() -> None:
                 "first_token_accuracy": first_acc,
                 "first_token_hit_count": first_hits,
                 "first_token_total_count": first_total,
+                "eos_reached_count": eos_hits,
+                "eos_reached_rate": ((eos_hits / struct_total) if struct_total else float("nan")),
+                "syntax_pass_count": syntax_hits,
+                "syntax_pass_rate": ((syntax_hits / struct_total) if struct_total else float("nan")),
                 "seq_len": eval_seq_len,
                 "eval_batches": args.eval_batches,
                 "num_continuation_samples": args.num_continuation_samples,
@@ -601,8 +760,9 @@ def main() -> None:
             results.append(result)
             print(
                 f"[eval_continuation] step={result['step']} "
-                f"valid_loss={valid_loss:.6f} ppl={ppl:.6f} "
+                f"valid_loss={valid_loss:.6f}({valid_loss_source}) ppl={ppl:.6f} "
                 f"struct_valid={struct_rate:.4f} ({struct_valid}/{struct_total}) "
+                f"eos={eos_hits}/{struct_total} syntax={syntax_hits}/{struct_total} "
                 f"first_acc={first_acc:.4f} ({first_hits}/{first_total})"
             )
 
@@ -638,10 +798,14 @@ def main() -> None:
             "max_new_tokens": args.max_new_tokens,
             "min_prefix_tokens": args.min_prefix_tokens,
             "seed": args.seed,
+            "checkpoint_policy": args.checkpoint_policy,
+            "sample_count": args.sample_count,
+            "valid_loss_source": args.valid_loss_source,
             "valid_idx": str(valid_idx.resolve()),
             "valid_bin": None if valid_bin is None else str(valid_bin.resolve()),
             "eval_tok": str(eval_tok_path.resolve()),
             "vocab_path": str(vocab_path.resolve()),
+            "metrics_path": None if metrics_path is None else str(metrics_path),
         },
         "summary": summary,
         "results": results,

@@ -88,7 +88,7 @@ class TokenBinDataset:
         self._eligible_cache[min_len] = indices
         return indices
 
-    def _sample_window(self, rng: random.Random, window_len: int) -> list[int]:
+    def _sample_window(self, rng: random.Random, window_len: int, anchor: str = "random") -> list[int]:
         """随机抽取一个连续窗口（长度为 `window_len`）。"""
         if window_len <= 0:
             raise ValueError("window_len must be > 0.")
@@ -103,8 +103,31 @@ class TokenBinDataset:
         seq_idx = candidates[rng.randrange(len(candidates))]
         seq_offset = self.offsets[seq_idx]
         seq_total_len = self.lengths[seq_idx]
-        start_in_seq = rng.randrange(seq_total_len - window_len + 1)
+        if anchor == "start":
+            start_in_seq = 0
+        elif anchor == "end":
+            start_in_seq = seq_total_len - window_len
+        else:
+            start_in_seq = rng.randrange(seq_total_len - window_len + 1)
         abs_start = seq_offset + start_in_seq
+        return list(self._token_view[abs_start : abs_start + window_len])
+
+    def _sample_window_before_eos(self, rng: random.Random, window_len: int) -> list[int]:
+        """抽取一个以真实序列末尾为锚点、但不包含最终 EOS 的窗口。"""
+        if window_len <= 0:
+            raise ValueError("window_len must be > 0.")
+
+        candidates = self._eligible_indices(window_len + 1)
+        if not candidates:
+            raise ValueError(
+                f"No sequence in {self.idx_path} has length >= {window_len + 1}. "
+                "Please lower --seq-len or regenerate data."
+            )
+
+        seq_idx = candidates[rng.randrange(len(candidates))]
+        seq_offset = self.offsets[seq_idx]
+        seq_total_len = self.lengths[seq_idx]
+        abs_start = seq_offset + seq_total_len - window_len - 1
         return list(self._token_view[abs_start : abs_start + window_len])
 
     @staticmethod
@@ -115,6 +138,8 @@ class TokenBinDataset:
         fim_mid_token_id: int,
         fim_min_span: int,
         fim_max_span: int,
+        append_eos: bool = False,
+        eos_token_id: int | None = None,
     ) -> tuple[list[int], list[int]]:
         """
         基于基础序列构造 FIM 样本：
@@ -138,6 +163,10 @@ class TokenBinDataset:
         middle = base_tokens[start:end]
         suffix = base_tokens[end:]
         fim_tokens = [*prefix, fim_hole_token_id, *suffix, fim_mid_token_id, *middle]
+        if append_eos:
+            if eos_token_id is None:
+                raise ValueError("append_eos=True requires eos_token_id.")
+            fim_tokens.append(eos_token_id)
 
         labels = fim_tokens.copy()
         fim_mid_pos = len(prefix) + 1 + len(suffix)
@@ -145,12 +174,28 @@ class TokenBinDataset:
             labels[idx] = -100
         return fim_tokens, labels
 
-    def sample_batch(self, torch_mod, rng: random.Random, batch_size: int, seq_len: int, device):
+    def sample_batch(
+        self,
+        torch_mod,
+        rng: random.Random,
+        batch_size: int,
+        seq_len: int,
+        device,
+        bos_sample_ratio: float = 0.0,
+        eos_sample_ratio: float = 0.0,
+    ):
         """采样 NEXT batch（labels 与 input_ids 对齐，由模型内部完成 shift）。"""
         input_rows: list[list[int]] = []
         label_rows: list[list[int]] = []
         for _ in range(batch_size):
-            window = self._sample_window(rng=rng, window_len=seq_len)
+            pick = rng.random()
+            if pick < bos_sample_ratio:
+                anchor = "start"
+            elif pick < bos_sample_ratio + eos_sample_ratio:
+                anchor = "end"
+            else:
+                anchor = "random"
+            window = self._sample_window(rng=rng, window_len=seq_len, anchor=anchor)
             input_rows.append(window)
             label_rows.append(window.copy())
 
@@ -170,6 +215,10 @@ class TokenBinDataset:
         fim_mid_token_id: int | None,
         fim_min_span: int,
         fim_max_span: int,
+        bos_sample_ratio: float,
+        eos_sample_ratio: float,
+        fim_eos_ratio: float,
+        eos_token_id: int | None,
     ):
         """
         采样 NEXT + FIM 混合 batch。
@@ -190,7 +239,16 @@ class TokenBinDataset:
         for _ in range(batch_size):
             pick_fim = use_fim and (rng.random() < fim_ratio)
             if pick_fim:
-                base_tokens = self._sample_window(rng=rng, window_len=seq_len - 2)
+                use_fim_eos = (
+                    fim_eos_ratio > 0.0
+                    and eos_token_id is not None
+                    and seq_len > 3
+                    and (rng.random() < fim_eos_ratio)
+                )
+                if use_fim_eos:
+                    base_tokens = self._sample_window_before_eos(rng=rng, window_len=seq_len - 3)
+                else:
+                    base_tokens = self._sample_window(rng=rng, window_len=seq_len - 2)
                 fim_input, fim_labels = self._build_fim_example(
                     base_tokens=base_tokens,
                     rng=rng,
@@ -198,12 +256,21 @@ class TokenBinDataset:
                     fim_mid_token_id=fim_mid_token_id,
                     fim_min_span=fim_min_span,
                     fim_max_span=fim_max_span,
+                    append_eos=use_fim_eos,
+                    eos_token_id=eos_token_id,
                 )
                 input_rows.append(fim_input)
                 label_rows.append(fim_labels)
                 fim_examples += 1
             else:
-                window = self._sample_window(rng=rng, window_len=seq_len)
+                pick = rng.random()
+                if pick < bos_sample_ratio:
+                    anchor = "start"
+                elif pick < bos_sample_ratio + eos_sample_ratio:
+                    anchor = "end"
+                else:
+                    anchor = "random"
+                window = self._sample_window(rng=rng, window_len=seq_len, anchor=anchor)
                 input_rows.append(window)
                 label_rows.append(window.copy())
 
@@ -303,6 +370,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=64,
         help="Maximum FIM hole length in tokens.",
+    )
+    parser.add_argument(
+        "--bos-sample-ratio",
+        type=float,
+        default=0.1,
+        help="Fraction of NEXT samples anchored at sequence start to strengthen BOS-prefix continuation.",
+    )
+    parser.add_argument(
+        "--eos-sample-ratio",
+        type=float,
+        default=0.1,
+        help="Fraction of NEXT samples anchored at sequence end to strengthen EOS prediction.",
+    )
+    parser.add_argument(
+        "--fim-eos-ratio",
+        type=float,
+        default=1.0,
+        help="Fraction of FIM samples that explicitly supervise EOS after middle generation.",
     )
     # 学习率调度
     parser.add_argument(
@@ -541,6 +626,14 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit("--steps must be > 0.")
     if not (0.0 <= args.fim_ratio <= 1.0):
         raise SystemExit("--fim-ratio must be within [0, 1].")
+    if not (0.0 <= args.bos_sample_ratio <= 1.0):
+        raise SystemExit("--bos-sample-ratio must be within [0, 1].")
+    if not (0.0 <= args.eos_sample_ratio <= 1.0):
+        raise SystemExit("--eos-sample-ratio must be within [0, 1].")
+    if args.bos_sample_ratio + args.eos_sample_ratio > 1.0:
+        raise SystemExit("--bos-sample-ratio + --eos-sample-ratio must be <= 1.")
+    if not (0.0 <= args.fim_eos_ratio <= 1.0):
+        raise SystemExit("--fim-eos-ratio must be within [0, 1].")
     if args.fim_min_span <= 0:
         raise SystemExit("--fim-min-span must be > 0.")
     if args.fim_max_span <= 0:
@@ -561,6 +654,7 @@ def main(argv: list[str] | None = None) -> None:
         )
     fim_hole_token_id = config.special_token_ids.get("FIM_HOLE")
     fim_mid_token_id = config.special_token_ids.get("FIM_MID")
+    eos_token_id = config.eos_token_id
     if args.fim_ratio > 0 and (fim_hole_token_id is None or fim_mid_token_id is None):
         raise SystemExit(
             "--fim-ratio > 0 but FIM_HOLE/FIM_MID token id is missing in model config."
@@ -615,15 +709,27 @@ def main(argv: list[str] | None = None) -> None:
 
     total_params = count_parameters(model)
     effective_batch = args.batch_size * args.grad_accum_steps
+    total_planned_tokens = args.steps * effective_batch * args.seq_len
+    remaining_steps = max(0, args.steps - start_step)
+    remaining_planned_tokens = remaining_steps * effective_batch * args.seq_len
+    approx_total_data_passes = total_planned_tokens / max(1, train_dataset.num_tokens)
+    approx_remaining_data_passes = remaining_planned_tokens / max(1, train_dataset.num_tokens)
     print(f"[train_base] model_type={config.model_type} vocab={config.vocab_size}")
     print(
         f"[train_base] params={total_params:,} device={device} precision={precision_name} "
         f"steps={args.steps} batch={args.batch_size} grad_accum={args.grad_accum_steps} "
-        f"effective_batch={effective_batch} seq_len={args.seq_len} fim_ratio={args.fim_ratio:.2f}"
+        f"effective_batch={effective_batch} seq_len={args.seq_len} fim_ratio={args.fim_ratio:.2f} "
+        f"bos_ratio={args.bos_sample_ratio:.2f} eos_ratio={args.eos_sample_ratio:.2f} fim_eos_ratio={args.fim_eos_ratio:.2f}"
     )
     print(
         f"[train_base] train={train_dataset.idx_path} ({train_dataset.num_sequences} seqs, "
         f"{train_dataset.num_tokens} tokens)"
+    )
+    print(
+        f"[train_base] planned_train_tokens={total_planned_tokens:,} "
+        f"(remaining={remaining_planned_tokens:,}) "
+        f"approx_data_passes={approx_total_data_passes:.4f} "
+        f"(remaining={approx_remaining_data_passes:.4f})"
     )
     if valid_dataset is not None:
         print(
@@ -646,7 +752,16 @@ def main(argv: list[str] | None = None) -> None:
             "lr": args.lr,
             "effective_batch": effective_batch,
             "seq_len": args.seq_len,
+            "train_num_sequences": train_dataset.num_sequences,
+            "train_num_tokens": train_dataset.num_tokens,
+            "planned_train_tokens": total_planned_tokens,
+            "remaining_planned_tokens": remaining_planned_tokens,
+            "approx_total_data_passes": approx_total_data_passes,
+            "approx_remaining_data_passes": approx_remaining_data_passes,
             "fim_ratio": args.fim_ratio,
+            "bos_sample_ratio": args.bos_sample_ratio,
+            "eos_sample_ratio": args.eos_sample_ratio,
+            "fim_eos_ratio": args.fim_eos_ratio,
             "fim_min_span": args.fim_min_span,
             "fim_max_span": args.fim_max_span,
             "resume_from": None if args.resume_from is None else str(args.resume_from),
@@ -676,6 +791,10 @@ def main(argv: list[str] | None = None) -> None:
                     fim_mid_token_id=fim_mid_token_id,
                     fim_min_span=args.fim_min_span,
                     fim_max_span=args.fim_max_span,
+                    bos_sample_ratio=args.bos_sample_ratio,
+                    eos_sample_ratio=args.eos_sample_ratio,
+                    fim_eos_ratio=args.fim_eos_ratio,
+                    eos_token_id=eos_token_id,
                 )
                 with _autocast_context(
                     torch_mod=torch, use_amp=use_amp, device_type=device.type, amp_dtype=amp_dtype

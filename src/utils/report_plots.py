@@ -25,17 +25,29 @@ def _build_dataframe(report: dict[str, Any]) -> pd.DataFrame:
     if "step" in frame.columns:
         frame["step"] = pd.to_numeric(frame["step"], errors="coerce")
 
-    x_labels: list[str] = []
+    raw_labels: list[str] = []
     for index, row in frame.iterrows():
-        step_value = row.get("step")
-        if pd.notna(step_value) and float(step_value) >= 0:
-            x_labels.append(f"step_{int(step_value)}")
-            continue
         checkpoint_name = row.get("checkpoint_name")
         if isinstance(checkpoint_name, str) and checkpoint_name:
-            x_labels.append(checkpoint_name)
+            checkpoint_stem = Path(checkpoint_name).stem
+            if not checkpoint_stem.startswith("step_"):
+                raw_labels.append(checkpoint_stem)
+                continue
+        step_value = row.get("step")
+        if pd.notna(step_value) and float(step_value) >= 0:
+            raw_labels.append(f"step_{int(step_value)}")
             continue
-        x_labels.append(f"ckpt_{index + 1}")
+        if isinstance(checkpoint_name, str) and checkpoint_name:
+            raw_labels.append(Path(checkpoint_name).stem)
+            continue
+        raw_labels.append(f"ckpt_{index + 1}")
+
+    seen_labels: dict[str, int] = {}
+    x_labels: list[str] = []
+    for label in raw_labels:
+        count = seen_labels.get(label, 0) + 1
+        seen_labels[label] = count
+        x_labels.append(label if count == 1 else f"{label}#{count}")
     frame["x_label"] = x_labels
     return frame
 

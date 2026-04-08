@@ -94,6 +94,11 @@ python scripts/eval/eval_all.py --checkpoint-dir outputs/checkpoints/base/<run_i
 这条命令会自动顺序执行：
 - `eval_infilling.py`
 - `eval_continuation.py`
+- 默认走“快速模式”：抽样 checkpoint，并优先复用训练阶段 `metrics.jsonl` 中已有的 `valid_loss`
+- 如果要做全量精评，可显式指定：
+```bash
+python scripts/eval/eval_all.py --checkpoint-dir outputs/checkpoints/base/<run_id> --run-id <run_id> --checkpoint-policy all --valid-loss-source recompute
+```
 
 4. 开长训前或改动训练代码后，建议先跑一遍最小回归检查：
 ```bash
@@ -101,8 +106,8 @@ python scripts/train/regression_check.py --device cpu --precision fp32 --seq-len
 ```
 
 评估报告默认写到：
-- 报告路径：`outputs/reports/eval/<run_id>.json`
-- 图表路径：`outputs/reports/eval/<run_id>.png`
+- 报告路径：`outputs/reports/eval_infilling/<run_id>.json`
+- 图表路径：`outputs/reports/eval_infilling/<run_id>.png`
 - 重点关注字段：`valid_loss`、`ppl`、`structural_validity_rate`
 - 报告路径：`outputs/reports/eval_continuation/<run_id>.json`
 - 图表路径：`outputs/reports/eval_continuation/<run_id>.png`
@@ -112,6 +117,15 @@ python scripts/train/regression_check.py --device cpu --precision fp32 --seq-len
 `eval_all.py` 是统一评估入口，会按顺序跑完 infilling 与 continuation 两类评估：
 ```bash
 python scripts/eval/eval_all.py --checkpoint-dir outputs/checkpoints/base/<run_id> --run-id <run_id>
+```
+
+默认优化策略：
+- `--checkpoint-policy sampled`：只抽样一部分 `step_*.pt`，并保留 `best.pt`、`last.pt`、`latest.pt`
+- `--valid-loss-source metrics`：优先复用训练阶段 `metrics.jsonl` 中记录的 `valid_loss`
+
+如果需要完整重评所有 checkpoint，并重新计算 valid_loss：
+```bash
+python scripts/eval/eval_all.py --checkpoint-dir outputs/checkpoints/base/<run_id> --run-id <run_id> --checkpoint-policy all --valid-loss-source recompute
 ```
 
 `eval_infilling.py` 会对 run 目录下每个 checkpoint 逐个评估，并输出：
@@ -125,8 +139,8 @@ python scripts/eval/eval_infilling.py --checkpoint-dir outputs/checkpoints/base/
 ```
 
 评估报告默认写入：
-- `outputs/reports/eval/<run_id>.json`
-- `outputs/reports/eval/<run_id>.png`
+- `outputs/reports/eval_infilling/<run_id>.json`
+- `outputs/reports/eval_infilling/<run_id>.png`
 
 `eval_continuation.py` 会对同一批 checkpoint 逐个评估续写能力，并输出：
 - `valid_loss`
@@ -154,7 +168,7 @@ python scripts/train/regression_check.py
 - 从 `latest.pt` 恢复并继续到第 2 步
 - 运行 `eval_infilling.py`
 - 运行 `eval_continuation.py`
-- 校验 `outputs/reports/eval/<run_id>.json`、`outputs/reports/eval_continuation/<run_id>.json` 以及对应 `.png` 图表
+- 校验 `outputs/reports/eval_infilling/<run_id>.json`、`outputs/reports/eval_continuation/<run_id>.json` 以及对应 `.png` 图表
 
 ## 当前训练策略（NEXT + FIM）
 `train_base` 当前采用混合训练：

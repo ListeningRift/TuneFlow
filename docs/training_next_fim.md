@@ -47,3 +47,12 @@ python scripts/train/train_base_from_config.py --preset full
 ```bash
 python scripts/eval/eval_all.py --checkpoint-dir outputs/checkpoints/base/<run_id> --run-id <run_id>
 ```
+
+默认优化策略：
+- 只抽样部分 `step_*.pt` 做结构评估，同时保留 `best.pt`、`last.pt`、`latest.pt`
+- `valid_loss` 默认优先复用训练期 `metrics.jsonl`，避免每个 checkpoint 重新扫验证集
+
+如需全量精评，可切换为：
+```bash
+python scripts/eval/eval_all.py --checkpoint-dir outputs/checkpoints/base/<run_id> --run-id <run_id> --checkpoint-policy all --valid-loss-source recompute
+```
