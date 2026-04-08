@@ -64,26 +64,36 @@ python scripts/data/validate_data_outputs.py
 - `outputs/reports/data/validate_data_report.json`
 
 ## 配置化训练
-训练参数统一放到 YAML，默认配置在：
-- `configs/train/train_base_run.yaml`
+训练参数统一放到 YAML，并拆成两档：
+- `configs/train/train_base_run_small.yaml`：小规模正式训练
+- `configs/train/train_base_run_full.yaml`：完整规模训练
 
 推荐按下面顺序执行。
 
-1. 先检查 YAML 是否能正常展开为训练参数：
+1. 先检查小规模 YAML 是否能正常展开为训练参数：
 ```bash
-python scripts/train/train_base_from_config.py --config configs/train/train_base_run.yaml --dry-run
+python scripts/train/train_base_from_config.py --preset small --dry-run
 ```
 
 2. 启动训练：
 ```bash
-python scripts/train/train_base_from_config.py --config configs/train/train_base_run.yaml
+python scripts/train/train_base_from_config.py --preset small
+python scripts/train/train_base_from_config.py --preset full
+```
+
+如果你更习惯显式写配置路径，也可以继续使用：
+```bash
+python scripts/train/train_base_from_config.py --config configs/train/train_base_run_small.yaml
+python scripts/train/train_base_from_config.py --config configs/train/train_base_run_full.yaml
 ```
 
 3. 训练结束后，对该 run 下所有 checkpoint 做自动评估：
 ```bash
-python scripts/eval/eval_infilling.py --checkpoint-dir outputs/checkpoints/base/<run_id> --run-id <run_id>
-python scripts/eval/eval_continuation.py --checkpoint-dir outputs/checkpoints/base/<run_id> --run-id <run_id>
+python scripts/eval/eval_all.py --checkpoint-dir outputs/checkpoints/base/<run_id> --run-id <run_id>
 ```
+这条命令会自动顺序执行：
+- `eval_infilling.py`
+- `eval_continuation.py`
 
 4. 开长训前或改动训练代码后，建议先跑一遍最小回归检查：
 ```bash
@@ -99,6 +109,11 @@ python scripts/train/regression_check.py --device cpu --precision fp32 --seq-len
 - 重点关注字段：`valid_loss`、`ppl`、`structural_validity_rate`、`first_token_accuracy`
 
 ## 评估最小闭环（按 checkpoint）
+`eval_all.py` 是统一评估入口，会按顺序跑完 infilling 与 continuation 两类评估：
+```bash
+python scripts/eval/eval_all.py --checkpoint-dir outputs/checkpoints/base/<run_id> --run-id <run_id>
+```
+
 `eval_infilling.py` 会对 run 目录下每个 checkpoint 逐个评估，并输出：
 - `valid_loss`
 - `ppl`
@@ -146,7 +161,7 @@ python scripts/train/regression_check.py
 - NEXT：保持前缀续写能力（主任务）
 - FIM：补充中间编辑能力（辅助任务）
 
-可在 `configs/train/train_base_run.yaml` 调整：
+可在 `configs/train/train_base_run_small.yaml` 或 `configs/train/train_base_run_full.yaml` 调整：
 - `fim_ratio`：每个 batch 中 FIM 样本比例（0~1）
 - `fim_min_span`：FIM 挖洞最小 token 长度
 - `fim_max_span`：FIM 挖洞最大 token 长度

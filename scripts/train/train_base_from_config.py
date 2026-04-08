@@ -26,8 +26,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path("configs/train/train_base_run.yaml"),
-        help="训练 YAML 路径（支持顶层字段，或嵌套在 `train:` 下）。",
+        default=None,
+        help="训练 YAML 路径（支持顶层字段，或嵌套在 `train:` 下）；传入后优先级高于 --preset。",
+    )
+    parser.add_argument(
+        "--preset",
+        type=str,
+        default="small",
+        choices=["small", "full"],
+        help="内置训练配置档位：small=小规模正式训练，full=完整规模训练。",
     )
     parser.add_argument(
         "--dry-run",
@@ -48,6 +55,24 @@ def _load_train_mapping(config_path: Path) -> dict[str, Any]:
             raise ValueError(f"`train` section in {config_path} must be a mapping.")
         return train_payload
     return payload
+
+
+def _resolve_preset_config(project_root: Path, preset: str) -> Path:
+    """
+    把 `--preset` 映射到仓库内的具体 YAML 路径。
+
+    约定：
+    - `small`：小规模正式训练，用于先看训练趋势与评估曲线。
+    - `full`：完整规模训练模板，用于长时间正式训练。
+    """
+    mapping = {
+        "small": project_root / "configs" / "train" / "train_base_run_small.yaml",
+        "full": project_root / "configs" / "train" / "train_base_run_full.yaml",
+    }
+    config_path = mapping[preset].resolve()
+    if not config_path.exists():
+        raise FileNotFoundError(f"Preset config not found for --preset {preset}: {config_path}")
+    return config_path
 
 
 def _option_maps(parser: argparse.ArgumentParser) -> tuple[dict[str, argparse.Action], dict[str, str]]:
@@ -116,8 +141,11 @@ def main() -> None:
     os.chdir(project_root)
     args = _parse_args()
 
-    config_path = args.config if args.config.is_absolute() else (project_root / args.config)
-    config_path = config_path.resolve()
+    if args.config is not None:
+        config_path = args.config if args.config.is_absolute() else (project_root / args.config)
+        config_path = config_path.resolve()
+    else:
+        config_path = _resolve_preset_config(project_root, args.preset)
 
     from src.training.train_base import build_arg_parser, main as train_base_main
 

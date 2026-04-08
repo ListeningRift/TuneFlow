@@ -24,11 +24,13 @@
 - `--fim-max-span`：FIM 挖洞最大长度（token）
 
 默认值写在：
-- `configs/train/train_base_run.yaml`
+- `configs/train/train_base_run_small.yaml`
+- `configs/train/train_base_run_full.yaml`
 
 ## 训练入口（配置化）
 ```bash
-python scripts/train/train_base_from_config.py --config configs/train/train_base_run.yaml
+python scripts/train/train_base_from_config.py --preset small
+python scripts/train/train_base_from_config.py --preset full
 ```
 
 ## 回归链路同步
@@ -36,6 +38,12 @@ python scripts/train/train_base_from_config.py --config configs/train/train_base
 - 目的是在冒烟回归中强制覆盖 FIM 分支，避免后续改动导致分支失效
 
 ## 评估闭环
+- [scripts/eval/eval_all.py](/d:/Project/TuneFlow/scripts/eval/eval_all.py)：统一评估入口，一条命令顺序执行 infilling 与 continuation 两类评估
 - [scripts/eval/eval_infilling.py](/d:/Project/TuneFlow/scripts/eval/eval_infilling.py)：评估中间编辑能力，输出 `valid_loss`、`ppl`、`structural_validity_rate`
 - [scripts/eval/eval_continuation.py](/d:/Project/TuneFlow/scripts/eval/eval_continuation.py)：评估 NEXT 主任务对应的续写能力，输出 `valid_loss`、`ppl`、`structural_validity_rate`、`first_token_accuracy`
 - [scripts/train/regression_check.py](/d:/Project/TuneFlow/scripts/train/regression_check.py) 会在最小链路中同时跑这两个评估脚本
+
+统一入口示例：
+```bash
+python scripts/eval/eval_all.py --checkpoint-dir outputs/checkpoints/base/<run_id> --run-id <run_id>
+```

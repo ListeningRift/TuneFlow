@@ -176,6 +176,7 @@ raw MIDI
   - 输出：`<MIDDLE>`
 - 训练目标：优先稳定续写能力，同时补齐中间编辑能力。
 - 对应评估：
+  - `scripts/eval/eval_all.py`：统一串行执行阶段1所需的两类评估
   - `scripts/eval/eval_continuation.py`：覆盖 NEXT 主任务的续写行为
   - `scripts/eval/eval_infilling.py`：覆盖 FIM 的中间编辑行为
 
@@ -210,7 +211,7 @@ TASK_GEN BOS [STYLE_x] [TEMPO_x] <FULL_SEQUENCE_TO_EOS> EOS
 ### 7.3 工程化定义（输入/输出/验收）
 - 输入：
   - `train.bin/.idx`（阶段1用于 NEXT + FIM 混合采样）
-  - `configs/train/train_base_run.yaml`
+  - `configs/train/train_base_run_small.yaml` / `configs/train/train_base_run_full.yaml`
 - 输出：
   - `outputs/checkpoints/base/<run_id>/`
   - `outputs/metrics/base/<run_id>.json`
@@ -319,8 +320,10 @@ TASK_GEN BOS [STYLE_x] [TEMPO_x] <FULL_SEQUENCE_TO_EOS> EOS
   - 待评估 checkpoint
 - 输出：
   - `outputs/reports/eval/<run_id>.json`
+  - `outputs/reports/eval_continuation/<run_id>.json`
 - 验收标准：
   - 每次评估自动生成同结构 JSON 报告
+  - 支持统一入口 `scripts/eval/eval_all.py` 一条命令跑完整阶段1评估
   - 默认支持按 run 下所有 checkpoint 逐个评估
   - 指标可追溯到 checkpoint、配置、数据版本
 
@@ -378,6 +381,7 @@ TuneFlow/
       regression_check.py
       train_lora.py
     eval/
+      eval_all.py
       eval_infilling.py
       eval_continuation.py
   src/
@@ -412,7 +416,8 @@ TuneFlow/
 ### 14.1 配置管理
 - 统一使用 YAML 配置，不在代码里硬编码关键超参。
 - 配置变更必须进入实验记录。
-- Base 训练默认配置路径：`configs/train/train_base_run.yaml`。
+- Base 训练默认配置路径：`configs/train/train_base_run_small.yaml`。
+- 完整规模训练模板路径：`configs/train/train_base_run_full.yaml`。
 - 训练入口统一为：`scripts/train/train_base_from_config.py`。
 
 ### 14.2 实验记录

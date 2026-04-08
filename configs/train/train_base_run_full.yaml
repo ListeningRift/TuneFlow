@@ -13,7 +13,8 @@ train:
   seed: 42
 
   # Optimization
-  steps: 200
+  # 完整规模训练：保持与 small 相同建模设置，只放大训练时长与评估周期。
+  steps: 5000
   batch_size: 2
   grad_accum_steps: 1
   seq_len: 256
@@ -27,17 +28,17 @@ train:
 
   # Scheduler
   scheduler: cosine
-  warmup_steps: 20
+  warmup_steps: 200
   min_lr_scale: 0.1
 
   # Logging / eval / saving
-  log_every: 10
-  eval_every: 50
-  eval_batches: 5
-  save_every: 100
+  log_every: 20
+  eval_every: 250
+  eval_batches: 10
+  save_every: 250
   save_best: true
   no_restore_rng: false
 
   # Outputs
-  output_dir: outputs/checkpoints/base/train_base_run
+  output_dir: outputs/checkpoints/base/train_base_run_full
   metrics_path: null
