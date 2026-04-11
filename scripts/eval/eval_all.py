@@ -165,6 +165,24 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="仅打印将执行的命令，不真正启动评估。",
     )
+    parser.add_argument(
+        "--debug-invalid-samples",
+        type=int,
+        default=0,
+        help="透传给 eval_infilling.py 的非法样本调试导出数量。",
+    )
+    parser.add_argument(
+        "--debug-preview-tokens",
+        type=int,
+        default=16,
+        help="透传给 eval_infilling.py 的控制台 token 预览数量。",
+    )
+    parser.add_argument(
+        "--debug-continuation-samples",
+        type=int,
+        default=0,
+        help="透传给 eval_continuation.py 的 continuation 样本导出数量。",
+    )
     return parser.parse_args()
 
 
@@ -266,6 +284,10 @@ def main() -> None:
         *shared_args,
         "--num-infilling-samples",
         str(args.num_infilling_samples),
+        "--debug-invalid-samples",
+        str(args.debug_invalid_samples),
+        "--debug-preview-tokens",
+        str(args.debug_preview_tokens),
     ]
     continuation_cmd = [
         args.python_exec,
@@ -275,6 +297,10 @@ def main() -> None:
         str(args.num_continuation_samples),
         "--min-prefix-tokens",
         str(args.min_prefix_tokens),
+        "--debug-continuation-samples",
+        str(args.debug_continuation_samples),
+        "--debug-preview-tokens",
+        str(args.debug_preview_tokens),
     ]
 
     _run_cmd(infilling_cmd, cwd=project_root, dry_run=args.dry_run)

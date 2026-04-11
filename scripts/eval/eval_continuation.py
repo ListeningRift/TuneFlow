@@ -158,6 +158,18 @@ def _parse_args() -> argparse.Namespace:
         help="可选：训练期 metrics.jsonl 路径；默认尝试使用 checkpoint 目录下的 metrics.jsonl。",
     )
     parser.add_argument("--seed", type=int, default=42, help="随机种子。")
+    parser.add_argument(
+        "--debug-continuation-samples",
+        type=int,
+        default=0,
+        help="每个 checkpoint 额外保留多少条 continuation 实际生成样本，并导出到 samples JSON。",
+    )
+    parser.add_argument(
+        "--debug-preview-tokens",
+        type=int,
+        default=16,
+        help="控制台打印 continuation 样本时，每段 token 预览的最大数量。",
+    )
     return parser.parse_args()
 
 
@@ -315,6 +327,92 @@ def _validate_token_order(tokens: list[str], vocab: dict[str, int]) -> bool:
     return True
 
 
+def _inspect_token_order(tokens: list[str], vocab: dict[str, int]) -> tuple[bool, str]:
+    """
+    校验 token 序列结构是否合法，并返回首个失败原因。
+    语法约束与 tokenizer 训练数据保持一致：
+    - BOS ... EOS
+    - BAR 分段
+    - 音符事件按 `POS -> INST -> PITCH -> DUR -> VEL` 五元组出现
+    """
+    for idx, token in enumerate(tokens):
+        if token not in vocab:
+            return False, f"unknown_token@{idx}:{token}"
+    if not tokens:
+        return False, "empty_sequence"
+    if tokens[0] != "BOS":
+        return False, f"missing_bos:{tokens[0]}"
+    if tokens[-1] != "EOS":
+        return False, f"missing_eos:{tokens[-1]}"
+
+    idx = 1
+    if idx < len(tokens) - 1 and tokens[idx].startswith("TEMPO_"):
+        idx += 1
+
+    while idx < len(tokens) - 1:
+        if tokens[idx] != "BAR":
+            return False, f"expected_bar@{idx}:{tokens[idx]}"
+        idx += 1
+        if idx < len(tokens) - 1 and tokens[idx].startswith("TEMPO_"):
+            idx += 1
+        while idx < len(tokens) - 1 and tokens[idx].startswith("POS_"):
+            if idx + 4 >= len(tokens):
+                return False, f"incomplete_note_tuple@{idx}"
+            if not tokens[idx + 1].startswith("INST_"):
+                return False, f"expected_inst@{idx + 1}:{tokens[idx + 1]}"
+            if not tokens[idx + 2].startswith("PITCH_"):
+                return False, f"expected_pitch@{idx + 2}:{tokens[idx + 2]}"
+            if not tokens[idx + 3].startswith("DUR_"):
+                return False, f"expected_dur@{idx + 3}:{tokens[idx + 3]}"
+            if not tokens[idx + 4].startswith("VEL_"):
+                return False, f"expected_vel@{idx + 4}:{tokens[idx + 4]}"
+            idx += 5
+        if idx < len(tokens) - 1 and tokens[idx] != "BAR":
+            return False, f"expected_bar_or_eos@{idx}:{tokens[idx]}"
+    return True, "ok"
+
+
+def _preview_tokens(tokens: list[str], limit: int, *, from_tail: bool = False) -> str:
+    """生成用于控制台日志的 token 预览字符串。"""
+    if limit <= 0:
+        return ""
+    if len(tokens) <= limit:
+        return " ".join(tokens)
+    if from_tail:
+        return "... " + " ".join(tokens[-limit:])
+    return " ".join(tokens[:limit]) + " ..."
+
+
+def _print_continuation_sample_preview(
+    *,
+    step: int,
+    checkpoint_name: str,
+    sample_records: list[dict[str, Any]],
+    preview_limit: int,
+) -> None:
+    """在控制台打印 continuation 样本摘要。"""
+    if not sample_records:
+        return
+
+    print(
+        f"[eval_continuation][debug] step={step} checkpoint={checkpoint_name} "
+        f"captured_samples={len(sample_records)}"
+    )
+    for index, sample in enumerate(sample_records, start=1):
+        prompt_tail = _preview_tokens(list(sample.get("prompt_tokens", [])), preview_limit, from_tail=True)
+        target_head = _preview_tokens(list(sample.get("target_tokens", [])), preview_limit)
+        generated_head = _preview_tokens(list(sample.get("generated_tokens", [])), preview_limit)
+        print(
+            f"[eval_continuation][debug] sample={index} attempt={sample.get('attempt_index')} "
+            f"valid={sample.get('is_structurally_valid')} eos={sample.get('reached_eos')} "
+            f"first_hit={sample.get('first_token_match')} syntax_reason={sample.get('syntax_reason')} "
+            f"prompt_len={sample.get('prompt_len')} generated_len={sample.get('generated_len')}"
+        )
+        print(f"[eval_continuation][debug] sample={index} prompt_tail={prompt_tail}")
+        print(f"[eval_continuation][debug] sample={index} target={target_head}")
+        print(f"[eval_continuation][debug] sample={index} generated={generated_head}")
+
+
 def _safe_perplexity(loss: float) -> float:
     """将 loss 转为 ppl，并在极端值时做安全处理。"""
     if not math.isfinite(loss):
@@ -398,6 +496,50 @@ def _evaluate_valid_loss(
     return sum(losses) / len(losses)
 
 
+def _collect_continuation_split_positions(core: list[str]) -> list[int]:
+    """
+    收集 continuation 允许切分的位置。
+
+    约束：
+    - 不能在完整音符事件内部截断
+    - 不能把 `TEMPO_*` 当作 target 起点
+    - target 只能从 `BAR` 或完整事件 `POS -> INST -> PITCH -> DUR -> VEL` 开始
+    """
+    positions: set[int] = set()
+    idx = 0
+
+    if idx < len(core) and core[idx].startswith("TEMPO_"):
+        idx += 1
+        positions.add(idx)
+
+    while idx < len(core):
+        if core[idx] != "BAR":
+            return []
+        positions.add(idx)
+        idx += 1
+
+        if idx < len(core) and core[idx].startswith("TEMPO_"):
+            idx += 1
+
+        while idx < len(core) and core[idx].startswith("POS_"):
+            positions.add(idx)
+            if idx + 4 >= len(core):
+                return []
+            if not core[idx + 1].startswith("INST_"):
+                return []
+            if not core[idx + 2].startswith("PITCH_"):
+                return []
+            if not core[idx + 3].startswith("DUR_"):
+                return []
+            if not core[idx + 4].startswith("VEL_"):
+                return []
+            idx += 5
+
+    positions.discard(0)
+    positions.discard(len(core))
+    return sorted(positions)
+
+
 def _build_continuation_prompt(
     source_tokens: list[str],
     max_positions: int,
@@ -440,7 +582,16 @@ def _build_continuation_prompt(
     if min_prefix_for_budget > max_prefix:
         return None
 
-    prefix_len = rng.randint(min_prefix_for_budget, max_prefix)
+    split_positions = _collect_continuation_split_positions(core)
+    candidate_prefix_lengths = [
+        position
+        for position in split_positions
+        if min_prefix_for_budget <= position <= max_prefix
+    ]
+    if not candidate_prefix_lengths:
+        return None
+
+    prefix_len = candidate_prefix_lengths[rng.randrange(len(candidate_prefix_lengths))]
     prompt_tokens = ["BOS", *core[:prefix_len]]
     target_tokens = [*core[prefix_len:], "EOS"]
     if len(prompt_tokens) >= max_positions:
@@ -520,7 +671,8 @@ def _evaluate_continuation_quality(
     max_new_tokens: int,
     min_prefix_tokens: int,
     rng: random.Random,
-) -> tuple[float, int, int, float, int, int, int, int]:
+    debug_continuation_samples: int = 0,
+) -> tuple[float, int, int, float, int, int, int, int, list[dict[str, Any]]]:
     """
     评估续写生成质量。
 
@@ -533,7 +685,7 @@ def _evaluate_continuation_quality(
     - 首 token 统计总数
     """
     if num_samples <= 0 or not eval_rows:
-        return float("nan"), 0, 0, float("nan"), 0, 0
+        return float("nan"), 0, 0, float("nan"), 0, 0, 0, 0, []
 
     valid_count = 0
     attempted = 0
@@ -541,6 +693,7 @@ def _evaluate_continuation_quality(
     first_token_total = 0
     eos_hits = 0
     syntax_hits = 0
+    sample_records: list[dict[str, Any]] = []
 
     retries = 0
     max_retries = max(num_samples * 10, 100)
@@ -582,11 +735,37 @@ def _evaluate_continuation_quality(
                 first_token_hits += 1
 
         reconstructed = [*prompt_tokens, *generated_tokens, "EOS"] if reached_eos else [*prompt_tokens, *generated_tokens]
+        syntax_reason = "missing_eos"
+        is_valid = False
         if reached_eos:
             eos_hits += 1
-        if reached_eos and _validate_token_order(reconstructed, vocab):
+            is_valid, syntax_reason = _inspect_token_order(reconstructed, vocab)
+        if is_valid:
             syntax_hits += 1
             valid_count += 1
+        if len(sample_records) < debug_continuation_samples:
+            sample_records.append(
+                {
+                    "attempt_index": attempted + 1,
+                    "prompt_len": len(prompt_tokens),
+                    "target_len": len(target_tokens),
+                    "generated_len": len(generated_tokens),
+                    "reconstructed_len": len(reconstructed),
+                    "reached_eos": reached_eos,
+                    "is_structurally_valid": is_valid,
+                    "syntax_reason": syntax_reason,
+                    "first_token_match": (
+                        bool(generated_tokens and target_prefixless and generated_tokens[0] == target_prefixless[0])
+                        if target_prefixless
+                        else None
+                    ),
+                    "prompt_tokens": list(prompt_tokens),
+                    "target_tokens": list(target_tokens),
+                    "generated_tokens": list(generated_tokens),
+                    "reconstructed_tokens": list(reconstructed),
+                    "source_tokens": list(source_tokens),
+                }
+            )
         attempted += 1
 
     structural_rate = (valid_count / attempted) if attempted else float("nan")
@@ -600,6 +779,7 @@ def _evaluate_continuation_quality(
         first_token_total,
         eos_hits,
         syntax_hits,
+        sample_records,
     )
 
 
@@ -623,6 +803,7 @@ def main() -> None:
 
     run_id = args.run_id if args.run_id else checkpoint_dir.name
     report_path = _resolve_report_path(run_id=run_id, output_path=args.output_path, project_root=project_root).resolve()
+    samples_path = report_path.with_name(f"{report_path.stem}.samples.json")
 
     from src.utils.config_io import dump_json_file
     from src.utils.report_plots import write_eval_report_plot
@@ -670,6 +851,7 @@ def main() -> None:
     valid_loss_by_step = _load_valid_loss_by_step(metrics_path)
 
     results: list[dict[str, Any]] = []
+    debug_sample_results: list[dict[str, Any]] = []
     started_at = time.time()
     print(
         f"[eval_continuation] run_id={run_id} "
@@ -717,7 +899,17 @@ def main() -> None:
                 ),
             )
             ppl = _safe_perplexity(valid_loss)
-            struct_rate, struct_valid, struct_total, first_acc, first_hits, first_total, eos_hits, syntax_hits = _evaluate_continuation_quality(
+            (
+                struct_rate,
+                struct_valid,
+                struct_total,
+                first_acc,
+                first_hits,
+                first_total,
+                eos_hits,
+                syntax_hits,
+                sample_records,
+            ) = _evaluate_continuation_quality(
                 model=model,
                 torch_mod=torch,
                 eval_rows=eval_rows,
@@ -733,6 +925,7 @@ def main() -> None:
                 max_new_tokens=args.max_new_tokens,
                 min_prefix_tokens=args.min_prefix_tokens,
                 rng=continuation_rng,
+                debug_continuation_samples=max(0, int(args.debug_continuation_samples)),
             )
 
             result = {
@@ -756,6 +949,7 @@ def main() -> None:
                 "eval_batches": args.eval_batches,
                 "num_continuation_samples": args.num_continuation_samples,
                 "min_prefix_tokens": args.min_prefix_tokens,
+                "debug_sample_count": len(sample_records),
             }
             results.append(result)
             print(
@@ -765,6 +959,21 @@ def main() -> None:
                 f"eos={eos_hits}/{struct_total} syntax={syntax_hits}/{struct_total} "
                 f"first_acc={first_acc:.4f} ({first_hits}/{first_total})"
             )
+            if sample_records:
+                debug_sample_results.append(
+                    {
+                        "checkpoint_name": ckpt_path.name,
+                        "checkpoint_path": str(ckpt_path),
+                        "step": step,
+                        "samples": sample_records,
+                    }
+                )
+                _print_continuation_sample_preview(
+                    step=step,
+                    checkpoint_name=ckpt_path.name,
+                    sample_records=sample_records,
+                    preview_limit=max(1, int(args.debug_preview_tokens)),
+                )
 
             del model
             if device.type == "cuda":
@@ -797,6 +1006,8 @@ def main() -> None:
             "num_continuation_samples": args.num_continuation_samples,
             "max_new_tokens": args.max_new_tokens,
             "min_prefix_tokens": args.min_prefix_tokens,
+            "debug_continuation_samples": args.debug_continuation_samples,
+            "debug_preview_tokens": args.debug_preview_tokens,
             "seed": args.seed,
             "checkpoint_policy": args.checkpoint_policy,
             "sample_count": args.sample_count,
@@ -811,9 +1022,24 @@ def main() -> None:
         "results": results,
         "artifacts": {
             "plot_path": str(report_path.with_suffix(".png")),
+            "samples_path": (str(samples_path) if args.debug_continuation_samples > 0 else None),
         },
     }
 
+    if args.debug_continuation_samples > 0:
+        dump_json_file(
+            samples_path,
+            {
+                "run_id": run_id,
+                "created_at": time.time(),
+                "checkpoint_dir": str(checkpoint_dir),
+                "report_path": str(report_path),
+                "debug_continuation_samples": args.debug_continuation_samples,
+                "results": debug_sample_results,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
     dump_json_file(report_path, report, ensure_ascii=False, indent=2)
     plot_path = write_eval_report_plot(
         report_path=report_path,
@@ -827,6 +1053,8 @@ def main() -> None:
         ],
     )
     print(f"[eval_continuation] report -> {report_path}")
+    if args.debug_continuation_samples > 0:
+        print(f"[eval_continuation] samples -> {samples_path}")
     print(f"[eval_continuation] plot -> {plot_path}")
 
 

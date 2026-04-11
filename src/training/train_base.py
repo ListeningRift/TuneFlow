@@ -15,6 +15,26 @@ from pathlib import Path
 from ..utils.torch_utils import count_parameters, lazy_import_torch, resolve_torch_device
 
 
+def _load_id_to_token(vocab_path: Path) -> list[str]:
+    """从词表 JSON 读取 `id -> token` 映射。"""
+    payload = json.loads(vocab_path.read_text(encoding="utf-8"))
+    id_to_token_raw = payload.get("id_to_token")
+    if isinstance(id_to_token_raw, list) and id_to_token_raw:
+        return [str(token) for token in id_to_token_raw]
+
+    token_to_id = payload.get("token_to_id")
+    if not isinstance(token_to_id, dict) or not token_to_id:
+        raise ValueError(f"Invalid tokenizer vocab file: {vocab_path}")
+
+    max_id = max(int(idx) for idx in token_to_id.values())
+    id_to_token = ["<UNK>"] * (max_id + 1)
+    for token, idx in token_to_id.items():
+        int_idx = int(idx)
+        if 0 <= int_idx < len(id_to_token):
+            id_to_token[int_idx] = str(token)
+    return id_to_token
+
+
 class TokenBinDataset:
     """基于 `.bin + .idx.json` 的随机窗口采样器。"""
 
@@ -88,6 +108,105 @@ class TokenBinDataset:
         self._eligible_cache[min_len] = indices
         return indices
 
+    def _sequence_tokens(self, seq_idx: int) -> list[int]:
+        """按序列索引读取完整 token 序列。"""
+        seq_offset = self.offsets[seq_idx]
+        seq_total_len = self.lengths[seq_idx]
+        return list(self._token_view[seq_offset : seq_offset + seq_total_len])
+
+    @staticmethod
+    def _collect_window_cut_positions(sequence_tokens: list[int], id_to_token: list[str]) -> list[int]:
+        """
+        收集 NEXT/validation 允许切分的边界位置。
+
+        目标是保证窗口首尾都落在完整结构单元边界上，不在完整音符事件内部截断。
+        """
+        positions: list[int] = [0]
+        idx = 0
+
+        while idx < len(sequence_tokens):
+            token_id = int(sequence_tokens[idx])
+            if token_id < 0 or token_id >= len(id_to_token):
+                return []
+
+            token = id_to_token[token_id]
+            if token in {"BOS", "EOS", "FIM_HOLE", "FIM_MID"} or token.startswith("TEMPO_") or token == "BAR":
+                idx += 1
+                positions.append(idx)
+                continue
+
+            if token.startswith("POS_") and idx + 4 < len(sequence_tokens):
+                inst_id = int(sequence_tokens[idx + 1])
+                pitch_id = int(sequence_tokens[idx + 2])
+                dur_id = int(sequence_tokens[idx + 3])
+                vel_id = int(sequence_tokens[idx + 4])
+                if (
+                    0 <= inst_id < len(id_to_token)
+                    and 0 <= pitch_id < len(id_to_token)
+                    and 0 <= dur_id < len(id_to_token)
+                    and 0 <= vel_id < len(id_to_token)
+                    and id_to_token[inst_id].startswith("INST_")
+                    and id_to_token[pitch_id].startswith("PITCH_")
+                    and id_to_token[dur_id].startswith("DUR_")
+                    and id_to_token[vel_id].startswith("VEL_")
+                ):
+                    idx += 5
+                    positions.append(idx)
+                    continue
+            return []
+
+        return positions
+
+    def _sample_aligned_window(
+        self,
+        rng: random.Random,
+        window_len: int,
+        *,
+        id_to_token: list[str],
+        anchor: str = "random",
+        exclude_terminal_eos: bool = False,
+        max_attempts: int = 128,
+    ) -> list[int]:
+        """
+        采样一个精确长度的结构对齐窗口。
+
+        窗口首尾都落在合法边界上，不会把完整音符事件截成半段。
+        """
+        if window_len <= 0:
+            raise ValueError("window_len must be > 0.")
+
+        min_seq_len = window_len + (1 if exclude_terminal_eos else 0)
+        candidates = self._eligible_indices(min_seq_len)
+        if not candidates:
+            raise ValueError(
+                f"No sequence in {self.idx_path} has length >= {min_seq_len}. "
+                "Please lower --seq-len or regenerate data."
+            )
+
+        for _ in range(max_attempts):
+            seq_idx = candidates[rng.randrange(len(candidates))]
+            seq_tokens = self._sequence_tokens(seq_idx)
+            cut_positions = self._collect_window_cut_positions(seq_tokens, id_to_token)
+            if len(cut_positions) < 2:
+                continue
+            cut_set = set(cut_positions)
+            exact_starts = [start for start in cut_positions[:-1] if start + window_len in cut_set]
+            if exclude_terminal_eos:
+                exact_starts = [start for start in exact_starts if start + window_len == len(seq_tokens) - 1]
+            elif anchor == "start":
+                exact_starts = [start for start in exact_starts if start == 0]
+            elif anchor == "end":
+                exact_starts = [start for start in exact_starts if start + window_len == len(seq_tokens)]
+
+            if not exact_starts:
+                continue
+
+            start = exact_starts[rng.randrange(len(exact_starts))]
+            end = start + window_len
+            return seq_tokens[start:end]
+
+        raise ValueError("Unable to sample an aligned window after multiple retries.")
+
     def _sample_window(self, rng: random.Random, window_len: int, anchor: str = "random") -> list[int]:
         """随机抽取一个连续窗口（长度为 `window_len`）。"""
         if window_len <= 0:
@@ -131,9 +250,120 @@ class TokenBinDataset:
         return list(self._token_view[abs_start : abs_start + window_len])
 
     @staticmethod
+    def _collect_fim_maskable_units(base_tokens: list[int], id_to_token: list[str]) -> list[tuple[int, int, str, int]]:
+        """
+        收集训练时允许被 FIM mask 的完整结构单元。
+
+        只允许 mask：
+        - `BAR`
+        - 完整音符事件 `POS -> INST -> PITCH -> DUR -> VEL`
+
+        `BOS/EOS/TEMPO_*` 以及无法识别的残缺片段都视为不可 mask 边界。
+        """
+        units: list[tuple[int, int, str, int]] = []
+        idx = 0
+        group_id = 0
+
+        while idx < len(base_tokens):
+            token_id = int(base_tokens[idx])
+            if token_id < 0 or token_id >= len(id_to_token):
+                idx += 1
+                group_id += 1
+                continue
+
+            token = id_to_token[token_id]
+            if token in {"BOS", "EOS", "FIM_HOLE", "FIM_MID"} or token.startswith("TEMPO_"):
+                idx += 1
+                group_id += 1
+                continue
+
+            if token == "BAR":
+                units.append((idx, idx + 1, "bar", group_id))
+                idx += 1
+                continue
+
+            if token.startswith("POS_") and idx + 4 < len(base_tokens):
+                inst_id = int(base_tokens[idx + 1])
+                pitch_id = int(base_tokens[idx + 2])
+                dur_id = int(base_tokens[idx + 3])
+                vel_id = int(base_tokens[idx + 4])
+                if (
+                    0 <= inst_id < len(id_to_token)
+                    and 0 <= pitch_id < len(id_to_token)
+                    and 0 <= dur_id < len(id_to_token)
+                    and 0 <= vel_id < len(id_to_token)
+                    and id_to_token[inst_id].startswith("INST_")
+                    and id_to_token[pitch_id].startswith("PITCH_")
+                    and id_to_token[dur_id].startswith("DUR_")
+                    and id_to_token[vel_id].startswith("VEL_")
+                ):
+                    units.append((idx, idx + 5, "event", group_id))
+                    idx += 5
+                    continue
+
+            idx += 1
+            group_id += 1
+
+        return units
+
+    @classmethod
+    def _choose_fim_hole_bounds(
+        cls,
+        base_tokens: list[int],
+        *,
+        id_to_token: list[str],
+        rng: random.Random,
+        fim_min_span: int,
+        fim_max_span: int,
+    ) -> tuple[int, int] | None:
+        """
+        在完整结构单元之间选择连续洞区间。
+
+        洞不会覆盖 `BOS/EOS/TEMPO_*`，也不会跨过这些边界。
+        """
+        units = cls._collect_fim_maskable_units(base_tokens=base_tokens, id_to_token=id_to_token)
+        if len(units) < 2:
+            return None
+
+        max_span = min(max(1, fim_max_span), len(base_tokens) - 2)
+        min_span = min(max(1, fim_min_span), max_span)
+        target_span = min_span if min_span == max_span else rng.randint(min_span, max_span)
+        candidate_bounds: list[tuple[int, int, int]] = []
+
+        for start_idx, (start_token, _, _, group_id) in enumerate(units):
+            if start_token <= 0:
+                continue
+            end_token = start_token
+            for unit_idx in range(start_idx, len(units)):
+                unit_start, unit_end, _, end_group_id = units[unit_idx]
+                if end_group_id != group_id:
+                    break
+                if unit_idx > start_idx and unit_start != end_token:
+                    break
+                end_token = unit_end
+                if end_token >= len(base_tokens):
+                    continue
+                span = end_token - start_token
+                if span < min_span:
+                    continue
+                if span > max_span:
+                    break
+                candidate_bounds.append((abs(span - target_span), start_token, end_token))
+
+        if not candidate_bounds:
+            return None
+
+        candidate_bounds.sort(key=lambda item: (item[0], item[1], item[2]))
+        best_gap = candidate_bounds[0][0]
+        near_best = [(start, end) for gap, start, end in candidate_bounds if gap <= best_gap + 4]
+        return near_best[rng.randrange(len(near_best))]
+
+    @classmethod
     def _build_fim_example(
+        cls,
         base_tokens: list[int],
         rng: random.Random,
+        id_to_token: list[str],
         fim_hole_token_id: int,
         fim_mid_token_id: int,
         fim_min_span: int,
@@ -151,13 +381,18 @@ class TokenBinDataset:
         if length < 4:
             raise ValueError("FIM base sequence must contain at least 4 tokens.")
 
-        max_span = min(max(1, fim_max_span), length - 2)
-        min_span = min(max(1, fim_min_span), max_span)
-        span = min_span if min_span == max_span else rng.randint(min_span, max_span)
+        hole_bounds = cls._choose_fim_hole_bounds(
+            base_tokens=base_tokens,
+            id_to_token=id_to_token,
+            rng=rng,
+            fim_min_span=fim_min_span,
+            fim_max_span=fim_max_span,
+        )
+        if hole_bounds is None:
+            raise ValueError("Unable to find a valid FIM hole made of complete structural units.")
 
         # 约束 hole 左右都至少保留 1 个 token，避免退化为纯前缀/纯后缀。
-        start = rng.randint(1, length - span - 1)
-        end = start + span
+        start, end = hole_bounds
 
         prefix = base_tokens[:start]
         middle = base_tokens[start:end]
@@ -181,6 +416,7 @@ class TokenBinDataset:
         batch_size: int,
         seq_len: int,
         device,
+        id_to_token: list[str],
         bos_sample_ratio: float = 0.0,
         eos_sample_ratio: float = 0.0,
     ):
@@ -195,7 +431,12 @@ class TokenBinDataset:
                 anchor = "end"
             else:
                 anchor = "random"
-            window = self._sample_window(rng=rng, window_len=seq_len, anchor=anchor)
+            window = self._sample_aligned_window(
+                rng=rng,
+                window_len=seq_len,
+                id_to_token=id_to_token,
+                anchor=anchor,
+            )
             input_rows.append(window)
             label_rows.append(window.copy())
 
@@ -210,6 +451,7 @@ class TokenBinDataset:
         batch_size: int,
         seq_len: int,
         device,
+        id_to_token: list[str],
         fim_ratio: float,
         fim_hole_token_id: int | None,
         fim_mid_token_id: int | None,
@@ -245,20 +487,39 @@ class TokenBinDataset:
                     and seq_len > 3
                     and (rng.random() < fim_eos_ratio)
                 )
-                if use_fim_eos:
-                    base_tokens = self._sample_window_before_eos(rng=rng, window_len=seq_len - 3)
-                else:
-                    base_tokens = self._sample_window(rng=rng, window_len=seq_len - 2)
-                fim_input, fim_labels = self._build_fim_example(
-                    base_tokens=base_tokens,
-                    rng=rng,
-                    fim_hole_token_id=fim_hole_token_id,
-                    fim_mid_token_id=fim_mid_token_id,
-                    fim_min_span=fim_min_span,
-                    fim_max_span=fim_max_span,
-                    append_eos=use_fim_eos,
-                    eos_token_id=eos_token_id,
-                )
+                fim_input = None
+                fim_labels = None
+                for _ in range(16):
+                    if use_fim_eos:
+                        base_tokens = self._sample_aligned_window(
+                            rng=rng,
+                            window_len=seq_len - 3,
+                            id_to_token=id_to_token,
+                            exclude_terminal_eos=True,
+                        )
+                    else:
+                        base_tokens = self._sample_aligned_window(
+                            rng=rng,
+                            window_len=seq_len - 2,
+                            id_to_token=id_to_token,
+                        )
+                    try:
+                        fim_input, fim_labels = self._build_fim_example(
+                            base_tokens=base_tokens,
+                            rng=rng,
+                            id_to_token=id_to_token,
+                            fim_hole_token_id=fim_hole_token_id,
+                            fim_mid_token_id=fim_mid_token_id,
+                            fim_min_span=fim_min_span,
+                            fim_max_span=fim_max_span,
+                            append_eos=use_fim_eos,
+                            eos_token_id=eos_token_id,
+                        )
+                        break
+                    except ValueError:
+                        continue
+                if fim_input is None or fim_labels is None:
+                    raise ValueError("Unable to sample a valid FIM example after multiple retries.")
                 input_rows.append(fim_input)
                 label_rows.append(fim_labels)
                 fim_examples += 1
@@ -270,7 +531,12 @@ class TokenBinDataset:
                     anchor = "end"
                 else:
                     anchor = "random"
-                window = self._sample_window(rng=rng, window_len=seq_len, anchor=anchor)
+                window = self._sample_aligned_window(
+                    rng=rng,
+                    window_len=seq_len,
+                    id_to_token=id_to_token,
+                    anchor=anchor,
+                )
                 input_rows.append(window)
                 label_rows.append(window.copy())
 
@@ -587,6 +853,7 @@ def _evaluate(
     eval_batches: int,
     use_amp: bool,
     amp_dtype,
+    id_to_token: list[str],
 ) -> float:
     """在验证集上采样若干 batch，返回平均 loss。"""
     if eval_batches <= 0:
@@ -603,6 +870,7 @@ def _evaluate(
                 batch_size=batch_size,
                 seq_len=seq_len,
                 device=device,
+                id_to_token=id_to_token,
             )
             # 评估阶段与训练保持一致的精度策略，避免统计口径偏差。
             with _autocast_context(torch_mod, use_amp=use_amp, device_type=device.type, amp_dtype=amp_dtype):
@@ -659,6 +927,14 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(
             "--fim-ratio > 0 but FIM_HOLE/FIM_MID token id is missing in model config."
         )
+    if not config.vocab_path:
+        raise SystemExit("Training window sampling requires model config to provide vocab_path.")
+    vocab_path = Path(config.vocab_path)
+    if not vocab_path.is_absolute():
+        vocab_path = vocab_path.resolve()
+    if not vocab_path.exists():
+        raise SystemExit(f"Tokenizer vocab file not found for window sampling: {vocab_path}")
+    id_to_token = _load_id_to_token(vocab_path)
 
     train_dataset = TokenBinDataset(args.train_idx, args.train_bin)
     valid_dataset = TokenBinDataset(args.valid_idx, args.valid_bin) if args.valid_idx.exists() else None
@@ -786,6 +1062,7 @@ def main(argv: list[str] | None = None) -> None:
                     batch_size=args.batch_size,
                     seq_len=args.seq_len,
                     device=device,
+                    id_to_token=id_to_token,
                     fim_ratio=args.fim_ratio,
                     fim_hole_token_id=fim_hole_token_id,
                     fim_mid_token_id=fim_mid_token_id,
@@ -883,6 +1160,7 @@ def main(argv: list[str] | None = None) -> None:
                     eval_batches=args.eval_batches,
                     use_amp=use_amp,
                     amp_dtype=amp_dtype,
+                    id_to_token=id_to_token,
                 )
                 print(f"[train_base] eval step={step} valid_loss={val_loss:.6f}")
                 _append_metrics(

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import json
 import math
 import os
@@ -152,6 +153,18 @@ def _parse_args() -> argparse.Namespace:
         help="可选：训练期 metrics.jsonl 路径；默认尝试使用 checkpoint 目录下的 metrics.jsonl。",
     )
     parser.add_argument("--seed", type=int, default=42, help="随机种子。")
+    parser.add_argument(
+        "--debug-invalid-samples",
+        type=int,
+        default=0,
+        help="每个 checkpoint 额外保留多少条非法样本；大于 0 时会打印摘要并写出 debug JSON。",
+    )
+    parser.add_argument(
+        "--debug-preview-tokens",
+        type=int,
+        default=16,
+        help="控制台打印非法样本时，每段 token 预览的最大数量。",
+    )
     return parser.parse_args()
 
 
@@ -315,6 +328,189 @@ def _validate_token_order(tokens: list[str], vocab: dict[str, int]) -> bool:
     return True
 
 
+def _inspect_token_order(tokens: list[str], vocab: dict[str, int]) -> tuple[bool, str]:
+    """
+    校验 token 序列结构是否合法，并返回首个失败原因。
+    语法约束与 tokenizer 训练数据保持一致：
+    - BOS ... EOS
+    - BAR 分段
+    - 音符事件按 `POS -> INST -> PITCH -> DUR -> VEL` 五元组出现
+    """
+    for idx, token in enumerate(tokens):
+        if token not in vocab:
+            return False, f"unknown_token@{idx}:{token}"
+    if not tokens:
+        return False, "empty_sequence"
+    if tokens[0] != "BOS":
+        return False, f"missing_bos:{tokens[0]}"
+    if tokens[-1] != "EOS":
+        return False, f"missing_eos:{tokens[-1]}"
+
+    idx = 1
+    if idx < len(tokens) - 1 and tokens[idx].startswith("TEMPO_"):
+        idx += 1
+
+    while idx < len(tokens) - 1:
+        if tokens[idx] != "BAR":
+            return False, f"expected_bar@{idx}:{tokens[idx]}"
+        idx += 1
+        if idx < len(tokens) - 1 and tokens[idx].startswith("TEMPO_"):
+            idx += 1
+        while idx < len(tokens) - 1 and tokens[idx].startswith("POS_"):
+            if idx + 4 >= len(tokens):
+                return False, f"incomplete_note_tuple@{idx}"
+            if not tokens[idx + 1].startswith("INST_"):
+                return False, f"expected_inst@{idx + 1}:{tokens[idx + 1]}"
+            if not tokens[idx + 2].startswith("PITCH_"):
+                return False, f"expected_pitch@{idx + 2}:{tokens[idx + 2]}"
+            if not tokens[idx + 3].startswith("DUR_"):
+                return False, f"expected_dur@{idx + 3}:{tokens[idx + 3]}"
+            if not tokens[idx + 4].startswith("VEL_"):
+                return False, f"expected_vel@{idx + 4}:{tokens[idx + 4]}"
+            idx += 5
+        if idx < len(tokens) - 1 and tokens[idx] != "BAR":
+            return False, f"expected_bar_or_eos@{idx}:{tokens[idx]}"
+    return True, "ok"
+
+
+def _preview_tokens(tokens: list[str], limit: int, *, from_tail: bool = False) -> str:
+    """生成用于控制台日志的 token 预览字符串。"""
+    if limit <= 0:
+        return ""
+    if len(tokens) <= limit:
+        return " ".join(tokens)
+    if from_tail:
+        return "... " + " ".join(tokens[-limit:])
+    return " ".join(tokens[:limit]) + " ..."
+
+
+def _print_invalid_sample_preview(
+    *,
+    step: int,
+    checkpoint_name: str,
+    invalid_samples: list[dict[str, Any]],
+    preview_limit: int,
+) -> None:
+    """在控制台打印非法样本的简要摘要。"""
+    if not invalid_samples:
+        return
+
+    reason_counts: dict[str, int] = {}
+    for sample in invalid_samples:
+        reason = str(sample.get("failure_reason", "unknown"))
+        reason_counts[reason] = reason_counts.get(reason, 0) + 1
+    reasons_text = ", ".join(f"{key}={value}" for key, value in sorted(reason_counts.items()))
+    print(
+        f"[eval_infilling][debug] step={step} checkpoint={checkpoint_name} "
+        f"captured_invalid={len(invalid_samples)} reasons={reasons_text}"
+    )
+    for index, sample in enumerate(invalid_samples, start=1):
+        prompt_tail = _preview_tokens(list(sample.get("prompt_tokens", [])), preview_limit, from_tail=True)
+        generated_head = _preview_tokens(list(sample.get("generated_middle_tokens", [])), preview_limit)
+        print(
+            f"[eval_infilling][debug] sample={index} attempt={sample.get('attempt_index')} "
+            f"failure={sample.get('failure_reason')} syntax_reason={sample.get('syntax_reason')} "
+            f"prompt_len={sample.get('prompt_len')} generated_len={sample.get('generated_middle_len')} "
+            f"prompt_tail={prompt_tail}"
+        )
+        print(f"[eval_infilling][debug] sample={index} generated={generated_head}")
+
+
+def _collect_infill_maskable_units(core: list[str]) -> list[tuple[int, int, str, int]]:
+    """
+    收集允许被 mask 的完整单元。
+
+    约束如下：
+    - 只允许 mask `BAR`
+    - 只允许 mask 完整音符事件 `POS -> INST -> PITCH -> DUR -> VEL`
+    - `TEMPO_*` 属于不可 mask 的特殊 token，同时也是不可跨越的边界
+    """
+    if not core:
+        return []
+
+    units: list[tuple[int, int, str, int]] = []
+    idx = 0
+    group_id = 0
+
+    if idx < len(core) and core[idx].startswith("TEMPO_"):
+        idx += 1
+        group_id += 1
+
+    while idx < len(core):
+        if core[idx] != "BAR":
+            return []
+        units.append((idx, idx + 1, "bar", group_id))
+        idx += 1
+
+        if idx < len(core) and core[idx].startswith("TEMPO_"):
+            idx += 1
+            group_id += 1
+
+        while idx < len(core) and core[idx].startswith("POS_"):
+            if idx + 4 >= len(core):
+                return []
+            if not core[idx + 1].startswith("INST_"):
+                return []
+            if not core[idx + 2].startswith("PITCH_"):
+                return []
+            if not core[idx + 3].startswith("DUR_"):
+                return []
+            if not core[idx + 4].startswith("VEL_"):
+                return []
+            units.append((idx, idx + 5, "event", group_id))
+            idx += 5
+
+    return units
+
+
+def _choose_infill_hole_bounds(
+    core: list[str],
+    *,
+    target_hole_tokens: int,
+    rng: random.Random,
+) -> tuple[int, int] | None:
+    """
+    在允许 mask 的完整单元之间选择一个连续洞区间。
+
+    洞只会覆盖 `BAR` 或完整音符事件，且不会跨过 `TEMPO_*`。
+    """
+    units = _collect_infill_maskable_units(core)
+    if len(units) < 2:
+        return None
+
+    max_hole_tokens = max(1, min(96, len(core) - 2))
+    min_hole_tokens = min(max_hole_tokens, max(1, min(target_hole_tokens, 8)))
+    candidate_bounds: list[tuple[int, int, int]] = []
+
+    for start_idx, (start_token, _, _, group_id) in enumerate(units):
+        if start_token <= 0:
+            continue
+        end_token = start_token
+        for end_idx in range(start_idx, len(units)):
+            unit_start, unit_end, _, end_group_id = units[end_idx]
+            if end_group_id != group_id:
+                break
+            if end_idx > start_idx and unit_start != end_token:
+                break
+            end_token = unit_end
+            if end_token >= len(core):
+                continue
+            span = end_token - start_token
+            if span < min_hole_tokens:
+                continue
+            if span > max_hole_tokens:
+                break
+            candidate_bounds.append((abs(span - target_hole_tokens), start_token, end_token))
+
+    if not candidate_bounds:
+        return None
+
+    candidate_bounds.sort(key=lambda item: (item[0], item[1], item[2]))
+    best_gap = candidate_bounds[0][0]
+    near_best = [(start_cut, end_cut) for gap, start_cut, end_cut in candidate_bounds if gap <= best_gap + 4]
+    return rng.choice(near_best)
+
+
 def _safe_perplexity(loss: float) -> float:
     """将 loss 转为 ppl，并在极端值时做安全处理。"""
     if not math.isfinite(loss):
@@ -426,14 +622,17 @@ def _build_infilling_prompt(
         return None
     core = seq[1:-1]
     core_len = len(core)
-    hole_len = max(8, int(round(core_len * 0.2)))
-    hole_len = min(hole_len, 96, core_len - 4)
-    if hole_len <= 0:
+    target_hole_len = max(8, int(round(core_len * 0.2)))
+    target_hole_len = min(target_hole_len, 96, core_len - 2)
+    if target_hole_len <= 0:
         return None
 
-    hole_start_core = rng.randrange(0, core_len - hole_len + 1)
+    hole_bounds = _choose_infill_hole_bounds(core, target_hole_tokens=target_hole_len, rng=rng)
+    if hole_bounds is None:
+        return None
+    hole_start_core, hole_end_core = hole_bounds
     hole_start = 1 + hole_start_core
-    hole_end = hole_start + hole_len
+    hole_end = 1 + hole_end_core
 
     prefix = seq[:hole_start]
     # suffix 不含 EOS，要求模型先生成 middle，再生成 EOS 结束。
@@ -515,7 +714,17 @@ def _evaluate_structural_validity(
     num_samples: int,
     max_new_tokens: int,
     rng: random.Random,
-) -> tuple[float, int, int, int, int]:
+    debug_invalid_samples: int = 0,
+) -> tuple[
+    float,
+    int,
+    int,
+    int,
+    int,
+    list[dict[str, Any]],
+    dict[str, int],
+    dict[str, int],
+]:
     """
     评估结构合法率。
 
@@ -525,12 +734,15 @@ def _evaluate_structural_validity(
     3) 重建为完整序列并做结构语法校验。
     """
     if num_samples <= 0 or not eval_rows:
-        return float("nan"), 0, 0
+        return float("nan"), 0, 0, 0, 0, [], {}, {}
 
     valid_count = 0
     attempted = 0
     eos_hits = 0
     syntax_hits = 0
+    invalid_samples: list[dict[str, Any]] = []
+    invalid_reason_counts: Counter[str] = Counter()
+    invalid_syntax_reason_counts: Counter[str] = Counter()
 
     retries = 0
     max_retries = max(num_samples * 10, 100)
@@ -566,17 +778,51 @@ def _evaluate_structural_validity(
             suffix = suffix[:suffix_len]
 
         reconstructed = [*prefix, *middle_tokens, *suffix, "EOS"]
-        is_valid = reached_eos and _validate_token_order(reconstructed, vocab)
+        syntax_reason = "missing_eos"
+        is_valid = False
         if reached_eos:
             eos_hits += 1
+            is_valid, syntax_reason = _inspect_token_order(reconstructed, vocab)
         if is_valid:
             syntax_hits += 1
             valid_count += 1
+        else:
+            failure_reason = "missing_eos" if not reached_eos else "syntax_invalid"
+            invalid_reason_counts[failure_reason] += 1
+            invalid_syntax_reason_counts[syntax_reason] += 1
+            if len(invalid_samples) < debug_invalid_samples:
+                invalid_samples.append(
+                    {
+                        "attempt_index": attempted + 1,
+                        "failure_reason": failure_reason,
+                        "syntax_reason": syntax_reason,
+                        "prompt_len": len(prompt_tokens),
+                        "prefix_len": len(prefix),
+                        "suffix_len": len(suffix),
+                        "generated_middle_len": len(middle_tokens),
+                        "reconstructed_len": len(reconstructed),
+                        "prompt_tokens": list(prompt_tokens),
+                        "prefix_tokens": list(prefix),
+                        "generated_middle_tokens": list(middle_tokens),
+                        "suffix_tokens": list(suffix),
+                        "reconstructed_tokens": list(reconstructed),
+                        "source_tokens": list(source_tokens),
+                    }
+                )
         attempted += 1
 
     if attempted == 0:
-        return float("nan"), 0, 0, 0, 0
-    return valid_count / attempted, valid_count, attempted, eos_hits, syntax_hits
+        return float("nan"), 0, 0, 0, 0, [], {}, {}
+    return (
+        valid_count / attempted,
+        valid_count,
+        attempted,
+        eos_hits,
+        syntax_hits,
+        invalid_samples,
+        dict(invalid_reason_counts),
+        dict(invalid_syntax_reason_counts),
+    )
 
 
 def _resolve_report_path(run_id: str, output_path: Path | None, project_root: Path) -> Path:
@@ -601,6 +847,7 @@ def main() -> None:
 
     run_id = args.run_id if args.run_id else checkpoint_dir.name
     report_path = _resolve_report_path(run_id=run_id, output_path=args.output_path, project_root=project_root).resolve()
+    invalid_samples_path = report_path.with_name(f"{report_path.stem}.invalid_samples.json")
 
     # 懒加载 torch，确保错误信息更可读，并减少无关场景启动开销。
     from src.utils.config_io import dump_json_file
@@ -651,6 +898,7 @@ def main() -> None:
     valid_loss_by_step = _load_valid_loss_by_step(metrics_path)
 
     results: list[dict[str, Any]] = []
+    invalid_debug_results: list[dict[str, Any]] = []
     started_at = time.time()
     print(
         f"[eval_infilling] run_id={run_id} checkpoints={len(checkpoints)} "
@@ -700,7 +948,16 @@ def main() -> None:
                 ),
             )
             ppl = _safe_perplexity(valid_loss)
-            struct_rate, struct_valid, struct_total, eos_hits, syntax_hits = _evaluate_structural_validity(
+            (
+                struct_rate,
+                struct_valid,
+                struct_total,
+                eos_hits,
+                syntax_hits,
+                invalid_samples,
+                invalid_reason_counts,
+                invalid_syntax_reason_counts,
+            ) = _evaluate_structural_validity(
                 model=model,
                 torch_mod=torch,
                 eval_rows=eval_rows,
@@ -715,6 +972,7 @@ def main() -> None:
                 num_samples=args.num_infilling_samples,
                 max_new_tokens=args.max_new_tokens,
                 rng=infill_rng,
+                debug_invalid_samples=max(0, int(args.debug_invalid_samples)),
             )
 
             result = {
@@ -734,14 +992,43 @@ def main() -> None:
                 "seq_len": eval_seq_len,
                 "eval_batches": args.eval_batches,
                 "num_infilling_samples": args.num_infilling_samples,
+                "invalid_debug_sample_count": len(invalid_samples),
+                "invalid_reason_counts": invalid_reason_counts,
+                "invalid_syntax_reason_counts": invalid_syntax_reason_counts,
             }
             results.append(result)
+            invalid_reason_text = ", ".join(
+                f"{key}={value}" for key, value in sorted(invalid_reason_counts.items())
+            ) or "none"
+            invalid_syntax_text = ", ".join(
+                f"{key}={value}" for key, value in sorted(invalid_syntax_reason_counts.items())
+            ) or "none"
             print(
                 f"[eval_infilling] step={result['step']} "
                 f"valid_loss={valid_loss:.6f}({valid_loss_source}) ppl={ppl:.6f} "
                 f"struct_valid={struct_rate:.4f} ({struct_valid}/{struct_total}) "
-                f"eos={eos_hits}/{struct_total} syntax={syntax_hits}/{struct_total}"
+                f"eos={eos_hits}/{struct_total} syntax={syntax_hits}/{struct_total} "
+                f"invalid={invalid_reason_text}"
             )
+            if invalid_syntax_reason_counts:
+                print(f"[eval_infilling] step={result['step']} invalid_syntax={invalid_syntax_text}")
+            if invalid_samples:
+                invalid_debug_results.append(
+                    {
+                        "checkpoint_name": ckpt_path.name,
+                        "checkpoint_path": str(ckpt_path),
+                        "step": step,
+                        "invalid_reason_counts": invalid_reason_counts,
+                        "invalid_syntax_reason_counts": invalid_syntax_reason_counts,
+                        "samples": invalid_samples,
+                    }
+                )
+                _print_invalid_sample_preview(
+                    step=step,
+                    checkpoint_name=ckpt_path.name,
+                    invalid_samples=invalid_samples,
+                    preview_limit=max(1, int(args.debug_preview_tokens)),
+                )
 
             del model
             if device.type == "cuda":
@@ -753,11 +1040,18 @@ def main() -> None:
     # 汇总 run 级别统计，便于快速看趋势与最优点。
     finite_losses = [r["valid_loss"] for r in results if math.isfinite(float(r["valid_loss"]))]
     finite_struct = [r["structural_validity_rate"] for r in results if math.isfinite(float(r["structural_validity_rate"]))]
+    summary_invalid_reason_counts: Counter[str] = Counter()
+    summary_invalid_syntax_reason_counts: Counter[str] = Counter()
+    for result in results:
+        summary_invalid_reason_counts.update(result.get("invalid_reason_counts", {}))
+        summary_invalid_syntax_reason_counts.update(result.get("invalid_syntax_reason_counts", {}))
     summary = {
         "checkpoint_count": len(results),
         "best_valid_loss": (min(finite_losses) if finite_losses else float("nan")),
         "best_structural_validity_rate": (max(finite_struct) if finite_struct else float("nan")),
         "elapsed_sec": max(0.0, time.time() - started_at),
+        "invalid_reason_counts": dict(summary_invalid_reason_counts),
+        "invalid_syntax_reason_counts": dict(summary_invalid_syntax_reason_counts),
     }
 
     report = {
@@ -773,6 +1067,8 @@ def main() -> None:
             "eval_batches": args.eval_batches,
             "num_infilling_samples": args.num_infilling_samples,
             "max_new_tokens": args.max_new_tokens,
+            "debug_invalid_samples": args.debug_invalid_samples,
+            "debug_preview_tokens": args.debug_preview_tokens,
             "seed": args.seed,
             "checkpoint_policy": args.checkpoint_policy,
             "sample_count": args.sample_count,
@@ -787,9 +1083,24 @@ def main() -> None:
         "results": results,
         "artifacts": {
             "plot_path": str(report_path.with_suffix(".png")),
+            "invalid_samples_path": (str(invalid_samples_path) if args.debug_invalid_samples > 0 else None),
         },
     }
 
+    if args.debug_invalid_samples > 0:
+        dump_json_file(
+            invalid_samples_path,
+            {
+                "run_id": run_id,
+                "created_at": time.time(),
+                "checkpoint_dir": str(checkpoint_dir),
+                "report_path": str(report_path),
+                "debug_invalid_samples": args.debug_invalid_samples,
+                "results": invalid_debug_results,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
     dump_json_file(report_path, report, ensure_ascii=False, indent=2)
     plot_path = write_eval_report_plot(
         report_path=report_path,
@@ -802,6 +1113,8 @@ def main() -> None:
         ],
     )
     print(f"[eval_infilling] report -> {report_path}")
+    if args.debug_invalid_samples > 0:
+        print(f"[eval_infilling] invalid samples -> {invalid_samples_path}")
     print(f"[eval_infilling] plot -> {plot_path}")
 
 
