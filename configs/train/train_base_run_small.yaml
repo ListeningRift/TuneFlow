@@ -22,11 +22,11 @@ train:
   weight_decay: 0.01
   grad_clip: 1.0
   # NEXT + FIM 混合训练：续写为主任务，FIM 为辅助任务。
-  fim_ratio: 0.15
+  fim_ratio: 0.3
   fim_min_span: 8
   fim_max_span: 64
   bos_sample_ratio: 0.1
-  eos_sample_ratio: 0.1
+  eos_sample_ratio: 0.3
   fim_eos_ratio: 1.0
 
   # 学习率调度

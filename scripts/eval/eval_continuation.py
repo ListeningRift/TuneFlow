@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import json
 import math
 import os
@@ -401,16 +402,26 @@ def _print_continuation_sample_preview(
     for index, sample in enumerate(sample_records, start=1):
         prompt_tail = _preview_tokens(list(sample.get("prompt_tokens", [])), preview_limit, from_tail=True)
         target_head = _preview_tokens(list(sample.get("target_tokens", [])), preview_limit)
-        generated_head = _preview_tokens(list(sample.get("generated_tokens", [])), preview_limit)
+        raw_record = sample.get("raw", {})
+        fsm_record = sample.get("fsm", {})
+        raw_generated_head = _preview_tokens(list(raw_record.get("generated_tokens", [])), preview_limit)
+        fsm_generated_head = _preview_tokens(list(fsm_record.get("generated_tokens", [])), preview_limit)
         print(
             f"[eval_continuation][debug] sample={index} attempt={sample.get('attempt_index')} "
-            f"valid={sample.get('is_structurally_valid')} eos={sample.get('reached_eos')} "
-            f"first_hit={sample.get('first_token_match')} syntax_reason={sample.get('syntax_reason')} "
-            f"prompt_len={sample.get('prompt_len')} generated_len={sample.get('generated_len')}"
+            f"raw_valid={raw_record.get('is_structurally_valid')} fsm_valid={fsm_record.get('is_structurally_valid')} "
+            f"raw_eos={raw_record.get('reached_eos')} fsm_eos={fsm_record.get('reached_eos')} "
+            f"raw_first_hit={raw_record.get('first_token_match')} fsm_first_hit={fsm_record.get('first_token_match')} "
+            f"prompt_len={sample.get('prompt_len')} "
+            f"raw_generated_len={raw_record.get('generated_len')} fsm_generated_len={fsm_record.get('generated_len')}"
         )
         print(f"[eval_continuation][debug] sample={index} prompt_tail={prompt_tail}")
         print(f"[eval_continuation][debug] sample={index} target={target_head}")
-        print(f"[eval_continuation][debug] sample={index} generated={generated_head}")
+        print(
+            f"[eval_continuation][debug] sample={index} "
+            f"raw_reason={raw_record.get('syntax_reason')} fsm_reason={fsm_record.get('syntax_reason')}"
+        )
+        print(f"[eval_continuation][debug] sample={index} raw_generated={raw_generated_head}")
+        print(f"[eval_continuation][debug] sample={index} fsm_generated={fsm_generated_head}")
 
 
 def _safe_perplexity(loss: float) -> float:
@@ -456,6 +467,7 @@ def _evaluate_valid_loss(
     torch_mod,
     rng: random.Random,
     device,
+    id_to_token: list[str],
     batch_size: int,
     seq_len: int,
     eval_batches: int,
@@ -478,6 +490,7 @@ def _evaluate_valid_loss(
                 batch_size=batch_size,
                 seq_len=seq_len,
                 device=device,
+                id_to_token=id_to_token,
             )
             with autocast_context_fn(
                 torch_mod=torch_mod,
@@ -599,37 +612,126 @@ def _build_continuation_prompt(
     return prompt_tokens, target_tokens
 
 
+_SAFE_CLOSE_STATES = {
+    "after_head_tempo",
+    "after_bar",
+    "after_bar_tempo",
+    "after_vel",
+}
+
+
+def _continuation_eos_bias(*, generated_len: int, max_can_generate: int, fsm_state: str | None) -> float:
+    """Length-aware EOS bias for FSM continuation decoding."""
+    if max_can_generate <= 0 or generated_len < 0:
+        return 0.0
+
+    progress = float(generated_len) / float(max_can_generate)
+    remaining_budget = max_can_generate - generated_len
+    bias = 0.0
+    if progress >= 0.50:
+        bias += 0.35
+    if progress >= 0.70:
+        bias += 0.75
+    if progress >= 0.85:
+        bias += 1.50
+    if remaining_budget <= 8:
+        bias += 0.75
+    if remaining_budget <= 4:
+        bias += 1.00
+    if fsm_state in _SAFE_CLOSE_STATES and generated_len >= 8:
+        bias += 0.50
+    return bias
+
+
+def _should_force_safe_boundary_stop(*, generated_len: int, max_can_generate: int, fsm_state: str | None) -> bool:
+    """Deterministically stop at safe boundaries when the decode is about to exhaust its budget."""
+    if fsm_state not in _SAFE_CLOSE_STATES:
+        return False
+    if generated_len <= 0 or max_can_generate <= 0:
+        return False
+
+    remaining_budget = max_can_generate - generated_len
+    if remaining_budget > max(4, min(8, max_can_generate // 8)):
+        return False
+    return generated_len >= max(8, min(24, max_can_generate // 4))
+
+
 def _generate_continuation_tokens(
     model,
     torch_mod,
     prompt_tokens: list[str],
     token_to_id: dict[str, int],
     id_to_token: list[str],
+    grammar_fsm,
     device,
     use_amp: bool,
     amp_dtype,
     autocast_context_fn,
     max_positions: int,
     max_new_tokens: int,
-) -> tuple[list[str], bool]:
+) -> tuple[list[str], bool, dict[str, float | int]]:
     """基于 prefix 执行贪心解码，返回续写 token 与是否遇到 EOS。"""
+    from src.decoding import select_masked_argmax
+
     prompt_ids: list[int] = []
     for token in prompt_tokens:
         token_id = token_to_id.get(token)
         if token_id is None:
-            return [], False
+            return [], False, {
+                "step_count": 0,
+                "illegal_top1_count": 0,
+                "mask_intervention_count": 0,
+                "legal_mass_sum": 0.0,
+                "dead_end_count": 0,
+                "eos_bias_step_count": 0,
+                "safe_boundary_stop_count": 0,
+            }
         prompt_ids.append(token_id)
 
     input_ids = torch_mod.tensor([prompt_ids], dtype=torch_mod.long, device=device)
     generated_tokens: list[str] = []
     reached_eos = False
+    stats: dict[str, float | int] = {
+        "step_count": 0,
+        "illegal_top1_count": 0,
+        "mask_intervention_count": 0,
+        "legal_mass_sum": 0.0,
+        "dead_end_count": 0,
+        "auto_close_count": 0,
+        "eos_bias_step_count": 0,
+        "safe_boundary_stop_count": 0,
+    }
+
+    fsm_state = None
+    if grammar_fsm is not None:
+        fsm_state = grammar_fsm.state_after_prefix_ids(prompt_ids)
+        if fsm_state is None:
+            stats["dead_end_count"] = 1
+            return generated_tokens, False, stats
 
     max_can_generate = max(0, min(max_new_tokens, max_positions - int(input_ids.shape[1])))
     if max_can_generate <= 0:
-        return generated_tokens, reached_eos
+        if grammar_fsm is not None and grammar_fsm.eos_id in grammar_fsm.allowed_token_ids(fsm_state):
+            reached_eos = True
+            stats["auto_close_count"] = 1
+        return generated_tokens, reached_eos, stats
 
+    stopped_without_eos = False
     with torch_mod.no_grad():
         for _ in range(max_can_generate):
+            if (
+                grammar_fsm is not None
+                and grammar_fsm.eos_id in grammar_fsm.allowed_token_ids(fsm_state)
+                and _should_force_safe_boundary_stop(
+                    generated_len=len(generated_tokens),
+                    max_can_generate=max_can_generate,
+                    fsm_state=fsm_state,
+                )
+            ):
+                reached_eos = True
+                stats["safe_boundary_stop_count"] = int(stats["safe_boundary_stop_count"]) + 1
+                break
+
             with autocast_context_fn(
                 torch_mod=torch_mod,
                 use_amp=use_amp,
@@ -637,11 +739,47 @@ def _generate_continuation_tokens(
                 amp_dtype=amp_dtype,
             ):
                 outputs = model(input_ids=input_ids, return_dict=True)
-            next_id = int(torch_mod.argmax(outputs.logits[:, -1, :], dim=-1).item())
+            step_logits = outputs.logits[0, -1, :]
+            if grammar_fsm is None:
+                next_id = int(torch_mod.argmax(step_logits, dim=-1).item())
+            else:
+                if grammar_fsm.eos_id in grammar_fsm.allowed_token_ids(fsm_state):
+                    eos_bias = _continuation_eos_bias(
+                        generated_len=len(generated_tokens),
+                        max_can_generate=max_can_generate,
+                        fsm_state=fsm_state,
+                    )
+                    if eos_bias > 0.0:
+                        step_logits = step_logits.clone()
+                        step_logits[grammar_fsm.eos_id] = step_logits[grammar_fsm.eos_id] + float(eos_bias)
+                        stats["eos_bias_step_count"] = int(stats["eos_bias_step_count"]) + 1
+                allowed_ids = grammar_fsm.allowed_token_ids(fsm_state)
+                decision = select_masked_argmax(step_logits, allowed_ids)
+                stats["step_count"] = int(stats["step_count"]) + 1
+                stats["legal_mass_sum"] = float(stats["legal_mass_sum"]) + float(decision.legal_mass)
+                if not decision.raw_top1_is_legal:
+                    stats["illegal_top1_count"] = int(stats["illegal_top1_count"]) + 1
+                if (
+                    decision.raw_top1_id is not None
+                    and decision.next_id is not None
+                    and decision.raw_top1_id != decision.next_id
+                ):
+                    stats["mask_intervention_count"] = int(stats["mask_intervention_count"]) + 1
+                if decision.next_id is None:
+                    stats["dead_end_count"] = int(stats["dead_end_count"]) + 1
+                    return generated_tokens, False, stats
+                next_id = int(decision.next_id)
+
             if next_id < 0 or next_id >= len(id_to_token):
-                return generated_tokens, False
+                return generated_tokens, False, stats
 
             next_token = id_to_token[next_id]
+            if grammar_fsm is not None:
+                next_state = grammar_fsm.transition(fsm_state, next_id)
+                if next_state is None:
+                    stats["dead_end_count"] = int(stats["dead_end_count"]) + 1
+                    return generated_tokens, False, stats
+                fsm_state = next_state
             if next_token == "EOS":
                 reached_eos = True
                 break
@@ -650,9 +788,78 @@ def _generate_continuation_tokens(
             next_ids = torch_mod.tensor([[next_id]], dtype=torch_mod.long, device=device)
             input_ids = torch_mod.cat([input_ids, next_ids], dim=1)
             if int(input_ids.shape[1]) >= max_positions:
+                stopped_without_eos = True
                 break
+        else:
+            if not reached_eos:
+                stopped_without_eos = True
 
-    return generated_tokens, reached_eos
+    if (
+        grammar_fsm is not None
+        and not reached_eos
+        and stopped_without_eos
+        and grammar_fsm.eos_id in grammar_fsm.allowed_token_ids(fsm_state)
+    ):
+        reached_eos = True
+        stats["auto_close_count"] = 1
+
+    return generated_tokens, reached_eos, stats
+
+
+def _build_continuation_trace(
+    *,
+    prompt_tokens: list[str],
+    target_tokens: list[str],
+    generated_tokens: list[str],
+    reached_eos: bool,
+    source_tokens: list[str],
+    grammar_fsm,
+    extra_fields: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build a structured record for one continuation decode."""
+    reconstructed = [*prompt_tokens, *generated_tokens, "EOS"] if reached_eos else [*prompt_tokens, *generated_tokens]
+    appended_eos_tokens = [*prompt_tokens, *generated_tokens, "EOS"]
+    append_eos_would_validate, append_eos_syntax_reason = grammar_fsm.inspect_complete_tokens(appended_eos_tokens)
+    syntax_reason = "missing_eos"
+    is_valid = False
+    failure_reason = "missing_eos"
+    if reached_eos:
+        is_valid = append_eos_would_validate
+        syntax_reason = append_eos_syntax_reason
+        failure_reason = ("ok" if is_valid else "syntax_invalid")
+    elif append_eos_would_validate:
+        failure_reason = "missing_eos_only"
+    else:
+        syntax_reason = append_eos_syntax_reason
+        failure_reason = "missing_eos_plus_syntax"
+
+    target_prefixless = [token for token in target_tokens if token != "EOS"]
+    first_token_match = (
+        bool(generated_tokens and target_prefixless and generated_tokens[0] == target_prefixless[0])
+        if target_prefixless
+        else None
+    )
+
+    record = {
+        "prompt_len": len(prompt_tokens),
+        "target_len": len(target_tokens),
+        "generated_len": len(generated_tokens),
+        "reconstructed_len": len(reconstructed),
+        "reached_eos": reached_eos,
+        "is_structurally_valid": is_valid,
+        "failure_reason": failure_reason,
+        "syntax_reason": syntax_reason,
+        "append_eos_would_validate": append_eos_would_validate,
+        "append_eos_syntax_reason": append_eos_syntax_reason,
+        "first_token_match": first_token_match,
+        "generated_tokens": list(generated_tokens),
+        "reconstructed_tokens": list(reconstructed),
+        "target_tokens": list(target_tokens),
+        "source_tokens": list(source_tokens),
+    }
+    if extra_fields:
+        record.update(extra_fields)
+    return record
 
 
 def _evaluate_continuation_quality(
@@ -661,7 +868,7 @@ def _evaluate_continuation_quality(
     eval_rows: list[list[str]],
     token_to_id: dict[str, int],
     id_to_token: list[str],
-    vocab: dict[str, int],
+    grammar_fsm,
     device,
     use_amp: bool,
     amp_dtype,
@@ -672,7 +879,7 @@ def _evaluate_continuation_quality(
     min_prefix_tokens: int,
     rng: random.Random,
     debug_continuation_samples: int = 0,
-) -> tuple[float, int, int, float, int, int, int, int, list[dict[str, Any]]]:
+) -> dict[str, Any]:
     """
     评估续写生成质量。
 
@@ -685,14 +892,73 @@ def _evaluate_continuation_quality(
     - 首 token 统计总数
     """
     if num_samples <= 0 or not eval_rows:
-        return float("nan"), 0, 0, float("nan"), 0, 0, 0, 0, []
+        return {
+            "raw_structural_validity_rate": float("nan"),
+            "raw_structural_valid_count": 0,
+            "raw_structural_total_count": 0,
+            "raw_first_token_accuracy": float("nan"),
+            "raw_first_token_hit_count": 0,
+            "raw_first_token_total_count": 0,
+            "raw_eos_reached_count": 0,
+            "raw_syntax_pass_count": 0,
+            "raw_generated_len_mean": float("nan"),
+            "raw_budget_stop_count": 0,
+            "raw_append_eos_recoverable_count": 0,
+            "raw_invalid_reason_counts": {},
+            "raw_invalid_syntax_reason_counts": {},
+            "fsm_structural_validity_rate": float("nan"),
+            "fsm_structural_valid_count": 0,
+            "fsm_structural_total_count": 0,
+            "fsm_first_token_accuracy": float("nan"),
+            "fsm_first_token_hit_count": 0,
+            "fsm_first_token_total_count": 0,
+            "fsm_eos_reached_count": 0,
+            "fsm_syntax_pass_count": 0,
+            "fsm_generated_len_mean": float("nan"),
+            "fsm_budget_stop_count": 0,
+            "fsm_append_eos_recoverable_count": 0,
+            "fsm_invalid_reason_counts": {},
+            "fsm_invalid_syntax_reason_counts": {},
+            "fsm_decoding_step_count": 0,
+            "fsm_illegal_top1_count": 0,
+            "fsm_mask_intervention_count": 0,
+            "fsm_legal_mass_mean": float("nan"),
+            "fsm_dead_end_count": 0,
+            "fsm_auto_close_count": 0,
+            "fsm_eos_bias_step_count": 0,
+            "fsm_safe_boundary_stop_count": 0,
+            "samples": [],
+        }
 
-    valid_count = 0
+    raw_valid_count = 0
     attempted = 0
-    first_token_hits = 0
-    first_token_total = 0
-    eos_hits = 0
-    syntax_hits = 0
+    raw_first_token_hits = 0
+    raw_first_token_total = 0
+    raw_eos_hits = 0
+    raw_syntax_hits = 0
+    raw_generated_len_sum = 0
+    raw_budget_stop_count = 0
+    raw_append_eos_recoverable_count = 0
+    raw_invalid_reason_counts: Counter[str] = Counter()
+    raw_invalid_syntax_reason_counts: Counter[str] = Counter()
+    fsm_valid_count = 0
+    fsm_first_token_hits = 0
+    fsm_first_token_total = 0
+    fsm_eos_hits = 0
+    fsm_syntax_hits = 0
+    fsm_generated_len_sum = 0
+    fsm_budget_stop_count = 0
+    fsm_append_eos_recoverable_count = 0
+    fsm_invalid_reason_counts: Counter[str] = Counter()
+    fsm_invalid_syntax_reason_counts: Counter[str] = Counter()
+    fsm_step_count = 0
+    fsm_illegal_top1_count = 0
+    fsm_mask_intervention_count = 0
+    fsm_legal_mass_sum = 0.0
+    fsm_dead_end_count = 0
+    fsm_auto_close_count = 0
+    fsm_eos_bias_step_count = 0
+    fsm_safe_boundary_stop_count = 0
     sample_records: list[dict[str, Any]] = []
 
     retries = 0
@@ -714,12 +980,27 @@ def _evaluate_continuation_quality(
         dyn_max_new = min(max_new_tokens, max(0, max_positions - len(prompt_tokens)))
         if dyn_max_new <= 0:
             continue
-        generated_tokens, reached_eos = _generate_continuation_tokens(
+        raw_generated_tokens, raw_reached_eos, _ = _generate_continuation_tokens(
             model=model,
             torch_mod=torch_mod,
             prompt_tokens=prompt_tokens,
             token_to_id=token_to_id,
             id_to_token=id_to_token,
+            grammar_fsm=None,
+            device=device,
+            use_amp=use_amp,
+            amp_dtype=amp_dtype,
+            autocast_context_fn=autocast_context_fn,
+            max_positions=max_positions,
+            max_new_tokens=dyn_max_new,
+        )
+        fsm_generated_tokens, fsm_reached_eos, fsm_stats = _generate_continuation_tokens(
+            model=model,
+            torch_mod=torch_mod,
+            prompt_tokens=prompt_tokens,
+            token_to_id=token_to_id,
+            id_to_token=id_to_token,
+            grammar_fsm=grammar_fsm,
             device=device,
             use_amp=use_amp,
             amp_dtype=amp_dtype,
@@ -728,59 +1009,141 @@ def _evaluate_continuation_quality(
             max_new_tokens=dyn_max_new,
         )
 
-        target_prefixless = [token for token in target_tokens if token != "EOS"]
-        if target_prefixless:
-            first_token_total += 1
-            if generated_tokens and generated_tokens[0] == target_prefixless[0]:
-                first_token_hits += 1
+        raw_record = _build_continuation_trace(
+            prompt_tokens=prompt_tokens,
+            target_tokens=target_tokens,
+            generated_tokens=raw_generated_tokens,
+            reached_eos=raw_reached_eos,
+            source_tokens=source_tokens,
+            grammar_fsm=grammar_fsm,
+            extra_fields={
+                "budget_stop": (not raw_reached_eos and len(raw_generated_tokens) >= dyn_max_new),
+                "auto_closed_with_eos": False,
+            },
+        )
+        fsm_record = _build_continuation_trace(
+            prompt_tokens=prompt_tokens,
+            target_tokens=target_tokens,
+            generated_tokens=fsm_generated_tokens,
+            reached_eos=fsm_reached_eos,
+            source_tokens=source_tokens,
+            grammar_fsm=grammar_fsm,
+            extra_fields={
+                "decoding_step_count": int(fsm_stats["step_count"]),
+                "illegal_top1_count": int(fsm_stats["illegal_top1_count"]),
+                "mask_intervention_count": int(fsm_stats["mask_intervention_count"]),
+                "legal_mass_mean": (
+                    float(fsm_stats["legal_mass_sum"]) / float(fsm_stats["step_count"])
+                    if int(fsm_stats["step_count"]) > 0
+                    else float("nan")
+                ),
+                "dead_end_count": int(fsm_stats["dead_end_count"]),
+                "budget_stop": (not fsm_reached_eos and len(fsm_generated_tokens) >= dyn_max_new),
+                "auto_closed_with_eos": bool(int(fsm_stats["auto_close_count"]) > 0),
+            },
+        )
 
-        reconstructed = [*prompt_tokens, *generated_tokens, "EOS"] if reached_eos else [*prompt_tokens, *generated_tokens]
-        syntax_reason = "missing_eos"
-        is_valid = False
-        if reached_eos:
-            eos_hits += 1
-            is_valid, syntax_reason = _inspect_token_order(reconstructed, vocab)
-        if is_valid:
-            syntax_hits += 1
-            valid_count += 1
+        if raw_record["first_token_match"] is not None:
+            raw_first_token_total += 1
+            if raw_record["first_token_match"]:
+                raw_first_token_hits += 1
+        if fsm_record["first_token_match"] is not None:
+            fsm_first_token_total += 1
+            if fsm_record["first_token_match"]:
+                fsm_first_token_hits += 1
+
+        if raw_record["reached_eos"]:
+            raw_eos_hits += 1
+        if raw_record["is_structurally_valid"]:
+            raw_syntax_hits += 1
+            raw_valid_count += 1
+        else:
+            raw_invalid_reason_counts[str(raw_record["failure_reason"])] += 1
+            raw_invalid_syntax_reason_counts[str(raw_record["syntax_reason"])] += 1
+        raw_generated_len_sum += int(raw_record["generated_len"])
+        if bool(raw_record["budget_stop"]):
+            raw_budget_stop_count += 1
+        if (not raw_record["reached_eos"]) and bool(raw_record["append_eos_would_validate"]):
+            raw_append_eos_recoverable_count += 1
+
+        if fsm_record["reached_eos"]:
+            fsm_eos_hits += 1
+        if fsm_record["is_structurally_valid"]:
+            fsm_syntax_hits += 1
+            fsm_valid_count += 1
+        else:
+            fsm_invalid_reason_counts[str(fsm_record["failure_reason"])] += 1
+            fsm_invalid_syntax_reason_counts[str(fsm_record["syntax_reason"])] += 1
+        fsm_generated_len_sum += int(fsm_record["generated_len"])
+        if bool(fsm_record["budget_stop"]):
+            fsm_budget_stop_count += 1
+        if (not fsm_record["reached_eos"]) and bool(fsm_record["append_eos_would_validate"]):
+            fsm_append_eos_recoverable_count += 1
+
+        fsm_step_count += int(fsm_stats["step_count"])
+        fsm_illegal_top1_count += int(fsm_stats["illegal_top1_count"])
+        fsm_mask_intervention_count += int(fsm_stats["mask_intervention_count"])
+        fsm_legal_mass_sum += float(fsm_stats["legal_mass_sum"])
+        fsm_dead_end_count += int(fsm_stats["dead_end_count"])
+        fsm_auto_close_count += int(fsm_stats["auto_close_count"])
+        fsm_eos_bias_step_count += int(fsm_stats["eos_bias_step_count"])
+        fsm_safe_boundary_stop_count += int(fsm_stats["safe_boundary_stop_count"])
+
         if len(sample_records) < debug_continuation_samples:
             sample_records.append(
                 {
                     "attempt_index": attempted + 1,
                     "prompt_len": len(prompt_tokens),
-                    "target_len": len(target_tokens),
-                    "generated_len": len(generated_tokens),
-                    "reconstructed_len": len(reconstructed),
-                    "reached_eos": reached_eos,
-                    "is_structurally_valid": is_valid,
-                    "syntax_reason": syntax_reason,
-                    "first_token_match": (
-                        bool(generated_tokens and target_prefixless and generated_tokens[0] == target_prefixless[0])
-                        if target_prefixless
-                        else None
-                    ),
                     "prompt_tokens": list(prompt_tokens),
                     "target_tokens": list(target_tokens),
-                    "generated_tokens": list(generated_tokens),
-                    "reconstructed_tokens": list(reconstructed),
                     "source_tokens": list(source_tokens),
+                    "raw": raw_record,
+                    "fsm": fsm_record,
                 }
             )
         attempted += 1
 
-    structural_rate = (valid_count / attempted) if attempted else float("nan")
-    first_token_accuracy = (first_token_hits / first_token_total) if first_token_total else float("nan")
-    return (
-        structural_rate,
-        valid_count,
-        attempted,
-        first_token_accuracy,
-        first_token_hits,
-        first_token_total,
-        eos_hits,
-        syntax_hits,
-        sample_records,
-    )
+    return {
+        "raw_structural_validity_rate": ((raw_valid_count / attempted) if attempted else float("nan")),
+        "raw_structural_valid_count": raw_valid_count,
+        "raw_structural_total_count": attempted,
+        "raw_first_token_accuracy": (
+            (raw_first_token_hits / raw_first_token_total) if raw_first_token_total else float("nan")
+        ),
+        "raw_first_token_hit_count": raw_first_token_hits,
+        "raw_first_token_total_count": raw_first_token_total,
+        "raw_eos_reached_count": raw_eos_hits,
+        "raw_syntax_pass_count": raw_syntax_hits,
+        "raw_generated_len_mean": ((raw_generated_len_sum / attempted) if attempted else float("nan")),
+        "raw_budget_stop_count": raw_budget_stop_count,
+        "raw_append_eos_recoverable_count": raw_append_eos_recoverable_count,
+        "raw_invalid_reason_counts": dict(raw_invalid_reason_counts),
+        "raw_invalid_syntax_reason_counts": dict(raw_invalid_syntax_reason_counts),
+        "fsm_structural_validity_rate": ((fsm_valid_count / attempted) if attempted else float("nan")),
+        "fsm_structural_valid_count": fsm_valid_count,
+        "fsm_structural_total_count": attempted,
+        "fsm_first_token_accuracy": (
+            (fsm_first_token_hits / fsm_first_token_total) if fsm_first_token_total else float("nan")
+        ),
+        "fsm_first_token_hit_count": fsm_first_token_hits,
+        "fsm_first_token_total_count": fsm_first_token_total,
+        "fsm_eos_reached_count": fsm_eos_hits,
+        "fsm_syntax_pass_count": fsm_syntax_hits,
+        "fsm_generated_len_mean": ((fsm_generated_len_sum / attempted) if attempted else float("nan")),
+        "fsm_budget_stop_count": fsm_budget_stop_count,
+        "fsm_append_eos_recoverable_count": fsm_append_eos_recoverable_count,
+        "fsm_invalid_reason_counts": dict(fsm_invalid_reason_counts),
+        "fsm_invalid_syntax_reason_counts": dict(fsm_invalid_syntax_reason_counts),
+        "fsm_decoding_step_count": fsm_step_count,
+        "fsm_illegal_top1_count": fsm_illegal_top1_count,
+        "fsm_mask_intervention_count": fsm_mask_intervention_count,
+        "fsm_legal_mass_mean": ((fsm_legal_mass_sum / fsm_step_count) if fsm_step_count else float("nan")),
+        "fsm_dead_end_count": fsm_dead_end_count,
+        "fsm_auto_close_count": fsm_auto_close_count,
+        "fsm_eos_bias_step_count": fsm_eos_bias_step_count,
+        "fsm_safe_boundary_stop_count": fsm_safe_boundary_stop_count,
+        "samples": sample_records,
+    }
 
 
 def _resolve_report_path(run_id: str, output_path: Path | None, project_root: Path) -> Path:
@@ -844,6 +1207,9 @@ def main() -> None:
 
     vocab_path = args.vocab_path if args.vocab_path.is_absolute() else (project_root / args.vocab_path)
     vocab, id_to_token = _load_vocab(vocab_path.resolve())
+    from src.decoding import TuneFlowGrammarFSM
+
+    grammar_fsm = TuneFlowGrammarFSM.from_vocab(vocab)
     metrics_path = None
     if args.metrics_path is not None:
         metrics_path = args.metrics_path if args.metrics_path.is_absolute() else (project_root / args.metrics_path)
@@ -890,6 +1256,7 @@ def main() -> None:
                     torch_mod=torch,
                     rng=valid_rng,
                     device=device,
+                    id_to_token=id_to_token,
                     batch_size=args.batch_size,
                     seq_len=eval_seq_len,
                     eval_batches=args.eval_batches,
@@ -899,23 +1266,13 @@ def main() -> None:
                 ),
             )
             ppl = _safe_perplexity(valid_loss)
-            (
-                struct_rate,
-                struct_valid,
-                struct_total,
-                first_acc,
-                first_hits,
-                first_total,
-                eos_hits,
-                syntax_hits,
-                sample_records,
-            ) = _evaluate_continuation_quality(
+            continuation_metrics = _evaluate_continuation_quality(
                 model=model,
                 torch_mod=torch,
                 eval_rows=eval_rows,
                 token_to_id=vocab,
                 id_to_token=id_to_token,
-                vocab=vocab,
+                grammar_fsm=grammar_fsm,
                 device=device,
                 use_amp=use_amp,
                 amp_dtype=amp_dtype,
@@ -927,6 +1284,26 @@ def main() -> None:
                 rng=continuation_rng,
                 debug_continuation_samples=max(0, int(args.debug_continuation_samples)),
             )
+            struct_rate = continuation_metrics["raw_structural_validity_rate"]
+            struct_valid = continuation_metrics["raw_structural_valid_count"]
+            struct_total = continuation_metrics["raw_structural_total_count"]
+            first_acc = continuation_metrics["raw_first_token_accuracy"]
+            first_hits = continuation_metrics["raw_first_token_hit_count"]
+            first_total = continuation_metrics["raw_first_token_total_count"]
+            eos_hits = continuation_metrics["raw_eos_reached_count"]
+            syntax_hits = continuation_metrics["raw_syntax_pass_count"]
+            fsm_struct_rate = continuation_metrics["fsm_structural_validity_rate"]
+            fsm_struct_valid = continuation_metrics["fsm_structural_valid_count"]
+            fsm_first_acc = continuation_metrics["fsm_first_token_accuracy"]
+            fsm_first_hits = continuation_metrics["fsm_first_token_hit_count"]
+            fsm_first_total = continuation_metrics["fsm_first_token_total_count"]
+            fsm_eos_hits = continuation_metrics["fsm_eos_reached_count"]
+            fsm_syntax_hits = continuation_metrics["fsm_syntax_pass_count"]
+            sample_records = continuation_metrics["samples"]
+            raw_invalid_reason_counts = continuation_metrics["raw_invalid_reason_counts"]
+            raw_invalid_syntax_reason_counts = continuation_metrics["raw_invalid_syntax_reason_counts"]
+            fsm_invalid_reason_counts = continuation_metrics["fsm_invalid_reason_counts"]
+            fsm_invalid_syntax_reason_counts = continuation_metrics["fsm_invalid_syntax_reason_counts"]
 
             result = {
                 "checkpoint_name": ckpt_path.name,
@@ -945,6 +1322,102 @@ def main() -> None:
                 "eos_reached_rate": ((eos_hits / struct_total) if struct_total else float("nan")),
                 "syntax_pass_count": syntax_hits,
                 "syntax_pass_rate": ((syntax_hits / struct_total) if struct_total else float("nan")),
+                "generated_len_mean": continuation_metrics["raw_generated_len_mean"],
+                "budget_stop_count": continuation_metrics["raw_budget_stop_count"],
+                "budget_stop_rate": (
+                    (continuation_metrics["raw_budget_stop_count"] / struct_total)
+                    if struct_total
+                    else float("nan")
+                ),
+                "append_eos_recoverable_count": continuation_metrics["raw_append_eos_recoverable_count"],
+                "append_eos_recoverable_rate": (
+                    (continuation_metrics["raw_append_eos_recoverable_count"] / struct_total)
+                    if struct_total
+                    else float("nan")
+                ),
+                "invalid_reason_counts": raw_invalid_reason_counts,
+                "invalid_syntax_reason_counts": raw_invalid_syntax_reason_counts,
+                "fsm_structural_validity_rate": fsm_struct_rate,
+                "fsm_structural_valid_count": fsm_struct_valid,
+                "fsm_structural_total_count": continuation_metrics["fsm_structural_total_count"],
+                "fsm_first_token_accuracy": fsm_first_acc,
+                "fsm_first_token_hit_count": fsm_first_hits,
+                "fsm_first_token_total_count": fsm_first_total,
+                "fsm_eos_reached_count": fsm_eos_hits,
+                "fsm_eos_reached_rate": (
+                    (fsm_eos_hits / continuation_metrics["fsm_structural_total_count"])
+                    if continuation_metrics["fsm_structural_total_count"]
+                    else float("nan")
+                ),
+                "fsm_syntax_pass_count": fsm_syntax_hits,
+                "fsm_syntax_pass_rate": (
+                    (fsm_syntax_hits / continuation_metrics["fsm_structural_total_count"])
+                    if continuation_metrics["fsm_structural_total_count"]
+                    else float("nan")
+                ),
+                "fsm_generated_len_mean": continuation_metrics["fsm_generated_len_mean"],
+                "fsm_budget_stop_count": continuation_metrics["fsm_budget_stop_count"],
+                "fsm_budget_stop_rate": (
+                    (
+                        continuation_metrics["fsm_budget_stop_count"]
+                        / continuation_metrics["fsm_structural_total_count"]
+                    )
+                    if continuation_metrics["fsm_structural_total_count"]
+                    else float("nan")
+                ),
+                "fsm_append_eos_recoverable_count": continuation_metrics["fsm_append_eos_recoverable_count"],
+                "fsm_append_eos_recoverable_rate": (
+                    (
+                        continuation_metrics["fsm_append_eos_recoverable_count"]
+                        / continuation_metrics["fsm_structural_total_count"]
+                    )
+                    if continuation_metrics["fsm_structural_total_count"]
+                    else float("nan")
+                ),
+                "fsm_invalid_reason_counts": fsm_invalid_reason_counts,
+                "fsm_invalid_syntax_reason_counts": fsm_invalid_syntax_reason_counts,
+                "fsm_decoding_step_count": continuation_metrics["fsm_decoding_step_count"],
+                "fsm_illegal_top1_count": continuation_metrics["fsm_illegal_top1_count"],
+                "fsm_illegal_top1_rate": (
+                    (continuation_metrics["fsm_illegal_top1_count"] / continuation_metrics["fsm_decoding_step_count"])
+                    if continuation_metrics["fsm_decoding_step_count"]
+                    else float("nan")
+                ),
+                "fsm_mask_intervention_count": continuation_metrics["fsm_mask_intervention_count"],
+                "fsm_mask_intervention_rate": (
+                    (
+                        continuation_metrics["fsm_mask_intervention_count"]
+                        / continuation_metrics["fsm_decoding_step_count"]
+                    )
+                    if continuation_metrics["fsm_decoding_step_count"]
+                    else float("nan")
+                ),
+                "fsm_legal_mass_mean": continuation_metrics["fsm_legal_mass_mean"],
+                "fsm_dead_end_count": continuation_metrics["fsm_dead_end_count"],
+                "fsm_auto_close_count": continuation_metrics["fsm_auto_close_count"],
+                "fsm_auto_close_rate": (
+                    (continuation_metrics["fsm_auto_close_count"] / continuation_metrics["fsm_structural_total_count"])
+                    if continuation_metrics["fsm_structural_total_count"]
+                    else float("nan")
+                ),
+                "fsm_eos_bias_step_count": continuation_metrics["fsm_eos_bias_step_count"],
+                "fsm_eos_bias_step_rate": (
+                    (
+                        continuation_metrics["fsm_eos_bias_step_count"]
+                        / continuation_metrics["fsm_decoding_step_count"]
+                    )
+                    if continuation_metrics["fsm_decoding_step_count"]
+                    else float("nan")
+                ),
+                "fsm_safe_boundary_stop_count": continuation_metrics["fsm_safe_boundary_stop_count"],
+                "fsm_safe_boundary_stop_rate": (
+                    (
+                        continuation_metrics["fsm_safe_boundary_stop_count"]
+                        / continuation_metrics["fsm_structural_total_count"]
+                    )
+                    if continuation_metrics["fsm_structural_total_count"]
+                    else float("nan")
+                ),
                 "seq_len": eval_seq_len,
                 "eval_batches": args.eval_batches,
                 "num_continuation_samples": args.num_continuation_samples,
@@ -952,12 +1425,23 @@ def main() -> None:
                 "debug_sample_count": len(sample_records),
             }
             results.append(result)
+            raw_invalid_reason_text = ", ".join(
+                f"{key}={value}" for key, value in sorted(raw_invalid_reason_counts.items())
+            ) or "none"
+            fsm_invalid_reason_text = ", ".join(
+                f"{key}={value}" for key, value in sorted(fsm_invalid_reason_counts.items())
+            ) or "none"
             print(
                 f"[eval_continuation] step={result['step']} "
                 f"valid_loss={valid_loss:.6f}({valid_loss_source}) ppl={ppl:.6f} "
-                f"struct_valid={struct_rate:.4f} ({struct_valid}/{struct_total}) "
-                f"eos={eos_hits}/{struct_total} syntax={syntax_hits}/{struct_total} "
-                f"first_acc={first_acc:.4f} ({first_hits}/{first_total})"
+                f"raw_struct={struct_rate:.4f} ({struct_valid}/{struct_total}) "
+                f"fsm_struct={fsm_struct_rate:.4f} ({fsm_struct_valid}/{struct_total}) "
+                f"raw_first={first_acc:.4f} ({first_hits}/{first_total}) "
+                f"fsm_first={fsm_first_acc:.4f} ({fsm_first_hits}/{fsm_first_total}) "
+                f"fsm_illegal_top1={result['fsm_illegal_top1_rate']:.4f} "
+                f"fsm_auto_close={result['fsm_auto_close_count']} "
+                f"raw_fail={raw_invalid_reason_text} "
+                f"fsm_fail={fsm_invalid_reason_text}"
             )
             if sample_records:
                 debug_sample_results.append(
@@ -984,11 +1468,43 @@ def main() -> None:
     finite_losses = [r["valid_loss"] for r in results if math.isfinite(float(r["valid_loss"]))]
     finite_struct = [r["structural_validity_rate"] for r in results if math.isfinite(float(r["structural_validity_rate"]))]
     finite_first = [r["first_token_accuracy"] for r in results if math.isfinite(float(r["first_token_accuracy"]))]
+    finite_fsm_struct = [
+        r["fsm_structural_validity_rate"]
+        for r in results
+        if math.isfinite(float(r["fsm_structural_validity_rate"]))
+    ]
+    finite_fsm_first = [
+        r["fsm_first_token_accuracy"]
+        for r in results
+        if math.isfinite(float(r["fsm_first_token_accuracy"]))
+    ]
+    summary_invalid_reason_counts: Counter[str] = Counter()
+    summary_invalid_syntax_reason_counts: Counter[str] = Counter()
+    summary_fsm_invalid_reason_counts: Counter[str] = Counter()
+    summary_fsm_invalid_syntax_reason_counts: Counter[str] = Counter()
+    for result in results:
+        summary_invalid_reason_counts.update(result.get("invalid_reason_counts", {}))
+        summary_invalid_syntax_reason_counts.update(result.get("invalid_syntax_reason_counts", {}))
+        summary_fsm_invalid_reason_counts.update(result.get("fsm_invalid_reason_counts", {}))
+        summary_fsm_invalid_syntax_reason_counts.update(result.get("fsm_invalid_syntax_reason_counts", {}))
     summary = {
         "checkpoint_count": len(results),
         "best_valid_loss": (min(finite_losses) if finite_losses else float("nan")),
         "best_structural_validity_rate": (max(finite_struct) if finite_struct else float("nan")),
         "best_first_token_accuracy": (max(finite_first) if finite_first else float("nan")),
+        "best_fsm_structural_validity_rate": (max(finite_fsm_struct) if finite_fsm_struct else float("nan")),
+        "best_fsm_first_token_accuracy": (max(finite_fsm_first) if finite_fsm_first else float("nan")),
+        "invalid_reason_counts": dict(summary_invalid_reason_counts),
+        "invalid_syntax_reason_counts": dict(summary_invalid_syntax_reason_counts),
+        "fsm_invalid_reason_counts": dict(summary_fsm_invalid_reason_counts),
+        "fsm_invalid_syntax_reason_counts": dict(summary_fsm_invalid_syntax_reason_counts),
+        "total_append_eos_recoverable_count": sum(int(r.get("append_eos_recoverable_count", 0)) for r in results),
+        "total_fsm_append_eos_recoverable_count": sum(
+            int(r.get("fsm_append_eos_recoverable_count", 0)) for r in results
+        ),
+        "total_fsm_auto_close_count": sum(int(r.get("fsm_auto_close_count", 0)) for r in results),
+        "total_fsm_safe_boundary_stop_count": sum(int(r.get("fsm_safe_boundary_stop_count", 0)) for r in results),
+        "total_fsm_eos_bias_step_count": sum(int(r.get("fsm_eos_bias_step_count", 0)) for r in results),
         "elapsed_sec": max(0.0, time.time() - started_at),
     }
 
@@ -1048,8 +1564,10 @@ def main() -> None:
         metric_specs=[
             {"key": "valid_loss", "label": "Valid Loss", "color": "#2563eb"},
             {"key": "ppl", "label": "Perplexity", "color": "#dc2626"},
-            {"key": "structural_validity_rate", "label": "Structural Validity Rate", "color": "#059669", "percent": True},
-            {"key": "first_token_accuracy", "label": "First Token Accuracy", "color": "#7c3aed", "percent": True},
+            {"key": "structural_validity_rate", "label": "Raw Structural Validity Rate", "color": "#059669", "percent": True},
+            {"key": "fsm_structural_validity_rate", "label": "FSM Structural Validity Rate", "color": "#0f766e", "percent": True},
+            {"key": "first_token_accuracy", "label": "Raw First Token Accuracy", "color": "#7c3aed", "percent": True},
+            {"key": "fsm_first_token_accuracy", "label": "FSM First Token Accuracy", "color": "#9333ea", "percent": True},
         ],
     )
     print(f"[eval_continuation] report -> {report_path}")

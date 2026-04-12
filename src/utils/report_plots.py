@@ -112,7 +112,14 @@ def write_eval_report_plot(
     summary = report.get("summary", {})
     summary_lines: list[str] = []
     if isinstance(summary, dict):
-        for key in ("best_valid_loss", "best_structural_validity_rate", "best_first_token_accuracy", "elapsed_sec"):
+        for key in (
+            "best_valid_loss",
+            "best_structural_validity_rate",
+            "best_fsm_structural_validity_rate",
+            "best_first_token_accuracy",
+            "best_fsm_first_token_accuracy",
+            "elapsed_sec",
+        ):
             if key not in summary:
                 continue
             value = pd.to_numeric(pd.Series([summary.get(key)]), errors="coerce").iloc[0]

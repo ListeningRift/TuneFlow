@@ -397,8 +397,10 @@ def _print_invalid_sample_preview(
 
     reason_counts: dict[str, int] = {}
     for sample in invalid_samples:
-        reason = str(sample.get("failure_reason", "unknown"))
-        reason_counts[reason] = reason_counts.get(reason, 0) + 1
+        raw_reason = str(sample.get("raw", {}).get("failure_reason", "unknown"))
+        fsm_reason = str(sample.get("fsm", {}).get("failure_reason", "unknown"))
+        reason_counts[f"raw:{raw_reason}"] = reason_counts.get(f"raw:{raw_reason}", 0) + 1
+        reason_counts[f"fsm:{fsm_reason}"] = reason_counts.get(f"fsm:{fsm_reason}", 0) + 1
     reasons_text = ", ".join(f"{key}={value}" for key, value in sorted(reason_counts.items()))
     print(
         f"[eval_infilling][debug] step={step} checkpoint={checkpoint_name} "
@@ -406,14 +408,21 @@ def _print_invalid_sample_preview(
     )
     for index, sample in enumerate(invalid_samples, start=1):
         prompt_tail = _preview_tokens(list(sample.get("prompt_tokens", [])), preview_limit, from_tail=True)
-        generated_head = _preview_tokens(list(sample.get("generated_middle_tokens", [])), preview_limit)
+        raw_record = sample.get("raw", {})
+        fsm_record = sample.get("fsm", {})
+        raw_generated_head = _preview_tokens(list(raw_record.get("generated_middle_tokens", [])), preview_limit)
+        fsm_generated_head = _preview_tokens(list(fsm_record.get("generated_middle_tokens", [])), preview_limit)
         print(
             f"[eval_infilling][debug] sample={index} attempt={sample.get('attempt_index')} "
-            f"failure={sample.get('failure_reason')} syntax_reason={sample.get('syntax_reason')} "
-            f"prompt_len={sample.get('prompt_len')} generated_len={sample.get('generated_middle_len')} "
+            f"raw_failure={raw_record.get('failure_reason')} fsm_failure={fsm_record.get('failure_reason')} "
+            f"raw_reason={raw_record.get('syntax_reason')} fsm_reason={fsm_record.get('syntax_reason')} "
+            f"prompt_len={sample.get('prompt_len')} "
+            f"raw_generated_len={raw_record.get('generated_middle_len')} "
+            f"fsm_generated_len={fsm_record.get('generated_middle_len')} "
             f"prompt_tail={prompt_tail}"
         )
-        print(f"[eval_infilling][debug] sample={index} generated={generated_head}")
+        print(f"[eval_infilling][debug] sample={index} raw_generated={raw_generated_head}")
+        print(f"[eval_infilling][debug] sample={index} fsm_generated={fsm_generated_head}")
 
 
 def _collect_infill_maskable_units(core: list[str]) -> list[tuple[int, int, str, int]]:
@@ -554,6 +563,7 @@ def _evaluate_valid_loss(
     torch_mod,
     rng: random.Random,
     device,
+    id_to_token: list[str],
     batch_size: int,
     seq_len: int,
     eval_batches: int,
@@ -576,6 +586,7 @@ def _evaluate_valid_loss(
                 batch_size=batch_size,
                 seq_len=seq_len,
                 device=device,
+                id_to_token=id_to_token,
             )
             with autocast_context_fn(
                 torch_mod=torch_mod,
@@ -649,28 +660,55 @@ def _generate_middle_tokens(
     prompt_tokens: list[str],
     token_to_id: dict[str, int],
     id_to_token: list[str],
+    grammar_fsm,
+    prefix_tokens: list[str],
+    suffix_tokens: list[str],
     device,
     use_amp: bool,
     amp_dtype,
     autocast_context_fn,
     max_positions: int,
     max_new_tokens: int,
-) -> tuple[list[str], bool]:
+) -> tuple[list[str], bool, dict[str, float | int]]:
     """基于 prompt 执行贪心解码，返回 middle token 与是否遇到 EOS。"""
+    from src.decoding import select_masked_argmax
+
     prompt_ids: list[int] = []
     for token in prompt_tokens:
         token_id = token_to_id.get(token)
         if token_id is None:
-            return [], False
+            return [], False, {
+                "step_count": 0,
+                "illegal_top1_count": 0,
+                "mask_intervention_count": 0,
+                "legal_mass_sum": 0.0,
+                "dead_end_count": 0,
+            }
         prompt_ids.append(token_id)
 
     input_ids = torch_mod.tensor([prompt_ids], dtype=torch_mod.long, device=device)
     middle_tokens: list[str] = []
     reached_eos = False
+    stats: dict[str, float | int] = {
+        "step_count": 0,
+        "illegal_top1_count": 0,
+        "mask_intervention_count": 0,
+        "legal_mass_sum": 0.0,
+        "dead_end_count": 0,
+    }
+
+    fsm_state = None
+    compatible_states: set[str] | None = None
+    if grammar_fsm is not None:
+        fsm_state = grammar_fsm.state_after_prefix_tokens(prefix_tokens)
+        compatible_states = grammar_fsm.compatible_states_for_suffix_tokens(suffix_tokens)
+        if fsm_state is None or not compatible_states:
+            stats["dead_end_count"] = 1
+            return middle_tokens, False, stats
 
     max_can_generate = max(0, min(max_new_tokens, max_positions - int(input_ids.shape[1])))
     if max_can_generate <= 0:
-        return middle_tokens, reached_eos
+        return middle_tokens, reached_eos, stats
 
     with torch_mod.no_grad():
         for _ in range(max_can_generate):
@@ -681,14 +719,49 @@ def _generate_middle_tokens(
                 amp_dtype=amp_dtype,
             ):
                 outputs = model(input_ids=input_ids, return_dict=True)
-            next_id = int(torch_mod.argmax(outputs.logits[:, -1, :], dim=-1).item())
+            step_logits = outputs.logits[0, -1, :]
+            if grammar_fsm is None:
+                next_id = int(torch_mod.argmax(step_logits, dim=-1).item())
+            else:
+                allowed_ids: list[int] = []
+                for token_id in grammar_fsm.allowed_token_ids(fsm_state):
+                    if token_id == grammar_fsm.eos_id:
+                        continue
+                    next_state = grammar_fsm.transition(fsm_state, token_id)
+                    if next_state is not None and next_state in compatible_states:
+                        allowed_ids.append(token_id)
+                if fsm_state in compatible_states:
+                    allowed_ids.append(grammar_fsm.eos_id)
+
+                decision = select_masked_argmax(step_logits, allowed_ids)
+                stats["step_count"] = int(stats["step_count"]) + 1
+                stats["legal_mass_sum"] = float(stats["legal_mass_sum"]) + float(decision.legal_mass)
+                if not decision.raw_top1_is_legal:
+                    stats["illegal_top1_count"] = int(stats["illegal_top1_count"]) + 1
+                if (
+                    decision.raw_top1_id is not None
+                    and decision.next_id is not None
+                    and decision.raw_top1_id != decision.next_id
+                ):
+                    stats["mask_intervention_count"] = int(stats["mask_intervention_count"]) + 1
+                if decision.next_id is None:
+                    stats["dead_end_count"] = int(stats["dead_end_count"]) + 1
+                    return middle_tokens, False, stats
+                next_id = int(decision.next_id)
+
             if next_id < 0 or next_id >= len(id_to_token):
-                return middle_tokens, False
+                return middle_tokens, False, stats
 
             next_token = id_to_token[next_id]
             if next_token == "EOS":
                 reached_eos = True
                 break
+            if grammar_fsm is not None:
+                next_state = grammar_fsm.transition(fsm_state, next_id)
+                if next_state is None or next_state not in compatible_states:
+                    stats["dead_end_count"] = int(stats["dead_end_count"]) + 1
+                    return middle_tokens, False, stats
+                fsm_state = next_state
             middle_tokens.append(next_token)
 
             next_ids = torch_mod.tensor([[next_id]], dtype=torch_mod.long, device=device)
@@ -696,7 +769,45 @@ def _generate_middle_tokens(
             if int(input_ids.shape[1]) >= max_positions:
                 break
 
-    return middle_tokens, reached_eos
+    return middle_tokens, reached_eos, stats
+
+
+def _build_infilling_trace(
+    *,
+    prefix_tokens: list[str],
+    suffix_tokens: list[str],
+    generated_middle_tokens: list[str],
+    reached_eos: bool,
+    prompt_tokens: list[str],
+    source_tokens: list[str],
+    grammar_fsm,
+    extra_fields: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build a structured record for one infilling decode."""
+    reconstructed = [*prefix_tokens, *generated_middle_tokens, *suffix_tokens, "EOS"]
+    is_valid, syntax_reason = grammar_fsm.inspect_complete_tokens(reconstructed)
+    failure_reason = ("ok" if is_valid else "syntax_invalid")
+
+    record = {
+        "failure_reason": failure_reason,
+        "syntax_reason": syntax_reason,
+        "generated_middle_len": len(generated_middle_tokens),
+        "reconstructed_len": len(reconstructed),
+        "reached_eos": reached_eos,
+        "is_structurally_valid": is_valid,
+        "prompt_len": len(prompt_tokens),
+        "prefix_len": len(prefix_tokens),
+        "suffix_len": len(suffix_tokens),
+        "prompt_tokens": list(prompt_tokens),
+        "prefix_tokens": list(prefix_tokens),
+        "generated_middle_tokens": list(generated_middle_tokens),
+        "suffix_tokens": list(suffix_tokens),
+        "reconstructed_tokens": list(reconstructed),
+        "source_tokens": list(source_tokens),
+    }
+    if extra_fields:
+        record.update(extra_fields)
+    return record
 
 
 def _evaluate_structural_validity(
@@ -705,7 +816,7 @@ def _evaluate_structural_validity(
     eval_rows: list[list[str]],
     token_to_id: dict[str, int],
     id_to_token: list[str],
-    vocab: dict[str, int],
+    grammar_fsm,
     device,
     use_amp: bool,
     amp_dtype,
@@ -715,16 +826,7 @@ def _evaluate_structural_validity(
     max_new_tokens: int,
     rng: random.Random,
     debug_invalid_samples: int = 0,
-) -> tuple[
-    float,
-    int,
-    int,
-    int,
-    int,
-    list[dict[str, Any]],
-    dict[str, int],
-    dict[str, int],
-]:
+) -> dict[str, Any]:
     """
     评估结构合法率。
 
@@ -734,15 +836,46 @@ def _evaluate_structural_validity(
     3) 重建为完整序列并做结构语法校验。
     """
     if num_samples <= 0 or not eval_rows:
-        return float("nan"), 0, 0, 0, 0, [], {}, {}
+        return {
+            "raw_structural_validity_rate": float("nan"),
+            "raw_structural_valid_count": 0,
+            "raw_structural_total_count": 0,
+            "raw_eos_reached_count": 0,
+            "raw_syntax_pass_count": 0,
+            "raw_invalid_reason_counts": {},
+            "raw_invalid_syntax_reason_counts": {},
+            "fsm_structural_validity_rate": float("nan"),
+            "fsm_structural_valid_count": 0,
+            "fsm_structural_total_count": 0,
+            "fsm_eos_reached_count": 0,
+            "fsm_syntax_pass_count": 0,
+            "fsm_invalid_reason_counts": {},
+            "fsm_invalid_syntax_reason_counts": {},
+            "fsm_decoding_step_count": 0,
+            "fsm_illegal_top1_count": 0,
+            "fsm_mask_intervention_count": 0,
+            "fsm_legal_mass_mean": float("nan"),
+            "fsm_dead_end_count": 0,
+            "invalid_samples": [],
+        }
 
-    valid_count = 0
+    raw_valid_count = 0
     attempted = 0
-    eos_hits = 0
-    syntax_hits = 0
+    raw_eos_hits = 0
+    raw_syntax_hits = 0
+    fsm_valid_count = 0
+    fsm_eos_hits = 0
+    fsm_syntax_hits = 0
     invalid_samples: list[dict[str, Any]] = []
-    invalid_reason_counts: Counter[str] = Counter()
-    invalid_syntax_reason_counts: Counter[str] = Counter()
+    raw_invalid_reason_counts: Counter[str] = Counter()
+    raw_invalid_syntax_reason_counts: Counter[str] = Counter()
+    fsm_invalid_reason_counts: Counter[str] = Counter()
+    fsm_invalid_syntax_reason_counts: Counter[str] = Counter()
+    fsm_step_count = 0
+    fsm_illegal_top1_count = 0
+    fsm_mask_intervention_count = 0
+    fsm_legal_mass_sum = 0.0
+    fsm_dead_end_count = 0
 
     retries = 0
     max_retries = max(num_samples * 10, 100)
@@ -754,16 +887,39 @@ def _evaluate_structural_validity(
             continue
 
         prompt_tokens, prefix, suffix_len = built
+        suffix = prompt_tokens[len(prefix) + 1 : len(prompt_tokens) - 1]
+        if len(suffix) != suffix_len:
+            suffix = suffix[:suffix_len]
+        dyn_max_new = min(max_new_tokens, max(0, max_positions - len(prompt_tokens)))
         # 生成预算受“剩余上下文长度”约束，避免越界。
         dyn_max_new = min(max_new_tokens, max(0, max_positions - len(prompt_tokens)))
         if dyn_max_new <= 0:
             continue
-        middle_tokens, reached_eos = _generate_middle_tokens(
+        raw_middle_tokens, raw_reached_eos, _ = _generate_middle_tokens(
             model=model,
             torch_mod=torch_mod,
             prompt_tokens=prompt_tokens,
             token_to_id=token_to_id,
             id_to_token=id_to_token,
+            grammar_fsm=None,
+            prefix_tokens=prefix,
+            suffix_tokens=suffix,
+            device=device,
+            use_amp=use_amp,
+            amp_dtype=amp_dtype,
+            autocast_context_fn=autocast_context_fn,
+            max_positions=max_positions,
+            max_new_tokens=dyn_max_new,
+        )
+        fsm_middle_tokens, fsm_reached_eos, fsm_stats = _generate_middle_tokens(
+            model=model,
+            torch_mod=torch_mod,
+            prompt_tokens=prompt_tokens,
+            token_to_id=token_to_id,
+            id_to_token=id_to_token,
+            grammar_fsm=grammar_fsm,
+            prefix_tokens=prefix,
+            suffix_tokens=suffix,
             device=device,
             use_amp=use_amp,
             amp_dtype=amp_dtype,
@@ -777,52 +933,101 @@ def _evaluate_structural_validity(
         if len(suffix) != suffix_len:
             suffix = suffix[:suffix_len]
 
-        reconstructed = [*prefix, *middle_tokens, *suffix, "EOS"]
-        syntax_reason = "missing_eos"
-        is_valid = False
-        if reached_eos:
-            eos_hits += 1
-            is_valid, syntax_reason = _inspect_token_order(reconstructed, vocab)
-        if is_valid:
-            syntax_hits += 1
-            valid_count += 1
+        raw_record = _build_infilling_trace(
+            prefix_tokens=prefix,
+            suffix_tokens=suffix,
+            generated_middle_tokens=raw_middle_tokens,
+            reached_eos=raw_reached_eos,
+            prompt_tokens=prompt_tokens,
+            source_tokens=source_tokens,
+            grammar_fsm=grammar_fsm,
+        )
+        fsm_record = _build_infilling_trace(
+            prefix_tokens=prefix,
+            suffix_tokens=suffix,
+            generated_middle_tokens=fsm_middle_tokens,
+            reached_eos=fsm_reached_eos,
+            prompt_tokens=prompt_tokens,
+            source_tokens=source_tokens,
+            grammar_fsm=grammar_fsm,
+            extra_fields={
+                "decoding_step_count": int(fsm_stats["step_count"]),
+                "illegal_top1_count": int(fsm_stats["illegal_top1_count"]),
+                "mask_intervention_count": int(fsm_stats["mask_intervention_count"]),
+                "legal_mass_mean": (
+                    float(fsm_stats["legal_mass_sum"]) / float(fsm_stats["step_count"])
+                    if int(fsm_stats["step_count"]) > 0
+                    else float("nan")
+                ),
+                "dead_end_count": int(fsm_stats["dead_end_count"]),
+            },
+        )
+
+        if raw_record["reached_eos"]:
+            raw_eos_hits += 1
+        if raw_record["is_structurally_valid"]:
+            raw_syntax_hits += 1
+            raw_valid_count += 1
         else:
-            failure_reason = "missing_eos" if not reached_eos else "syntax_invalid"
-            invalid_reason_counts[failure_reason] += 1
-            invalid_syntax_reason_counts[syntax_reason] += 1
-            if len(invalid_samples) < debug_invalid_samples:
-                invalid_samples.append(
-                    {
-                        "attempt_index": attempted + 1,
-                        "failure_reason": failure_reason,
-                        "syntax_reason": syntax_reason,
-                        "prompt_len": len(prompt_tokens),
-                        "prefix_len": len(prefix),
-                        "suffix_len": len(suffix),
-                        "generated_middle_len": len(middle_tokens),
-                        "reconstructed_len": len(reconstructed),
-                        "prompt_tokens": list(prompt_tokens),
-                        "prefix_tokens": list(prefix),
-                        "generated_middle_tokens": list(middle_tokens),
-                        "suffix_tokens": list(suffix),
-                        "reconstructed_tokens": list(reconstructed),
-                        "source_tokens": list(source_tokens),
-                    }
-                )
+            raw_invalid_reason_counts[str(raw_record["failure_reason"])] += 1
+            raw_invalid_syntax_reason_counts[str(raw_record["syntax_reason"])] += 1
+
+        if fsm_record["reached_eos"]:
+            fsm_eos_hits += 1
+        if fsm_record["is_structurally_valid"]:
+            fsm_syntax_hits += 1
+            fsm_valid_count += 1
+        else:
+            fsm_invalid_reason_counts[str(fsm_record["failure_reason"])] += 1
+            fsm_invalid_syntax_reason_counts[str(fsm_record["syntax_reason"])] += 1
+
+        fsm_step_count += int(fsm_stats["step_count"])
+        fsm_illegal_top1_count += int(fsm_stats["illegal_top1_count"])
+        fsm_mask_intervention_count += int(fsm_stats["mask_intervention_count"])
+        fsm_legal_mass_sum += float(fsm_stats["legal_mass_sum"])
+        fsm_dead_end_count += int(fsm_stats["dead_end_count"])
+
+        if (
+            (not raw_record["is_structurally_valid"]) or (not fsm_record["is_structurally_valid"])
+        ) and len(invalid_samples) < debug_invalid_samples:
+            invalid_samples.append(
+                {
+                    "attempt_index": attempted + 1,
+                    "prompt_len": len(prompt_tokens),
+                    "prefix_len": len(prefix),
+                    "suffix_len": len(suffix),
+                    "prompt_tokens": list(prompt_tokens),
+                    "prefix_tokens": list(prefix),
+                    "suffix_tokens": list(suffix),
+                    "source_tokens": list(source_tokens),
+                    "raw": raw_record,
+                    "fsm": fsm_record,
+                }
+            )
         attempted += 1
 
-    if attempted == 0:
-        return float("nan"), 0, 0, 0, 0, [], {}, {}
-    return (
-        valid_count / attempted,
-        valid_count,
-        attempted,
-        eos_hits,
-        syntax_hits,
-        invalid_samples,
-        dict(invalid_reason_counts),
-        dict(invalid_syntax_reason_counts),
-    )
+    return {
+        "raw_structural_validity_rate": ((raw_valid_count / attempted) if attempted else float("nan")),
+        "raw_structural_valid_count": raw_valid_count,
+        "raw_structural_total_count": attempted,
+        "raw_eos_reached_count": raw_eos_hits,
+        "raw_syntax_pass_count": raw_syntax_hits,
+        "raw_invalid_reason_counts": dict(raw_invalid_reason_counts),
+        "raw_invalid_syntax_reason_counts": dict(raw_invalid_syntax_reason_counts),
+        "fsm_structural_validity_rate": ((fsm_valid_count / attempted) if attempted else float("nan")),
+        "fsm_structural_valid_count": fsm_valid_count,
+        "fsm_structural_total_count": attempted,
+        "fsm_eos_reached_count": fsm_eos_hits,
+        "fsm_syntax_pass_count": fsm_syntax_hits,
+        "fsm_invalid_reason_counts": dict(fsm_invalid_reason_counts),
+        "fsm_invalid_syntax_reason_counts": dict(fsm_invalid_syntax_reason_counts),
+        "fsm_decoding_step_count": fsm_step_count,
+        "fsm_illegal_top1_count": fsm_illegal_top1_count,
+        "fsm_mask_intervention_count": fsm_mask_intervention_count,
+        "fsm_legal_mass_mean": ((fsm_legal_mass_sum / fsm_step_count) if fsm_step_count else float("nan")),
+        "fsm_dead_end_count": fsm_dead_end_count,
+        "invalid_samples": invalid_samples,
+    }
 
 
 def _resolve_report_path(run_id: str, output_path: Path | None, project_root: Path) -> Path:
@@ -851,8 +1056,11 @@ def main() -> None:
 
     # 懒加载 torch，确保错误信息更可读，并减少无关场景启动开销。
     from src.utils.config_io import dump_json_file
+    from src.utils.config_io import dump_json_file
     from src.utils.report_plots import write_eval_report_plot
     from src.utils.torch_utils import lazy_import_torch, resolve_torch_device
+
+    from src.decoding import TuneFlowGrammarFSM
 
     torch = lazy_import_torch()
     from src.model.configuration import DecoderConfig
@@ -878,6 +1086,7 @@ def main() -> None:
 
     # 1) 准备验证集采样器（用于 valid_loss / ppl）。
     valid_idx = args.valid_idx if args.valid_idx.is_absolute() else (project_root / args.valid_idx)
+    valid_idx = args.valid_idx if args.valid_idx.is_absolute() else (project_root / args.valid_idx)
     valid_bin = None
     if args.valid_bin is not None:
         valid_bin = args.valid_bin if args.valid_bin.is_absolute() else (project_root / args.valid_bin)
@@ -885,12 +1094,14 @@ def main() -> None:
 
     # 2) 准备 infilling 评估样本与词表。
     eval_tok_path = args.eval_tok if args.eval_tok.is_absolute() else (project_root / args.eval_tok)
+    eval_tok_path = args.eval_tok if args.eval_tok.is_absolute() else (project_root / args.eval_tok)
     eval_rows = _load_eval_tok_lines(eval_tok_path.resolve())
     if not eval_rows:
         raise ValueError(f"No eval samples found in {eval_tok_path}")
 
     vocab_path = args.vocab_path if args.vocab_path.is_absolute() else (project_root / args.vocab_path)
     vocab, id_to_token = _load_vocab(vocab_path.resolve())
+    grammar_fsm = TuneFlowGrammarFSM.from_vocab(vocab)
     metrics_path = None
     if args.metrics_path is not None:
         metrics_path = args.metrics_path if args.metrics_path.is_absolute() else (project_root / args.metrics_path)
@@ -913,6 +1124,7 @@ def main() -> None:
 
             # 优先使用 checkpoint 内部保存的模型配置，保证评估与训练一致。
             ckpt_model_cfg = ckpt_payload.get("model_config")
+            ckpt_model_cfg = ckpt_payload.get("model_config")
             if isinstance(ckpt_model_cfg, dict):
                 config = DecoderConfig.from_dict(ckpt_model_cfg)
             else:
@@ -924,6 +1136,7 @@ def main() -> None:
             model.eval()
 
             # 每个 checkpoint 的有效 seq_len 受对应模型最大位置长度约束。
+            eval_seq_len = min(max(1, args.seq_len), int(config.max_position_embeddings))
             eval_seq_len = min(max(1, args.seq_len), int(config.max_position_embeddings))
             valid_rng = random.Random(args.seed)
             infill_rng = random.Random(args.seed + 1)
@@ -939,6 +1152,7 @@ def main() -> None:
                     torch_mod=torch,
                     rng=valid_rng,
                     device=device,
+                    id_to_token=id_to_token,
                     batch_size=args.batch_size,
                     seq_len=eval_seq_len,
                     eval_batches=args.eval_batches,
@@ -948,22 +1162,13 @@ def main() -> None:
                 ),
             )
             ppl = _safe_perplexity(valid_loss)
-            (
-                struct_rate,
-                struct_valid,
-                struct_total,
-                eos_hits,
-                syntax_hits,
-                invalid_samples,
-                invalid_reason_counts,
-                invalid_syntax_reason_counts,
-            ) = _evaluate_structural_validity(
+            infilling_metrics = _evaluate_structural_validity(
                 model=model,
                 torch_mod=torch,
                 eval_rows=eval_rows,
                 token_to_id=vocab,
                 id_to_token=id_to_token,
-                vocab=vocab,
+                grammar_fsm=grammar_fsm,
                 device=device,
                 use_amp=use_amp,
                 amp_dtype=amp_dtype,
@@ -974,6 +1179,21 @@ def main() -> None:
                 rng=infill_rng,
                 debug_invalid_samples=max(0, int(args.debug_invalid_samples)),
             )
+            struct_rate = infilling_metrics["raw_structural_validity_rate"]
+            struct_valid = infilling_metrics["raw_structural_valid_count"]
+            struct_total = infilling_metrics["raw_structural_total_count"]
+            eos_hits = infilling_metrics["raw_eos_reached_count"]
+            syntax_hits = infilling_metrics["raw_syntax_pass_count"]
+            invalid_samples = infilling_metrics["invalid_samples"]
+            invalid_reason_counts = infilling_metrics["raw_invalid_reason_counts"]
+            invalid_syntax_reason_counts = infilling_metrics["raw_invalid_syntax_reason_counts"]
+            fsm_struct_rate = infilling_metrics["fsm_structural_validity_rate"]
+            fsm_struct_valid = infilling_metrics["fsm_structural_valid_count"]
+            fsm_struct_total = infilling_metrics["fsm_structural_total_count"]
+            fsm_eos_hits = infilling_metrics["fsm_eos_reached_count"]
+            fsm_syntax_hits = infilling_metrics["fsm_syntax_pass_count"]
+            fsm_invalid_reason_counts = infilling_metrics["fsm_invalid_reason_counts"]
+            fsm_invalid_syntax_reason_counts = infilling_metrics["fsm_invalid_syntax_reason_counts"]
 
             result = {
                 "checkpoint_name": ckpt_path.name,
@@ -989,12 +1209,39 @@ def main() -> None:
                 "eos_reached_rate": ((eos_hits / struct_total) if struct_total else float("nan")),
                 "syntax_pass_count": syntax_hits,
                 "syntax_pass_rate": ((syntax_hits / struct_total) if struct_total else float("nan")),
+                "fsm_structural_validity_rate": fsm_struct_rate,
+                "fsm_structural_valid_count": fsm_struct_valid,
+                "fsm_structural_total_count": fsm_struct_total,
+                "fsm_eos_reached_count": fsm_eos_hits,
+                "fsm_eos_reached_rate": ((fsm_eos_hits / fsm_struct_total) if fsm_struct_total else float("nan")),
+                "fsm_syntax_pass_count": fsm_syntax_hits,
+                "fsm_syntax_pass_rate": ((fsm_syntax_hits / fsm_struct_total) if fsm_struct_total else float("nan")),
+                "fsm_decoding_step_count": infilling_metrics["fsm_decoding_step_count"],
+                "fsm_illegal_top1_count": infilling_metrics["fsm_illegal_top1_count"],
+                "fsm_illegal_top1_rate": (
+                    (infilling_metrics["fsm_illegal_top1_count"] / infilling_metrics["fsm_decoding_step_count"])
+                    if infilling_metrics["fsm_decoding_step_count"]
+                    else float("nan")
+                ),
+                "fsm_mask_intervention_count": infilling_metrics["fsm_mask_intervention_count"],
+                "fsm_mask_intervention_rate": (
+                    (
+                        infilling_metrics["fsm_mask_intervention_count"]
+                        / infilling_metrics["fsm_decoding_step_count"]
+                    )
+                    if infilling_metrics["fsm_decoding_step_count"]
+                    else float("nan")
+                ),
+                "fsm_legal_mass_mean": infilling_metrics["fsm_legal_mass_mean"],
+                "fsm_dead_end_count": infilling_metrics["fsm_dead_end_count"],
                 "seq_len": eval_seq_len,
                 "eval_batches": args.eval_batches,
                 "num_infilling_samples": args.num_infilling_samples,
                 "invalid_debug_sample_count": len(invalid_samples),
                 "invalid_reason_counts": invalid_reason_counts,
                 "invalid_syntax_reason_counts": invalid_syntax_reason_counts,
+                "fsm_invalid_reason_counts": fsm_invalid_reason_counts,
+                "fsm_invalid_syntax_reason_counts": fsm_invalid_syntax_reason_counts,
             }
             results.append(result)
             invalid_reason_text = ", ".join(
@@ -1003,15 +1250,25 @@ def main() -> None:
             invalid_syntax_text = ", ".join(
                 f"{key}={value}" for key, value in sorted(invalid_syntax_reason_counts.items())
             ) or "none"
+            fsm_invalid_reason_text = ", ".join(
+                f"{key}={value}" for key, value in sorted(fsm_invalid_reason_counts.items())
+            ) or "none"
+            fsm_invalid_syntax_text = ", ".join(
+                f"{key}={value}" for key, value in sorted(fsm_invalid_syntax_reason_counts.items())
+            ) or "none"
             print(
                 f"[eval_infilling] step={result['step']} "
                 f"valid_loss={valid_loss:.6f}({valid_loss_source}) ppl={ppl:.6f} "
-                f"struct_valid={struct_rate:.4f} ({struct_valid}/{struct_total}) "
-                f"eos={eos_hits}/{struct_total} syntax={syntax_hits}/{struct_total} "
-                f"invalid={invalid_reason_text}"
+                f"raw_struct={struct_rate:.4f} ({struct_valid}/{struct_total}) "
+                f"fsm_struct={fsm_struct_rate:.4f} ({fsm_struct_valid}/{fsm_struct_total}) "
+                f"raw_invalid={invalid_reason_text} "
+                f"fsm_invalid={fsm_invalid_reason_text} "
+                f"fsm_illegal_top1={result['fsm_illegal_top1_rate']:.4f}"
             )
             if invalid_syntax_reason_counts:
-                print(f"[eval_infilling] step={result['step']} invalid_syntax={invalid_syntax_text}")
+                print(f"[eval_infilling] step={result['step']} raw_invalid_syntax={invalid_syntax_text}")
+            if fsm_invalid_syntax_reason_counts:
+                print(f"[eval_infilling] step={result['step']} fsm_invalid_syntax={fsm_invalid_syntax_text}")
             if invalid_samples:
                 invalid_debug_results.append(
                     {
@@ -1020,6 +1277,8 @@ def main() -> None:
                         "step": step,
                         "invalid_reason_counts": invalid_reason_counts,
                         "invalid_syntax_reason_counts": invalid_syntax_reason_counts,
+                        "fsm_invalid_reason_counts": fsm_invalid_reason_counts,
+                        "fsm_invalid_syntax_reason_counts": fsm_invalid_syntax_reason_counts,
                         "samples": invalid_samples,
                     }
                 )
@@ -1032,6 +1291,7 @@ def main() -> None:
 
             del model
             if device.type == "cuda":
+                torch.cuda.empty_cache()
                 # 防止多 checkpoint 连续评估时显存积压。
                 torch.cuda.empty_cache()
     finally:
@@ -1039,19 +1299,32 @@ def main() -> None:
 
     # 汇总 run 级别统计，便于快速看趋势与最优点。
     finite_losses = [r["valid_loss"] for r in results if math.isfinite(float(r["valid_loss"]))]
+    finite_losses = [r["valid_loss"] for r in results if math.isfinite(float(r["valid_loss"]))]
     finite_struct = [r["structural_validity_rate"] for r in results if math.isfinite(float(r["structural_validity_rate"]))]
+    finite_fsm_struct = [
+        r["fsm_structural_validity_rate"]
+        for r in results
+        if math.isfinite(float(r["fsm_structural_validity_rate"]))
+    ]
     summary_invalid_reason_counts: Counter[str] = Counter()
     summary_invalid_syntax_reason_counts: Counter[str] = Counter()
+    summary_fsm_invalid_reason_counts: Counter[str] = Counter()
+    summary_fsm_invalid_syntax_reason_counts: Counter[str] = Counter()
     for result in results:
         summary_invalid_reason_counts.update(result.get("invalid_reason_counts", {}))
         summary_invalid_syntax_reason_counts.update(result.get("invalid_syntax_reason_counts", {}))
+        summary_fsm_invalid_reason_counts.update(result.get("fsm_invalid_reason_counts", {}))
+        summary_fsm_invalid_syntax_reason_counts.update(result.get("fsm_invalid_syntax_reason_counts", {}))
     summary = {
         "checkpoint_count": len(results),
         "best_valid_loss": (min(finite_losses) if finite_losses else float("nan")),
         "best_structural_validity_rate": (max(finite_struct) if finite_struct else float("nan")),
+        "best_fsm_structural_validity_rate": (max(finite_fsm_struct) if finite_fsm_struct else float("nan")),
         "elapsed_sec": max(0.0, time.time() - started_at),
         "invalid_reason_counts": dict(summary_invalid_reason_counts),
         "invalid_syntax_reason_counts": dict(summary_invalid_syntax_reason_counts),
+        "fsm_invalid_reason_counts": dict(summary_fsm_invalid_reason_counts),
+        "fsm_invalid_syntax_reason_counts": dict(summary_fsm_invalid_syntax_reason_counts),
     }
 
     report = {
@@ -1109,7 +1382,8 @@ def main() -> None:
         metric_specs=[
             {"key": "valid_loss", "label": "Valid Loss", "color": "#2563eb"},
             {"key": "ppl", "label": "Perplexity", "color": "#dc2626"},
-            {"key": "structural_validity_rate", "label": "Structural Validity Rate", "color": "#059669", "percent": True},
+            {"key": "structural_validity_rate", "label": "Raw Structural Validity Rate", "color": "#059669", "percent": True},
+            {"key": "fsm_structural_validity_rate", "label": "FSM Structural Validity Rate", "color": "#0f766e", "percent": True},
         ],
     )
     print(f"[eval_infilling] report -> {report_path}")

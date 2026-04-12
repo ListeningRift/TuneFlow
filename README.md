@@ -108,10 +108,10 @@ python scripts/train/regression_check.py --device cpu --precision fp32 --seq-len
 评估报告默认写到：
 - 报告路径：`outputs/reports/eval_infilling/<run_id>.json`
 - 图表路径：`outputs/reports/eval_infilling/<run_id>.png`
-- 重点关注字段：`valid_loss`、`ppl`、`structural_validity_rate`
+- 重点关注字段：`valid_loss`、`ppl`、`structural_validity_rate`、`fsm_structural_validity_rate`
 - 报告路径：`outputs/reports/eval_continuation/<run_id>.json`
 - 图表路径：`outputs/reports/eval_continuation/<run_id>.png`
-- 重点关注字段：`valid_loss`、`ppl`、`structural_validity_rate`、`first_token_accuracy`
+- 重点关注字段：`valid_loss`、`ppl`、`structural_validity_rate`、`fsm_structural_validity_rate`、`first_token_accuracy`、`fsm_first_token_accuracy`
 
 ## 评估最小闭环（按 checkpoint）
 `eval_all.py` 是统一评估入口，会按顺序跑完 infilling 与 continuation 两类评估：
@@ -128,10 +128,11 @@ python scripts/eval/eval_all.py --checkpoint-dir outputs/checkpoints/base/<run_i
 python scripts/eval/eval_all.py --checkpoint-dir outputs/checkpoints/base/<run_id> --run-id <run_id> --checkpoint-policy all --valid-loss-source recompute
 ```
 
-`eval_infilling.py` 会对 run 目录下每个 checkpoint 逐个评估，并输出：
+`eval_infilling.py` 会对 run 目录下每个 checkpoint 逐个评估，并同时输出“原始贪心解码”和“FSM 约束解码”两套结果：
 - `valid_loss`
 - `ppl`
 - `structural_validity_rate`
+- `fsm_structural_validity_rate`
 
 示例：
 ```bash
@@ -142,11 +143,13 @@ python scripts/eval/eval_infilling.py --checkpoint-dir outputs/checkpoints/base/
 - `outputs/reports/eval_infilling/<run_id>.json`
 - `outputs/reports/eval_infilling/<run_id>.png`
 
-`eval_continuation.py` 会对同一批 checkpoint 逐个评估续写能力，并输出：
+`eval_continuation.py` 会对同一批 checkpoint 逐个评估续写能力，并同时输出“原始贪心解码”和“FSM 约束解码”两套结果：
 - `valid_loss`
 - `ppl`
 - `structural_validity_rate`
+- `fsm_structural_validity_rate`
 - `first_token_accuracy`
+- `fsm_first_token_accuracy`
 
 示例：
 ```bash
