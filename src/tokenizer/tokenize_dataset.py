@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import math
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -27,6 +26,7 @@ from .common import (
     summarize_lengths,
     write_tok_lines,
 )
+from .velocity import VelocityConfig, build_velocity_table, velocity_to_bin
 
 
 @dataclass
@@ -71,17 +71,35 @@ class TokenizerConfig:
         """从 YAML 字典构建配置，并忽略未知字段。"""
         valid_keys = {f.name for f in cls.__dataclass_fields__.values()}  # type: ignore[attr-defined]
         safe = {k: v for k, v in data.items() if k in valid_keys}
+        velocity_cfg = VelocityConfig.from_mapping(data)
+        safe.update(
+            {
+                "velocity_bins": velocity_cfg.num_bins,
+                "velocity_mu": velocity_cfg.mu,
+                "velocity_center": velocity_cfg.center,
+                "velocity_radius": velocity_cfg.half_range,
+            }
+        )
         cfg = cls(**safe)
         if cfg.positions_per_bar <= 0:
             raise ValueError("positions_per_bar 必须为正数")
-        if cfg.velocity_bins <= 1:
-            raise ValueError("velocity_bins 必须大于 1")
         if cfg.tempo_step <= 0:
             raise ValueError("tempo_step 必须为正数")
         if cfg.pitch_min > cfg.pitch_max:
             raise ValueError("pitch_min 不能大于 pitch_max")
         if cfg.default_inst not in cfg.inst_classes:
             raise ValueError("default_inst 必须在 inst_classes 内")
+        return cfg
+
+    def velocity_config(self) -> VelocityConfig:
+        """返回当前 tokenizer 配置对应的力度映射配置。"""
+        cfg = VelocityConfig(
+            num_bins=self.velocity_bins,
+            mu=self.velocity_mu,
+            center=self.velocity_center,
+            half_range=self.velocity_radius,
+        )
+        cfg.validate()
         return cfg
 
 
@@ -91,18 +109,22 @@ def load_config(path: Path) -> TokenizerConfig:
     return TokenizerConfig.from_mapping(raw)
 
 
-def velocity_to_bucket(velocity: int, config: TokenizerConfig) -> int:
+def velocity_to_bucket(velocity: int, velocity_config: VelocityConfig) -> int:
     """将 MIDI velocity 映射到 `VEL_0..N-1`。"""
-    v = min(127, max(1, int(velocity)))
-    c = config.velocity_center
-    r = max(1e-6, config.velocity_radius)
-    mu = max(1e-6, config.velocity_mu)
-    x = (v - c) / r
-    sign = -1.0 if x < 0 else 1.0
-    s = sign * math.log1p(mu * abs(x)) / math.log1p(mu)
-    bins = config.velocity_bins - 1
-    k = int(round(((s + 1.0) / 2.0) * bins))
-    return min(bins, max(0, k))
+    return velocity_to_bin(velocity, velocity_config)
+
+
+def print_velocity_table(config: TokenizerConfig) -> None:
+    """打印当前 tokenizer 配置下的力度桶代表值和示例编码。"""
+    velocity_config = config.velocity_config()
+    reps = build_velocity_table(velocity_config)
+    print("Velocity bin representatives (bin -> decoded velocity):")
+    for idx, vel in enumerate(reps):
+        print(f"  VEL_{idx:02d} -> {vel}")
+
+    print("\nSample encoding (velocity -> bin):")
+    for velocity in [1, 16, 32, 48, 64, 80, 96, 112, 127]:
+        print(f"  {velocity:3d} -> VEL_{velocity_to_bucket(velocity, velocity_config):02d}")
 
 
 def bpm_to_token(bpm: float, config: TokenizerConfig) -> str:
@@ -151,6 +173,7 @@ def tokenize_midi(midi: mido.MidiFile, config: TokenizerConfig) -> List[str]:
     bar_ticks = get_bar_ticks(midi)
     pos_ticks = bar_ticks / config.positions_per_bar
     tempo_events = collect_tempo_changes(midi)
+    velocity_config = config.velocity_config()
 
     per_bar: Dict[int, List[Tuple[int, int, int, int]]] = defaultdict(list)
     max_bar_idx = 0
@@ -164,7 +187,7 @@ def tokenize_midi(midi: mido.MidiFile, config: TokenizerConfig) -> List[str]:
         dur_pos = int(round(n.duration_tick / max(1e-9, pos_ticks)))
         dur_pos = max(1, dur_pos)
         dur_bin = nearest_value(dur_pos, config.duration_bins)
-        vel_bin = velocity_to_bucket(n.velocity, config)
+        vel_bin = velocity_to_bucket(n.velocity, velocity_config)
         per_bar[bar_idx].append((pos, n.pitch, dur_bin, vel_bin))
 
     tokens: List[str] = ["BOS"]
@@ -371,6 +394,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="可选：每个 split 最多处理 N 条（用于冒烟测试）。",
     )
+    parser.add_argument(
+        "--print-velocity-table",
+        action="store_true",
+        help="打印当前配置下的 velocity 分桶代表值并退出。",
+    )
     return parser.parse_args()
 
 
@@ -378,6 +406,9 @@ def main() -> None:
     """程序入口。"""
     args = parse_args()
     config = load_config(args.config)
+    if args.print_velocity_table:
+        print_velocity_table(config)
+        return
     process(
         config=config,
         output_dir=args.output_dir,
