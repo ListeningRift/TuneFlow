@@ -24,6 +24,9 @@ special_tokens: [BOS, EOS, FIM_HOLE, FIM_MID]
 include_task_tokens: false
 task_tokens: [TASK_INFILL, TASK_CONT, TASK_GEN]
 
+# 仅对 train split 做移调增强；valid/test/eval 保持不变，方便公平对比。
+train_transpose_offsets: [-12, -5, -3, 3, 5, 12]
+
 split_files:
   train: data/base/train.jsonl
   valid: data/base/valid.jsonl

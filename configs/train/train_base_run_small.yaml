@@ -16,13 +16,13 @@ train:
   # small 档位：明显大于冒烟规模，但仍适合快速观察训练趋势和早期评估反馈。
   steps: 5000
   batch_size: 2
-  grad_accum_steps: 1
+  grad_accum_steps: 4
   seq_len: 256
-  lr: 0.0003
+  lr: 0.0002
   weight_decay: 0.01
   grad_clip: 1.0
   # NEXT + FIM 混合训练：续写为主任务，FIM 为辅助任务。
-  fim_ratio: 0.3
+  fim_ratio: 0.2
   fim_min_span: 8
   fim_max_span: 64
   bos_sample_ratio: 0.1
@@ -35,7 +35,7 @@ train:
   min_lr_scale: 0.1
 
   # 日志 / 评估 / 保存
-  log_every: 20
+  log_every: 50
   eval_every: 250
   eval_batches: 10
   save_every: 250

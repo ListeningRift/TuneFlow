@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shlex
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 
@@ -260,6 +262,98 @@ def _run_cmd(cmd: list[str], cwd: Path, dry_run: bool) -> None:
     subprocess.run(cmd, cwd=cwd, check=True)
 
 
+def _build_overall_report(
+    *,
+    project_root: Path,
+    run_id: str,
+    checkpoint_dir: Path,
+) -> Path:
+    """汇总 infilling / continuation 两份报告，生成全局推荐结果。"""
+    from src.utils.checkpoint_selection import score_checkpoint_results
+    from src.utils.config_io import dump_json_file
+
+    infilling_report_path = project_root / "outputs" / "reports" / "eval_infilling" / f"{run_id}.json"
+    continuation_report_path = project_root / "outputs" / "reports" / "eval_continuation" / f"{run_id}.json"
+    if not infilling_report_path.exists():
+        raise FileNotFoundError(f"Infilling report not found: {infilling_report_path}")
+    if not continuation_report_path.exists():
+        raise FileNotFoundError(f"Continuation report not found: {continuation_report_path}")
+
+    infilling_report = json.loads(infilling_report_path.read_text(encoding="utf-8"))
+    continuation_report = json.loads(continuation_report_path.read_text(encoding="utf-8"))
+    infilling_results = infilling_report.get("results", [])
+    continuation_results = continuation_report.get("results", [])
+
+    merged_by_path: dict[str, dict[str, object]] = {}
+
+    for result in infilling_results:
+        checkpoint_path = str(result.get("checkpoint_path"))
+        merged = merged_by_path.setdefault(
+            checkpoint_path,
+            {
+                "checkpoint_name": result.get("checkpoint_name"),
+                "checkpoint_path": checkpoint_path,
+                "step": result.get("step"),
+            },
+        )
+        merged["valid_loss"] = result.get("valid_loss")
+        merged["ppl"] = result.get("ppl")
+        merged["infilling_structural_validity_rate"] = result.get("structural_validity_rate")
+        merged["infilling_fsm_structural_validity_rate"] = result.get("fsm_structural_validity_rate")
+
+    for result in continuation_results:
+        checkpoint_path = str(result.get("checkpoint_path"))
+        merged = merged_by_path.setdefault(
+            checkpoint_path,
+            {
+                "checkpoint_name": result.get("checkpoint_name"),
+                "checkpoint_path": checkpoint_path,
+                "step": result.get("step"),
+            },
+        )
+        if merged.get("valid_loss") is None:
+            merged["valid_loss"] = result.get("valid_loss")
+        if merged.get("ppl") is None:
+            merged["ppl"] = result.get("ppl")
+        merged["continuation_structural_validity_rate"] = result.get("structural_validity_rate")
+        merged["continuation_eos_reached_rate"] = result.get("eos_reached_rate")
+        merged["continuation_budget_stop_rate"] = result.get("budget_stop_rate")
+        merged["continuation_first_token_accuracy"] = result.get("first_token_accuracy")
+        merged["continuation_fsm_structural_validity_rate"] = result.get("fsm_structural_validity_rate")
+
+    merged_results = sorted(
+        merged_by_path.values(),
+        key=lambda item: (
+            int(item.get("step") or -1),
+            str(item.get("checkpoint_name") or ""),
+        ),
+    )
+    merged_results, selection = score_checkpoint_results(list(merged_results), profile="overall")
+
+    output_dir = project_root / "outputs" / "reports" / "eval_all"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f"{run_id}.json"
+    report = {
+        "run_id": run_id,
+        "created_at": time.time(),
+        "checkpoint_dir": str(checkpoint_dir),
+        "infilling_report_path": str(infilling_report_path),
+        "continuation_report_path": str(continuation_report_path),
+        "summary": {
+            "selection_version": selection["selection_version"],
+            "selection_profile": selection["profile"],
+            "selection_display_name": selection["display_name"],
+            "selection_metric_weights": selection["metric_weights"],
+            "selection_notes": selection["notes"],
+            "recommended_checkpoint": selection["recommended_checkpoint"],
+        },
+        "selection": selection,
+        "results": merged_results,
+    }
+    dump_json_file(output_path, report, ensure_ascii=False, indent=2)
+    return output_path
+
+
 def main() -> None:
     """
     程序入口。
@@ -305,6 +399,23 @@ def main() -> None:
 
     _run_cmd(infilling_cmd, cwd=project_root, dry_run=args.dry_run)
     _run_cmd(continuation_cmd, cwd=project_root, dry_run=args.dry_run)
+
+    if not args.dry_run:
+        overall_report_path = _build_overall_report(
+            project_root=project_root,
+            run_id=run_id,
+            checkpoint_dir=checkpoint_dir,
+        )
+        overall_report = json.loads(overall_report_path.read_text(encoding="utf-8"))
+        recommended = (overall_report.get("summary", {}) or {}).get("recommended_checkpoint")
+        if isinstance(recommended, dict):
+            print(
+                "[eval_all] 全局推荐 checkpoint -> "
+                f"{recommended.get('checkpoint_name')} "
+                f"(step={recommended.get('step')}, balanced_score={float(recommended.get('balanced_score', float('nan'))):.4f})",
+                flush=True,
+            )
+        print(f"[eval_all] overall report -> {overall_report_path}", flush=True)
 
     print(f"[eval_all] infilling report dir={project_root / 'outputs' / 'reports' / 'eval_infilling'}", flush=True)
     print(f"[eval_all] continuation report dir={project_root / 'outputs' / 'reports' / 'eval_continuation'}", flush=True)

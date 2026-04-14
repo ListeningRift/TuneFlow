@@ -1168,9 +1168,13 @@ def main() -> None:
     report_path = _resolve_report_path(run_id=run_id, output_path=args.output_path, project_root=project_root).resolve()
     samples_path = report_path.with_name(f"{report_path.stem}.samples.json")
 
+    from src.utils.checkpoint_selection import score_checkpoint_results
     from src.utils.config_io import dump_json_file
-    from src.utils.report_plots import write_eval_report_plot
     from src.utils.torch_utils import lazy_import_torch, resolve_torch_device
+    try:
+        from src.utils.report_plots import write_eval_report_plot
+    except ModuleNotFoundError:
+        write_eval_report_plot = None
 
     torch = lazy_import_torch()
     from src.model.configuration import DecoderConfig
@@ -1487,6 +1491,8 @@ def main() -> None:
         summary_invalid_syntax_reason_counts.update(result.get("invalid_syntax_reason_counts", {}))
         summary_fsm_invalid_reason_counts.update(result.get("fsm_invalid_reason_counts", {}))
         summary_fsm_invalid_syntax_reason_counts.update(result.get("fsm_invalid_syntax_reason_counts", {}))
+    results, selection = score_checkpoint_results(results, profile="continuation")
+
     summary = {
         "checkpoint_count": len(results),
         "best_valid_loss": (min(finite_losses) if finite_losses else float("nan")),
@@ -1494,6 +1500,12 @@ def main() -> None:
         "best_first_token_accuracy": (max(finite_first) if finite_first else float("nan")),
         "best_fsm_structural_validity_rate": (max(finite_fsm_struct) if finite_fsm_struct else float("nan")),
         "best_fsm_first_token_accuracy": (max(finite_fsm_first) if finite_fsm_first else float("nan")),
+        "selection_version": selection["selection_version"],
+        "selection_profile": selection["profile"],
+        "selection_display_name": selection["display_name"],
+        "selection_metric_weights": selection["metric_weights"],
+        "selection_notes": selection["notes"],
+        "recommended_checkpoint": selection["recommended_checkpoint"],
         "invalid_reason_counts": dict(summary_invalid_reason_counts),
         "invalid_syntax_reason_counts": dict(summary_invalid_syntax_reason_counts),
         "fsm_invalid_reason_counts": dict(summary_fsm_invalid_reason_counts),
@@ -1536,6 +1548,7 @@ def main() -> None:
         },
         "summary": summary,
         "results": results,
+        "selection": selection,
         "artifacts": {
             "plot_path": str(report_path.with_suffix(".png")),
             "samples_path": (str(samples_path) if args.debug_continuation_samples > 0 else None),
@@ -1557,22 +1570,33 @@ def main() -> None:
             indent=2,
         )
     dump_json_file(report_path, report, ensure_ascii=False, indent=2)
-    plot_path = write_eval_report_plot(
-        report_path=report_path,
-        report=report,
-        title="Continuation Eval Report",
-        metric_specs=[
-            {"key": "valid_loss", "label": "Valid Loss", "color": "#2563eb"},
-            {"key": "ppl", "label": "Perplexity", "color": "#dc2626"},
-            {"key": "structural_validity_rate", "label": "Raw Structural Validity Rate", "color": "#059669", "percent": True},
-            {"key": "fsm_structural_validity_rate", "label": "FSM Structural Validity Rate", "color": "#0f766e", "percent": True},
-            {"key": "first_token_accuracy", "label": "Raw First Token Accuracy", "color": "#7c3aed", "percent": True},
-            {"key": "fsm_first_token_accuracy", "label": "FSM First Token Accuracy", "color": "#9333ea", "percent": True},
-        ],
-    )
+    plot_path = report_path.with_suffix(".png")
+    if write_eval_report_plot is not None:
+        plot_path = write_eval_report_plot(
+            report_path=report_path,
+            report=report,
+            title="Continuation Eval Report",
+            metric_specs=[
+                {"key": "valid_loss", "label": "Valid Loss", "color": "#2563eb"},
+                {"key": "ppl", "label": "Perplexity", "color": "#dc2626"},
+                {"key": "structural_validity_rate", "label": "Raw Structural Validity Rate", "color": "#059669", "percent": True},
+                {"key": "fsm_structural_validity_rate", "label": "FSM Structural Validity Rate", "color": "#0f766e", "percent": True},
+                {"key": "first_token_accuracy", "label": "Raw First Token Accuracy", "color": "#7c3aed", "percent": True},
+                {"key": "fsm_first_token_accuracy", "label": "FSM First Token Accuracy", "color": "#9333ea", "percent": True},
+            ],
+        )
     print(f"[eval_continuation] report -> {report_path}")
     if args.debug_continuation_samples > 0:
         print(f"[eval_continuation] samples -> {samples_path}")
+    recommended = selection.get("recommended_checkpoint")
+    if isinstance(recommended, dict):
+        print(
+            "[eval_continuation] 推荐 checkpoint -> "
+            f"{recommended.get('checkpoint_name')} "
+            f"(step={recommended.get('step')}, balanced_score={float(recommended.get('balanced_score', float('nan'))):.4f})"
+        )
+    if write_eval_report_plot is None:
+        print("[eval_continuation] 未检测到 matplotlib，已跳过 PNG 绘图。")
     print(f"[eval_continuation] plot -> {plot_path}")
 
 

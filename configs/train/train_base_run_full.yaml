@@ -13,17 +13,16 @@ train:
   seed: 42
 
   # 优化配置
-  # full 档位：按当前数据集估算，大致覆盖一个完整的 train-token pass。
-  # `one_pass` 会由 train_base_from_config.py 结合 train.idx.json 自动展开。
-  steps: one_pass
+  # full 档位：使用固定训练预算，避免在增强后数据规模下 `one_pass` 过重。
+  steps: 150000
   batch_size: 2
-  grad_accum_steps: 1
+  grad_accum_steps: 4
   seq_len: 256
-  lr: 0.0003
+  lr: 0.0002
   weight_decay: 0.01
   grad_clip: 1.0
   # NEXT + FIM 混合训练：续写为主任务，FIM 为辅助任务。
-  fim_ratio: 0.3
+  fim_ratio: 0.2
   fim_min_span: 8
   fim_max_span: 64
   bos_sample_ratio: 0.1
@@ -37,9 +36,9 @@ train:
 
   # 日志 / 评估 / 保存
   log_every: 100
-  eval_every: 5000
+  eval_every: 2000
   eval_batches: 10
-  save_every: 5000
+  save_every: 2000
   save_best: true
   no_restore_rng: false
 

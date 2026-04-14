@@ -18,6 +18,7 @@ except ImportError as exc:
 
 from ..utils.config_io import dump_json_file, load_yaml_mapping
 from .common import (
+    NoteEvent,
     collect_note_events,
     collect_tempo_changes,
     get_bar_ticks,
@@ -56,6 +57,7 @@ class TokenizerConfig:
     task_tokens: List[str] = field(
         default_factory=lambda: ["TASK_INFILL", "TASK_CONT", "TASK_GEN"]
     )
+    train_transpose_offsets: List[int] = field(default_factory=list)
     recursive: bool = True
     split_files: Dict[str, str] = field(
         default_factory=lambda: {
@@ -89,6 +91,11 @@ class TokenizerConfig:
             raise ValueError("pitch_min 不能大于 pitch_max")
         if cfg.default_inst not in cfg.inst_classes:
             raise ValueError("default_inst 必须在 inst_classes 内")
+        cfg.train_transpose_offsets = [
+            int(offset)
+            for offset in dict.fromkeys(cfg.train_transpose_offsets)
+            if int(offset) != 0
+        ]
         return cfg
 
     def velocity_config(self) -> VelocityConfig:
@@ -153,42 +160,69 @@ def build_vocab(config: TokenizerConfig) -> Dict[str, int]:
 
     seen = set()
     deduped: List[str] = []
-    for t in vocab:
-        if t not in seen:
-            seen.add(t)
-            deduped.append(t)
-    return {t: i for i, t in enumerate(deduped)}
+    for token in vocab:
+        if token not in seen:
+            seen.add(token)
+            deduped.append(token)
+    return {token: idx for idx, token in enumerate(deduped)}
 
 
-def tokenize_midi(midi: mido.MidiFile, config: TokenizerConfig) -> List[str]:
-    """将单个 MIDI 编码成 token 序列。"""
-    notes = [
-        n
-        for n in collect_note_events(midi)
-        if config.pitch_min <= n.pitch <= config.pitch_max and n.duration_tick > 0
+def _collect_tokenizer_notes(midi: mido.MidiFile, config: TokenizerConfig) -> List[NoteEvent]:
+    """收集落在当前音高范围内、可用于分词的音符事件。"""
+    return [
+        note
+        for note in collect_note_events(midi)
+        if config.pitch_min <= note.pitch <= config.pitch_max and note.duration_tick > 0
     ]
+
+
+def _transpose_notes(
+    notes: Sequence[NoteEvent], semitone_offset: int, config: TokenizerConfig
+) -> List[NoteEvent] | None:
+    """对音符事件做移调；若超出音域范围则返回 `None`。"""
+    shifted_notes: List[NoteEvent] = []
+    for note in notes:
+        shifted_pitch = note.pitch + semitone_offset
+        if shifted_pitch < config.pitch_min or shifted_pitch > config.pitch_max:
+            return None
+        shifted_notes.append(
+            NoteEvent(
+                start_tick=note.start_tick,
+                end_tick=note.end_tick,
+                pitch=shifted_pitch,
+                velocity=note.velocity,
+            )
+        )
+    return shifted_notes
+
+
+def _tokenize_note_events(
+    notes: Sequence[NoteEvent],
+    tempo_events: Sequence[Tuple[int, float]],
+    bar_ticks: int,
+    config: TokenizerConfig,
+) -> List[str]:
+    """将音符事件与节奏信息编码成 token 序列。"""
     if not notes:
         return ["BOS", "EOS"]
 
-    bar_ticks = get_bar_ticks(midi)
     pos_ticks = bar_ticks / config.positions_per_bar
-    tempo_events = collect_tempo_changes(midi)
     velocity_config = config.velocity_config()
 
     per_bar: Dict[int, List[Tuple[int, int, int, int]]] = defaultdict(list)
     max_bar_idx = 0
-    for n in notes:
-        bar_idx = n.start_tick // bar_ticks
+    for note in notes:
+        bar_idx = note.start_tick // bar_ticks
         max_bar_idx = max(max_bar_idx, bar_idx)
-        in_bar_tick = n.start_tick % bar_ticks
+        in_bar_tick = note.start_tick % bar_ticks
         pos = int(round(in_bar_tick / max(1e-9, pos_ticks)))
         pos = min(config.positions_per_bar - 1, max(0, pos))
 
-        dur_pos = int(round(n.duration_tick / max(1e-9, pos_ticks)))
+        dur_pos = int(round(note.duration_tick / max(1e-9, pos_ticks)))
         dur_pos = max(1, dur_pos)
         dur_bin = nearest_value(dur_pos, config.duration_bins)
-        vel_bin = velocity_to_bucket(n.velocity, velocity_config)
-        per_bar[bar_idx].append((pos, n.pitch, dur_bin, vel_bin))
+        vel_bin = velocity_to_bucket(note.velocity, velocity_config)
+        per_bar[bar_idx].append((pos, note.pitch, dur_bin, vel_bin))
 
     tokens: List[str] = ["BOS"]
     first_tempo_token = bpm_to_token(tempo_events[0][1], config)
@@ -208,7 +242,7 @@ def tokenize_midi(midi: mido.MidiFile, config: TokenizerConfig) -> List[str]:
             last_tempo_token = current_tempo_token
 
         events = per_bar.get(bar_idx, [])
-        events.sort(key=lambda x: (x[0], x[1], x[2], x[3]))
+        events.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
         for pos, pitch, dur_bin, vel_bin in events:
             tokens.append(f"POS_{pos}")
             tokens.append(f"INST_{config.default_inst}")
@@ -220,38 +254,45 @@ def tokenize_midi(midi: mido.MidiFile, config: TokenizerConfig) -> List[str]:
     return tokens
 
 
+def tokenize_midi(midi: mido.MidiFile, config: TokenizerConfig) -> List[str]:
+    """将单个 MIDI 编码成 token 序列。"""
+    notes = _collect_tokenizer_notes(midi, config)
+    bar_ticks = get_bar_ticks(midi)
+    tempo_events = collect_tempo_changes(midi)
+    return _tokenize_note_events(notes, tempo_events, bar_ticks, config)
+
+
 def validate_token_order(tokens: Sequence[str], vocab: Dict[str, int]) -> Tuple[bool, int]:
-    """校验 token 顺序是否合法，并返回 OOV 数量。"""
-    oov = sum(1 for t in tokens if t not in vocab)
+    """校验 token 顺序是否合法，并返回 `(is_valid, oov_count)`。"""
+    oov = sum(1 for token in tokens if token not in vocab)
     if not tokens or tokens[0] != "BOS":
         return False, oov
     if tokens[-1] != "EOS":
         return False, oov
 
-    i = 1
-    if i < len(tokens) - 1 and tokens[i].startswith("TEMPO_"):
-        i += 1
+    idx = 1
+    if idx < len(tokens) - 1 and tokens[idx].startswith("TEMPO_"):
+        idx += 1
 
-    while i < len(tokens) - 1:
-        if tokens[i] != "BAR":
+    while idx < len(tokens) - 1:
+        if tokens[idx] != "BAR":
             return False, oov
-        i += 1
-        if i < len(tokens) - 1 and tokens[i].startswith("TEMPO_"):
-            i += 1
-        while i < len(tokens) - 1 and tokens[i].startswith("POS_"):
-            if i + 4 >= len(tokens):
+        idx += 1
+        if idx < len(tokens) - 1 and tokens[idx].startswith("TEMPO_"):
+            idx += 1
+        while idx < len(tokens) - 1 and tokens[idx].startswith("POS_"):
+            if idx + 4 >= len(tokens):
                 return False, oov
-            if not tokens[i + 1].startswith("INST_"):
+            if not tokens[idx + 1].startswith("INST_"):
                 return False, oov
-            if not tokens[i + 2].startswith("PITCH_"):
+            if not tokens[idx + 2].startswith("PITCH_"):
                 return False, oov
-            if not tokens[i + 3].startswith("DUR_"):
+            if not tokens[idx + 3].startswith("DUR_"):
                 return False, oov
-            if not tokens[i + 4].startswith("VEL_"):
+            if not tokens[idx + 4].startswith("VEL_"):
                 return False, oov
-            i += 5
-        if i < len(tokens) - 1 and tokens[i] != "BAR":
-            # 若不是下一个 BAR，那只能是 EOS（循环条件会处理 EOS）
+            idx += 5
+        if idx < len(tokens) - 1 and tokens[idx] != "BAR":
             return False, oov
 
     return True, oov
@@ -275,6 +316,9 @@ def process(
     total_oov = 0
     total_invalid = 0
     total_samples = 0
+    total_written_rows = 0
+    total_augmented_rows = 0
+    total_transpose_skips = 0
     parse_errors: List[Dict[str, str]] = []
 
     for split_name, split_file in config.split_files.items():
@@ -286,8 +330,12 @@ def process(
         lengths: List[int] = []
         oov_count = 0
         invalid_count = 0
+        augmented_rows = 0
+        skipped_transpose_rows = 0
+        applied_transpose_counts = {str(offset): 0 for offset in config.train_transpose_offsets}
+        skipped_transpose_counts = {str(offset): 0 for offset in config.train_transpose_offsets}
 
-        for idx, row in enumerate(rows, 1):
+        for row_idx, row in enumerate(rows, 1):
             rel = str(row.get("midi_path", "")).strip()
             if not rel:
                 invalid_count += 1
@@ -299,23 +347,43 @@ def process(
             midi_path = midi_root / Path(rel)
             try:
                 midi = mido.MidiFile(midi_path, clip=True)
-                tokens = tokenize_midi(midi, config)
-                valid, line_oov = validate_token_order(tokens, vocab)
-                if not valid:
-                    invalid_count += 1
-                oov_count += line_oov
-                tok_lines.append(" ".join(tokens))
-                lengths.append(len(tokens))
+                notes = _collect_tokenizer_notes(midi, config)
+                bar_ticks = get_bar_ticks(midi)
+                tempo_events = collect_tempo_changes(midi)
+
+                token_variants = [_tokenize_note_events(notes, tempo_events, bar_ticks, config)]
+                # 仅对 train split 追加移调增强，验证与评测集保持原样。
+                if split_name == "train" and notes:
+                    for offset in config.train_transpose_offsets:
+                        shifted_notes = _transpose_notes(notes, offset, config)
+                        if shifted_notes is None:
+                            # 任一音符移调后越界，则跳过该增强版本，避免静默裁剪音高。
+                            skipped_transpose_rows += 1
+                            skipped_transpose_counts[str(offset)] += 1
+                            continue
+                        token_variants.append(
+                            _tokenize_note_events(shifted_notes, tempo_events, bar_ticks, config)
+                        )
+                        augmented_rows += 1
+                        applied_transpose_counts[str(offset)] += 1
+
+                for tokens in token_variants:
+                    valid, line_oov = validate_token_order(tokens, vocab)
+                    if not valid:
+                        invalid_count += 1
+                    oov_count += line_oov
+                    tok_lines.append(" ".join(tokens))
+                    lengths.append(len(tokens))
             except Exception as exc:  # pylint: disable=broad-except
                 invalid_count += 1
                 parse_errors.append(
                     {"split": split_name, "midi_path": rel, "error": str(exc)}
                 )
 
-            if idx % 500 == 0:
+            if row_idx % 500 == 0:
                 print(
-                    f"[tokenize] split={split_name} processed={idx}/{len(rows)} "
-                    f"ok={len(tok_lines)} invalid={invalid_count}"
+                    f"[tokenize] split={split_name} processed={row_idx}/{len(rows)} "
+                    f"ok={len(tok_lines)} invalid={invalid_count} aug={augmented_rows}"
                 )
 
         out_path = output_dir / f"{split_name}.tok"
@@ -324,6 +392,10 @@ def process(
         split_stats[split_name] = {
             "input_rows": len(rows),
             "written_rows": len(tok_lines),
+            "augmented_rows": augmented_rows,
+            "skipped_transpose_rows": skipped_transpose_rows,
+            "applied_transpose_counts": applied_transpose_counts,
+            "skipped_transpose_counts": skipped_transpose_counts,
             "invalid_rows": invalid_count,
             "oov_count": oov_count,
             "length_stats": summarize_lengths(lengths),
@@ -333,6 +405,9 @@ def process(
         total_oov += oov_count
         total_invalid += invalid_count
         total_samples += len(rows)
+        total_written_rows += len(tok_lines)
+        total_augmented_rows += augmented_rows
+        total_transpose_skips += skipped_transpose_rows
 
     stats = {
         "tokenizer_config": asdict(config),
@@ -340,6 +415,9 @@ def process(
         "oov_count": total_oov,
         "invalid_rows": total_invalid,
         "total_rows": total_samples,
+        "total_written_rows": total_written_rows,
+        "total_augmented_rows": total_augmented_rows,
+        "total_transpose_skips": total_transpose_skips,
         "invalid_ratio": (0.0 if total_samples == 0 else total_invalid / total_samples),
         "split_stats": split_stats,
         "parse_errors_head": parse_errors[:200],
@@ -355,6 +433,7 @@ def process(
     dump_json_file(stats_path, stats)
     print(
         f"[tokenize] done vocab={len(vocab)} rows={total_samples} "
+        f"written={total_written_rows} aug={total_augmented_rows} "
         f"invalid={total_invalid} oov={total_oov}"
     )
     print(f"[tokenize] vocab -> {vocab_path}")
