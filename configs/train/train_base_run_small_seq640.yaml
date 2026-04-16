@@ -1,5 +1,4 @@
 train:
-  # 模型与数据路径
   model_config: configs/train/model_base.yaml
   train_idx: data/tokenized/train.idx.json
   train_bin: null
@@ -7,34 +6,30 @@ train:
   valid_bin: null
   resume_from: null
 
-  # 运行环境
   device: auto
   precision: auto
   seed: 42
 
-  # 优化配置
-  # small 档位：明显大于冒烟规模，但仍适合快速观察训练趋势和早期评估反馈。
+  # 640 token exploratory run for checking whether longer local context
+  # helps phrase-level completion without immediately jumping to 768.
   steps: 5000
-  batch_size: 2
-  grad_accum_steps: 4
-  seq_len: 512
+  batch_size: 1
+  grad_accum_steps: 8
+  seq_len: 640
   lr: 0.00015
   weight_decay: 0.01
   grad_clip: 1.0
-  # NEXT + FIM 混合训练：续写为主任务，FIM 为辅助任务。
   fim_ratio: 0.35
-  fim_min_span: 16
-  fim_max_span: 128
+  fim_min_span: 20
+  fim_max_span: 160
   bos_sample_ratio: 0.05
   eos_sample_ratio: 0.45
   fim_eos_ratio: 1.0
 
-  # 学习率调度
   scheduler: cosine
   warmup_steps: 200
   min_lr_scale: 0.1
 
-  # 日志 / 评估 / 保存
   log_every: 50
   eval_every: 250
   eval_batches: 10
@@ -42,6 +37,5 @@ train:
   save_best: true
   no_restore_rng: false
 
-  # 输出路径
-  output_dir: outputs/checkpoints/base_small
+  output_dir: outputs/checkpoints/base_small_seq640
   metrics_path: null

@@ -17,16 +17,16 @@ train:
   steps: 150000
   batch_size: 2
   grad_accum_steps: 4
-  seq_len: 256
-  lr: 0.0002
+  seq_len: 512
+  lr: 0.00015
   weight_decay: 0.01
   grad_clip: 1.0
   # NEXT + FIM 混合训练：续写为主任务，FIM 为辅助任务。
-  fim_ratio: 0.2
-  fim_min_span: 8
-  fim_max_span: 64
-  bos_sample_ratio: 0.1
-  eos_sample_ratio: 0.3
+  fim_ratio: 0.35
+  fim_min_span: 16
+  fim_max_span: 128
+  bos_sample_ratio: 0.05
+  eos_sample_ratio: 0.45
   fim_eos_ratio: 1.0
 
   # 学习率调度

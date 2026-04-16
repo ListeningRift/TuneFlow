@@ -28,7 +28,7 @@ model:
 
   initializer_range: 0.02
   rms_norm_eps: 0.000001
-  attention_dropout: 0.0
+  attention_dropout: 0.05
   use_cache: true
   tie_word_embeddings: false
 
