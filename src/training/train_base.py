@@ -14,6 +14,8 @@ from pathlib import Path
 
 from ..utils.torch_utils import count_parameters, lazy_import_torch, resolve_torch_device
 
+_TRAIN_LOSS_EMA_ALPHA = 0.1
+
 
 def _load_id_to_token(vocab_path: Path) -> list[str]:
     """从词表 JSON 读取 `id -> token` 映射。"""
@@ -688,7 +690,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("outputs/checkpoints/base/minimal_real_train"),
+        default=Path("outputs/checkpoints/minimal_real_train"),
         help="Directory for checkpoints and metrics.",
     )
     parser.add_argument(
@@ -782,6 +784,11 @@ def _append_metrics(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8", newline="\n") as file:
         file.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def _tokens_seen_for_step(step: int, *, effective_batch: int, seq_len: int) -> int:
+    """Derive the approximate number of training tokens consumed by a step."""
+    return max(0, int(step)) * max(1, int(effective_batch)) * max(1, int(seq_len))
 
 
 def _collect_rng_states(torch_mod) -> dict:
@@ -1048,6 +1055,7 @@ def main(argv: list[str] | None = None) -> None:
     run_start = time.perf_counter()
     interval_start = run_start
     interval_tokens = 0
+    train_loss_ema: float | None = None
 
     try:
         for step in range(start_step + 1, args.steps + 1):
@@ -1093,6 +1101,13 @@ def main(argv: list[str] | None = None) -> None:
                 step_fim_examples += int(fim_examples)
 
             step_loss /= args.grad_accum_steps
+            if train_loss_ema is None:
+                train_loss_ema = step_loss
+            else:
+                train_loss_ema = (
+                    (_TRAIN_LOSS_EMA_ALPHA * step_loss)
+                    + ((1.0 - _TRAIN_LOSS_EMA_ALPHA) * float(train_loss_ema))
+                )
 
             if scaler is not None:
                 # clip 前先 unscale，确保梯度范数语义正确。
@@ -1114,6 +1129,11 @@ def main(argv: list[str] | None = None) -> None:
             interval_tokens += args.batch_size * args.seq_len * args.grad_accum_steps
             step_total_examples = args.batch_size * args.grad_accum_steps
             step_fim_ratio = step_fim_examples / max(1, step_total_examples)
+            tokens_seen = _tokens_seen_for_step(
+                step,
+                effective_batch=effective_batch,
+                seq_len=args.seq_len,
+            )
 
             should_log = step == start_step + 1 or (args.log_every > 0 and step % args.log_every == 0)
             if should_log:
@@ -1138,6 +1158,8 @@ def main(argv: list[str] | None = None) -> None:
                         "tok_per_sec": toks_per_sec,
                         "fim_examples": step_fim_examples,
                         "fim_ratio_in_batch": step_fim_ratio,
+                        "tokens_seen": tokens_seen,
+                        "train_loss_ema": train_loss_ema,
                     },
                 )
                 interval_start = now
@@ -1163,6 +1185,12 @@ def main(argv: list[str] | None = None) -> None:
                     id_to_token=id_to_token,
                 )
                 print(f"[train_base] eval step={step} valid_loss={val_loss:.6f}")
+                best_valid_loss_so_far = min(best_valid_loss, val_loss)
+                overfit_gap = (
+                    (val_loss - float(train_loss_ema))
+                    if train_loss_ema is not None
+                    else float("nan")
+                )
                 _append_metrics(
                     metrics_path,
                     {
@@ -1170,6 +1198,10 @@ def main(argv: list[str] | None = None) -> None:
                         "time": time.time(),
                         "step": step,
                         "valid_loss": val_loss,
+                        "tokens_seen": tokens_seen,
+                        "train_loss_ema": train_loss_ema,
+                        "best_valid_loss_so_far": best_valid_loss_so_far,
+                        "overfit_gap": overfit_gap,
                     },
                 )
                 if args.save_best and val_loss < best_valid_loss:

@@ -87,91 +87,46 @@ python scripts/train/train_base_from_config.py --config configs/train/train_base
 python scripts/train/train_base_from_config.py --config configs/train/train_base_run_full.yaml
 ```
 
-3. 训练结束后，对该 run 下所有 checkpoint 做自动评估：
+当前内置 preset 的默认 run 名称分别是 `base_small` 和 `base_full`。
+配置文件名暂时仍保留为 `train_base_run_small.yaml` 和 `train_base_run_full.yaml`，只是默认输出目录与 run 名称已经精简。
+
+3. 训练结束后，使用统一 benchmark 入口做完整评估：
 ```bash
-python scripts/eval/eval_all.py --checkpoint-dir outputs/checkpoints/base/<run_id> --run-id <run_id>
+python scripts/eval/eval_all.py --preset small
+python scripts/eval/eval_all.py --preset full
 ```
-这条命令会自动顺序执行：
-- `eval_infilling.py`
-- `eval_continuation.py`
-- 默认走“快速模式”：抽样 checkpoint，并优先复用训练阶段 `metrics.jsonl` 中已有的 `valid_loss`
-- 如果要做全量精评，可显式指定：
+
+如果你使用的是自定义训练配置：
 ```bash
-python scripts/eval/eval_all.py --checkpoint-dir outputs/checkpoints/base/<run_id> --run-id <run_id> --checkpoint-policy all --valid-loss-source recompute
+python scripts/eval/eval_all.py --config configs/train/train_base_run_small.yaml
 ```
+
+如果只想单独优化某一个任务，也可以直接运行：
+```bash
+python scripts/eval/eval_infilling.py --preset small
+python scripts/eval/eval_continuation.py --preset small
+```
+
+这套评估会直接从训练配置里的 `output_dir` 读取 checkpoint 与 `metrics.jsonl`，不再需要手动传 `--checkpoint-dir`。
+完整 benchmark 会按顺序执行：
+- `fast benchmark` 扫全量 checkpoint
+- `formal benchmark` 复评前 3 名
+- 导出 best checkpoint、leaderboard 和样本摘要
 
 4. 开长训前或改动训练代码后，建议先跑一遍最小回归检查：
 ```bash
 python scripts/train/regression_check.py --device cpu --precision fp32 --seq-len 64 --batch-size 1
 ```
 
-评估报告默认写到：
-- 报告路径：`outputs/reports/eval_infilling/<run_id>.json`
-- 图表路径：`outputs/reports/eval_infilling/<run_id>.png`
-- 重点关注字段：`valid_loss`、`ppl`、`structural_validity_rate`、`fsm_structural_validity_rate`
-- 报告路径：`outputs/reports/eval_continuation/<run_id>.json`
-- 图表路径：`outputs/reports/eval_continuation/<run_id>.png`
-- 重点关注字段：`valid_loss`、`ppl`、`structural_validity_rate`、`fsm_structural_validity_rate`、`first_token_accuracy`、`fsm_first_token_accuracy`
+评估产物默认写到：
+- `outputs/benchmark/<run_id>/benchmark_report.json`
+- `outputs/benchmark/<run_id>/benchmark_summary.md`
+- `outputs/benchmark/<run_id>/benchmark_infilling_report.json`
+- `outputs/benchmark/<run_id>/benchmark_continuation_report.json`
+- `outputs/benchmark/<run_id>/samples/<checkpoint>/continuation.json`
+- `outputs/benchmark/<run_id>/samples/<checkpoint>/infilling.json`
 
-## 评估最小闭环（按 checkpoint）
-`eval_all.py` 是统一评估入口，会按顺序跑完 infilling 与 continuation 两类评估：
-```bash
-python scripts/eval/eval_all.py --checkpoint-dir outputs/checkpoints/base/<run_id> --run-id <run_id>
-```
-
-默认优化策略：
-- `--checkpoint-policy sampled`：只抽样一部分 `step_*.pt`，并保留 `best.pt`、`last.pt`、`latest.pt`
-- `--valid-loss-source metrics`：优先复用训练阶段 `metrics.jsonl` 中记录的 `valid_loss`
-
-如果需要完整重评所有 checkpoint，并重新计算 valid_loss：
-```bash
-python scripts/eval/eval_all.py --checkpoint-dir outputs/checkpoints/base/<run_id> --run-id <run_id> --checkpoint-policy all --valid-loss-source recompute
-```
-
-`eval_infilling.py` 会对 run 目录下每个 checkpoint 逐个评估，并同时输出“原始贪心解码”和“FSM 约束解码”两套结果：
-- `valid_loss`
-- `ppl`
-- `structural_validity_rate`
-- `fsm_structural_validity_rate`
-
-示例：
-```bash
-python scripts/eval/eval_infilling.py --checkpoint-dir outputs/checkpoints/base/<run_id> --run-id <run_id>
-```
-
-评估报告默认写入：
-- `outputs/reports/eval_infilling/<run_id>.json`
-- `outputs/reports/eval_infilling/<run_id>.png`
-
-`eval_continuation.py` 会对同一批 checkpoint 逐个评估续写能力，并同时输出“原始贪心解码”和“FSM 约束解码”两套结果：
-- `valid_loss`
-- `ppl`
-- `structural_validity_rate`
-- `fsm_structural_validity_rate`
-- `first_token_accuracy`
-- `fsm_first_token_accuracy`
-
-示例：
-```bash
-python scripts/eval/eval_continuation.py --checkpoint-dir outputs/checkpoints/base/<run_id> --run-id <run_id>
-```
-
-评估报告默认写入：
-- `outputs/reports/eval_continuation/<run_id>.json`
-- `outputs/reports/eval_continuation/<run_id>.png`
-
-## 自动回归检查
-一条命令覆盖 train + save + resume + eval 的最小链路：
-```bash
-python scripts/train/regression_check.py
-```
-
-该检查会自动执行：
-- 真实数据采样训练 1 步并保存 checkpoint
-- 从 `latest.pt` 恢复并继续到第 2 步
-- 运行 `eval_infilling.py`
-- 运行 `eval_continuation.py`
-- 校验 `outputs/reports/eval_infilling/<run_id>.json`、`outputs/reports/eval_continuation/<run_id>.json` 以及对应 `.png` 图表
+更详细的评估参数与使用方式见：[docs/eval_guide.md](./docs/eval_guide.md)
 
 ## 当前训练策略（NEXT + FIM）
 `train_base` 当前采用混合训练：

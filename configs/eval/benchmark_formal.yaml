@@ -1,0 +1,11 @@
+tier: formal
+seed: 42
+sample_count: null
+per_bucket_limit: null
+min_prefix_tokens: 32
+continuation_prefix_ratio_min: 0.35
+continuation_prefix_ratio_max: 0.70
+infilling_hole_ratio_min: 0.10
+infilling_hole_ratio_max: 0.25
+sample_export_case_count: 12
+sample_export_top_k: 3

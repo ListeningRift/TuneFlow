@@ -43,5 +43,5 @@ train:
   no_restore_rng: false
 
   # 输出路径
-  output_dir: outputs/checkpoints/base/train_base_run_small
+  output_dir: outputs/checkpoints/base_small
   metrics_path: null

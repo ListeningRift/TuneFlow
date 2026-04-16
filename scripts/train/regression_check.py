@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""一键回归冒烟检查：覆盖 train/eval/save/resume 最小链路。"""
+"""Smoke regression for train/save/resume/benchmark."""
 
 from __future__ import annotations
 
@@ -14,7 +14,6 @@ import yaml
 
 
 def _ensure_project_root() -> Path:
-    """确保仓库根目录在 `sys.path` 中。"""
     project_root = Path(__file__).resolve().parents[2]
     project_root_str = str(project_root)
     if project_root_str not in sys.path:
@@ -23,63 +22,62 @@ def _ensure_project_root() -> Path:
 
 
 def _parse_args() -> argparse.Namespace:
-    """解析命令行参数。"""
-    parser = argparse.ArgumentParser(description="执行 train/eval/save/resume 回归冒烟检查。")
+    parser = argparse.ArgumentParser(
+        description="Run a smoke regression across train/save/resume/benchmark."
+    )
     parser.add_argument(
         "--python-exec",
         type=str,
         default=sys.executable,
-        help="用于执行子进程命令的 Python 解释器路径。",
+        help="Python executable used for subprocess commands.",
     )
     parser.add_argument(
         "--run-id",
         type=str,
         default=None,
-        help="可选 run_id；默认是 regression_smoke_<timestamp>。",
+        help="Optional run id. Defaults to regression_smoke_<timestamp>.",
     )
     parser.add_argument(
         "--device",
         type=str,
         default="auto",
         choices=["auto", "cpu", "cuda"],
-        help="传给训练和评估脚本的设备参数。",
+        help="Device forwarded to training and benchmark scripts.",
     )
     parser.add_argument(
         "--precision",
         type=str,
         default="auto",
         choices=["auto", "fp32", "bf16", "fp16"],
-        help="传给训练和评估脚本的精度参数。",
+        help="Precision forwarded to training and benchmark scripts.",
     )
     parser.add_argument(
         "--seq-len",
         type=int,
         default=64,
-        help="冒烟测试使用的序列长度。",
+        help="Sequence length used by the smoke training run.",
     )
     parser.add_argument(
         "--batch-size",
         type=int,
         default=1,
-        help="冒烟测试使用的 batch size。",
+        help="Batch size used by the smoke training run.",
     )
     parser.add_argument(
         "--seed",
         type=int,
         default=42,
-        help="随机种子。",
+        help="Random seed for the smoke run.",
     )
     return parser.parse_args()
 
 
 def _run_cmd(cmd: list[str], cwd: Path) -> None:
-    """执行子命令并在失败时抛出异常。"""
     print("[regression_check] cmd:", " ".join(cmd), flush=True)
     subprocess.run(cmd, cwd=cwd, check=True)
 
 
 def _check_runtime_deps(python_exec: str, cwd: Path) -> None:
-    """检查目标 Python 环境是否安装 torch，避免跑到中途才失败。"""
     probe = subprocess.run(
         [python_exec, "-c", "import torch"],  # noqa: S603,S607
         cwd=cwd,
@@ -98,14 +96,12 @@ def _check_runtime_deps(python_exec: str, cwd: Path) -> None:
         )
 
 
-def _write_train_cfg(path: Path, payload: dict) -> None:
-    """把阶段性训练配置写入临时 YAML 文件。"""
+def _write_yaml(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(yaml.safe_dump(payload, sort_keys=False, allow_unicode=False), encoding="utf-8")
 
 
 def _assert_exists(path: Path, msg: str) -> None:
-    """断言文件存在。"""
     if not path.exists():
         raise FileNotFoundError(f"{msg}: {path}")
 
@@ -120,7 +116,6 @@ def _build_train_payload(
     steps: int,
     resume_from: Path | None,
 ) -> dict:
-    """构建 train_base_from_config 需要的 YAML 载荷。"""
     return {
         "train": {
             "model_config": "configs/train/model_base.yaml",
@@ -139,7 +134,6 @@ def _build_train_payload(
             "lr": 0.0003,
             "weight_decay": 0.01,
             "grad_clip": 1.0,
-            # 回归测试中固定启用 FIM，确保该分支被覆盖到。
             "fim_ratio": 1.0,
             "fim_min_span": 4,
             "fim_max_span": 16,
@@ -158,25 +152,39 @@ def _build_train_payload(
     }
 
 
+def _build_benchmark_payload(
+    *,
+    tier: str,
+    sample_count: int,
+    per_bucket_limit: int,
+    sample_export_case_count: int,
+    sample_export_top_k: int,
+) -> dict:
+    return {
+        "tier": tier,
+        "seed": 42,
+        "sample_count": sample_count,
+        "per_bucket_limit": per_bucket_limit,
+        "min_prefix_tokens": 32,
+        "continuation_prefix_ratio_min": 0.35,
+        "continuation_prefix_ratio_max": 0.70,
+        "infilling_hole_ratio_min": 0.10,
+        "infilling_hole_ratio_max": 0.25,
+        "sample_export_case_count": sample_export_case_count,
+        "sample_export_top_k": sample_export_top_k,
+    }
+
+
 def main() -> None:
-    """
-    回归检查主流程：
-    1) 训练 1 步并保存 checkpoint。
-    2) 从 latest.pt 恢复训练到第 2 步。
-    3) 对该 run 的所有 checkpoint 执行 eval_infilling 与 eval_continuation。
-    4) 校验评估报告包含关键指标字段。
-    """
     args = _parse_args()
     project_root = _ensure_project_root()
 
     run_id = args.run_id or f"regression_smoke_{time.strftime('%Y%m%d_%H%M%S')}"
-    output_dir = (project_root / "outputs" / "checkpoints" / "base" / run_id).resolve()
-    infilling_report_path = (project_root / "outputs" / "reports" / "eval_infilling" / f"{run_id}.json").resolve()
-    infilling_plot_path = infilling_report_path.with_suffix(".png")
-    continuation_report_path = (
-        project_root / "outputs" / "reports" / "eval_continuation" / f"{run_id}.json"
-    ).resolve()
-    continuation_plot_path = continuation_report_path.with_suffix(".png")
+    output_dir = (project_root / "outputs" / "checkpoints" / run_id).resolve()
+    benchmark_root = (project_root / "outputs" / "benchmark" / run_id).resolve()
+    benchmark_report_path = benchmark_root / "benchmark_report.json"
+    benchmark_summary_path = benchmark_root / "benchmark_summary.md"
+
     _check_runtime_deps(args.python_exec, project_root)
 
     required = [
@@ -184,16 +192,17 @@ def main() -> None:
         project_root / "data" / "tokenized" / "valid.idx.json",
         project_root / "data" / "tokenized" / "eval.tok",
         project_root / "data" / "tokenized" / "tokenizer_vocab.json",
+        project_root / "data" / "eval" / "fixed_eval.jsonl",
     ]
-    for p in required:
-        # 提前校验关键输入，避免进入训练后才报路径错误。
-        _assert_exists(p, "required input not found")
+    for path in required:
+        _assert_exists(path, "required input not found")
 
     cfg_dir = project_root / "outputs" / "tmp" / "regression_check" / run_id
     cfg_phase1 = cfg_dir / "train_phase1.yaml"
     cfg_phase2 = cfg_dir / "train_phase2_resume.yaml"
+    fast_benchmark_cfg = cfg_dir / "benchmark_fast_smoke.yaml"
+    formal_benchmark_cfg = cfg_dir / "benchmark_formal_smoke.yaml"
 
-    # 阶段 1：训练到 1 步，强制执行评估与保存，验证“训练+保存”链路。
     payload1 = _build_train_payload(
         output_dir=output_dir,
         device=args.device,
@@ -204,7 +213,7 @@ def main() -> None:
         steps=1,
         resume_from=None,
     )
-    _write_train_cfg(cfg_phase1, payload1)
+    _write_yaml(cfg_phase1, payload1)
     _run_cmd(
         [
             args.python_exec,
@@ -220,7 +229,6 @@ def main() -> None:
     _assert_exists(latest_pt, "phase1 latest checkpoint missing")
     _assert_exists(step1_pt, "phase1 step_1 checkpoint missing")
 
-    # 阶段 2：从 latest.pt 恢复，训练到第 2 步，验证“恢复+继续训练”链路。
     payload2 = _build_train_payload(
         output_dir=output_dir,
         device=args.device,
@@ -231,7 +239,7 @@ def main() -> None:
         steps=2,
         resume_from=latest_pt,
     )
-    _write_train_cfg(cfg_phase2, payload2)
+    _write_yaml(cfg_phase2, payload2)
     _run_cmd(
         [
             args.python_exec,
@@ -249,92 +257,90 @@ def main() -> None:
     _assert_exists(last_pt, "phase2 last checkpoint missing")
     _assert_exists(metrics_jsonl, "training metrics.jsonl missing")
 
-    # 阶段 3：对当前 run 的全部 checkpoint 执行评估，验证“checkpoint->评估->报告”链路。
+    _write_yaml(
+        fast_benchmark_cfg,
+        _build_benchmark_payload(
+            tier="fast",
+            sample_count=8,
+            per_bucket_limit=2,
+            sample_export_case_count=4,
+            sample_export_top_k=1,
+        ),
+    )
+    _write_yaml(
+        formal_benchmark_cfg,
+        _build_benchmark_payload(
+            tier="formal",
+            sample_count=8,
+            per_bucket_limit=2,
+            sample_export_case_count=4,
+            sample_export_top_k=1,
+        ),
+    )
+
     _run_cmd(
         [
             args.python_exec,
-            "scripts/eval/eval_infilling.py",
-            "--checkpoint-dir",
-            str(output_dir),
-            "--run-id",
-            run_id,
+            "scripts/eval/eval_all.py",
+            "--config",
+            str(cfg_phase2),
             "--device",
             args.device,
             "--precision",
             args.precision,
-            "--seq-len",
-            str(args.seq_len),
-            "--batch-size",
-            str(args.batch_size),
-            "--eval-batches",
+            "--limit-checkpoints",
             "1",
-            "--num-infilling-samples",
-            "2",
+            "--checkpoint-policy",
+            "sampled",
+            "--sample-count",
+            "1",
             "--max-new-tokens",
             "32",
-        ],
-        cwd=project_root,
-    )
-    _run_cmd(
-        [
-            args.python_exec,
-            "scripts/eval/eval_continuation.py",
-            "--checkpoint-dir",
-            str(output_dir),
-            "--run-id",
-            run_id,
-            "--device",
-            args.device,
-            "--precision",
-            args.precision,
-            "--seq-len",
-            str(args.seq_len),
-            "--batch-size",
-            str(args.batch_size),
-            "--eval-batches",
-            "1",
-            "--num-continuation-samples",
-            "2",
-            "--max-new-tokens",
-            "32",
+            "--fast-config",
+            str(fast_benchmark_cfg),
+            "--formal-config",
+            str(formal_benchmark_cfg),
         ],
         cwd=project_root,
     )
 
-    _assert_exists(infilling_report_path, "infilling eval report missing")
-    infilling_report = json.loads(infilling_report_path.read_text(encoding="utf-8"))
-    infilling_results = infilling_report.get("results")
-    if not isinstance(infilling_results, list) or not infilling_results:
-        raise ValueError(f"infilling eval report has empty results: {infilling_report_path}")
+    _assert_exists(benchmark_report_path, "benchmark report missing")
+    _assert_exists(benchmark_summary_path, "benchmark summary missing")
 
-    infilling_required_keys = {"valid_loss", "ppl", "structural_validity_rate"}
-    infilling_missing = [k for k in infilling_required_keys if k not in infilling_results[0]]
-    if infilling_missing:
+    benchmark_report = json.loads(benchmark_report_path.read_text(encoding="utf-8"))
+    final_selection = benchmark_report.get("final_selection", {})
+    leaderboard = final_selection.get("leaderboard")
+    if not isinstance(leaderboard, list) or not leaderboard:
+        raise ValueError(f"benchmark leaderboard is empty: {benchmark_report_path}")
+
+    benchmark_required_keys = {
+        "continuation_stop_success_rate",
+        "continuation_time_order_validity_rate",
+        "infilling_structural_validity_rate",
+        "valid_loss_from_training",
+    }
+    missing = [key for key in benchmark_required_keys if key not in leaderboard[0]]
+    if missing:
         raise ValueError(
-            f"infilling eval result missing keys {infilling_missing}: {infilling_report_path}"
+            f"benchmark leaderboard missing keys {missing}: {benchmark_report_path}"
         )
-    _assert_exists(infilling_plot_path, "infilling eval plot missing")
 
-    _assert_exists(continuation_report_path, "continuation eval report missing")
-    continuation_report = json.loads(continuation_report_path.read_text(encoding="utf-8"))
-    continuation_results = continuation_report.get("results")
-    if not isinstance(continuation_results, list) or not continuation_results:
-        raise ValueError(f"continuation eval report has empty results: {continuation_report_path}")
+    sample_artifacts = benchmark_report.get("sample_artifacts")
+    if not isinstance(sample_artifacts, dict) or not sample_artifacts:
+        raise ValueError(f"benchmark sample artifacts missing: {benchmark_report_path}")
 
-    continuation_required_keys = {"valid_loss", "ppl", "structural_validity_rate", "first_token_accuracy"}
-    continuation_missing = [k for k in continuation_required_keys if k not in continuation_results[0]]
-    if continuation_missing:
-        raise ValueError(
-            f"continuation eval result missing keys {continuation_missing}: {continuation_report_path}"
-        )
-    _assert_exists(continuation_plot_path, "continuation eval plot missing")
+    for checkpoint_name, artifact_paths in sample_artifacts.items():
+        continuation_path = artifact_paths.get("continuation")
+        infilling_path = artifact_paths.get("infilling")
+        if not continuation_path or not infilling_path:
+            raise ValueError(f"sample artifact paths incomplete for {checkpoint_name}: {benchmark_report_path}")
+        _assert_exists(Path(continuation_path), "continuation sample artifact missing")
+        _assert_exists(Path(infilling_path), "infilling sample artifact missing")
 
     print(f"[regression_check] PASS run_id={run_id}", flush=True)
     print(f"[regression_check] checkpoints={output_dir}", flush=True)
-    print(f"[regression_check] infilling_eval_report={infilling_report_path}", flush=True)
-    print(f"[regression_check] infilling_eval_plot={infilling_plot_path}", flush=True)
-    print(f"[regression_check] continuation_eval_report={continuation_report_path}", flush=True)
-    print(f"[regression_check] continuation_eval_plot={continuation_plot_path}", flush=True)
+    print(f"[regression_check] benchmark_report={benchmark_report_path}", flush=True)
+    print(f"[regression_check] benchmark_summary={benchmark_summary_path}", flush=True)
 
 
 if __name__ == "__main__":

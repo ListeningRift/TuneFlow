@@ -1,58 +1,95 @@
-# 训练策略说明：NEXT + FIM 混合训练
+# 训练策略说明：NEXT + FIM
 
 ## 背景
-- 项目主场景是 Copilot 式续写（`prefix -> continuation`）。
-- 同时需要支持中间编辑（Infilling）。
 
-因此，当前 `train_base` 采用：
-- `NEXT` 作为主训练目标（保证续写能力）
-- `FIM` 作为辅助训练目标（补充中间编辑能力）
+TuneFlow 当前采用混合训练：
 
-## 代码实现
-- [src/training/train_base.py](/d:/Project/TuneFlow/src/training/train_base.py)
-  - `TokenBinDataset.sample_mixed_batch(...)`：混合采样入口
-  - `TokenBinDataset._build_fim_example(...)`：构造 FIM 样本
-  - 训练循环使用 `sample_mixed_batch(...)`
-  - metrics 增加：
-    - `fim_examples`
-    - `fim_ratio_in_batch`
+- `NEXT`：保留前缀续写能力
+- `FIM`：增强中间补全能力
+
+因此 `train_base` 会在训练中混合采样普通 continuation 样本和 FIM 样本。
+
+## 关键实现
+
+- [train_base.py](/d:/Project/TuneFlow/src/training/train_base.py)
+- [train_base_from_config.py](/d:/Project/TuneFlow/scripts/train/train_base_from_config.py)
+
+训练期会持续写入：
+
+- `loss`
+- `valid_loss`
+- `fim_ratio_in_batch`
+- `tokens_seen`
+- `train_loss_ema`
+- `best_valid_loss_so_far`
+- `overfit_gap`
+
+这些指标会被 benchmark 直接读取，不再在评估阶段重算 `valid_loss`。
 
 ## 关键参数
-在 `train_base` 中新增参数：
-- `--fim-ratio`：每个 batch 中 FIM 样本比例，范围 `[0, 1]`
-- `--fim-min-span`：FIM 挖洞最小长度（token）
-- `--fim-max-span`：FIM 挖洞最大长度（token）
 
-默认值写在：
+训练配置中重点关注：
+
+- `fim_ratio`
+- `fim_min_span`
+- `fim_max_span`
+- `eval_every`
+- `save_every`
+- `output_dir`
+
+默认训练配置：
+
 - `configs/train/train_base_run_small.yaml`
 - `configs/train/train_base_run_full.yaml`
 
-## 训练入口（配置化）
+## 训练命令
+
 ```bash
 python scripts/train/train_base_from_config.py --preset small
 python scripts/train/train_base_from_config.py --preset full
 ```
 
-## 回归链路同步
-- [scripts/train/regression_check.py](/d:/Project/TuneFlow/scripts/train/regression_check.py) 中固定开启 `fim_ratio=1.0`
-- 目的是在冒烟回归中强制覆盖 FIM 分支，避免后续改动导致分支失效
+或：
+
+```bash
+python scripts/train/train_base_from_config.py --config configs/train/train_base_run_small.yaml
+python scripts/train/train_base_from_config.py --config configs/train/train_base_run_full.yaml
+```
 
 ## 评估闭环
-- [scripts/eval/eval_all.py](/d:/Project/TuneFlow/scripts/eval/eval_all.py)：统一评估入口，一条命令顺序执行 infilling 与 continuation 两类评估
-- [scripts/eval/eval_infilling.py](/d:/Project/TuneFlow/scripts/eval/eval_infilling.py)：评估中间编辑能力，同时输出原始解码与 FSM 约束解码两套结果，重点字段包括 `valid_loss`、`ppl`、`structural_validity_rate`、`fsm_structural_validity_rate`
-- [scripts/eval/eval_continuation.py](/d:/Project/TuneFlow/scripts/eval/eval_continuation.py)：评估 NEXT 主任务对应的续写能力，同时输出原始解码与 FSM 约束解码两套结果，重点字段包括 `valid_loss`、`ppl`、`structural_validity_rate`、`fsm_structural_validity_rate`、`first_token_accuracy`、`fsm_first_token_accuracy`
-- [scripts/train/regression_check.py](/d:/Project/TuneFlow/scripts/train/regression_check.py) 会在最小链路中同时跑这两个评估脚本
 
-统一入口示例：
+训练完成后，可以按需求选择 benchmark 入口：
+
 ```bash
-python scripts/eval/eval_all.py --checkpoint-dir outputs/checkpoints/base/<run_id> --run-id <run_id>
+python scripts/eval/eval_all.py --preset small
+python scripts/eval/eval_infilling.py --preset small
+python scripts/eval/eval_continuation.py --preset small
 ```
 
-默认优化策略：
-- 只抽样部分 `step_*.pt` 做结构评估，同时保留 `best.pt`、`last.pt`、`latest.pt`
-- `valid_loss` 默认优先复用训练期 `metrics.jsonl`，避免每个 checkpoint 重新扫验证集
+如果训练使用自定义 YAML：
 
-如需全量精评，可切换为：
 ```bash
-python scripts/eval/eval_all.py --checkpoint-dir outputs/checkpoints/base/<run_id> --run-id <run_id> --checkpoint-policy all --valid-loss-source recompute
+python scripts/eval/eval_all.py --config configs/train/train_base_run_small.yaml
+python scripts/eval/eval_infilling.py --config configs/train/train_base_run_small.yaml
+python scripts/eval/eval_continuation.py --config configs/train/train_base_run_small.yaml
 ```
+
+三个入口都会自动从训练配置里的 `output_dir` 读取 checkpoint，不再需要手动指定 checkpoint 目录。
+当前内置 preset 默认对应的 run 名称分别是 `base_small` 和 `base_full`。
+配置文件名暂时仍保留为 `train_base_run_small.yaml` 和 `train_base_run_full.yaml`，只是默认输出目录与 run 名称已经精简。
+
+## 回归检查
+
+回归脚本会固定开启 `fim_ratio=1.0`，确保 FIM 分支被覆盖：
+
+```bash
+python scripts/train/regression_check.py --device cpu --precision fp32 --seq-len 64 --batch-size 1
+```
+
+它会验证：
+
+1. 训练
+2. 保存 checkpoint
+3. 从 `latest.pt` 恢复
+4. 跑缩小版 benchmark
+5. 校验 benchmark 报告与样本导出

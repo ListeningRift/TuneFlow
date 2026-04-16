@@ -214,7 +214,7 @@ TASK_GEN BOS [STYLE_x] [TEMPO_x] <FULL_SEQUENCE_TO_EOS> EOS
   - `train.bin/.idx`（阶段1用于 NEXT + FIM 混合采样）
   - `configs/train/train_base_run_small.yaml` / `configs/train/train_base_run_full.yaml`
 - 输出：
-  - `outputs/checkpoints/base/<run_id>/`
+  - `outputs/checkpoints/<run_id>/`
   - `outputs/metrics/base/<run_id>.json`
 - 验收标准：
   - 训练过程无 NaN/Inf
