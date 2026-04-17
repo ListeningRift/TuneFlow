@@ -17,6 +17,8 @@ from pathlib import Path
 from statistics import median
 from typing import Dict, List, Optional, Sequence, Tuple
 
+from src.utils.output_cleanup import ensure_clean_directory, remove_file_if_exists
+
 try:
     import mido
 except ImportError as exc:
@@ -572,7 +574,9 @@ def process(
     if limit is not None:
         files = files[:limit]
 
-    output_dir.mkdir(parents=True, exist_ok=True)
+    ensure_clean_directory(output_dir)
+    if report_path.parent.resolve() != output_dir.resolve():
+        remove_file_if_exists(report_path)
 
     dedup_seen: Dict[str, str] = {}
     dropped_by_reason: Counter[str] = Counter()

@@ -17,6 +17,7 @@ except ImportError as exc:
     ) from exc
 
 from ..utils.config_io import dump_json_file, load_yaml_mapping
+from ..utils.output_cleanup import ensure_clean_directory, remove_file_if_exists
 from .common import (
     NoteEvent,
     collect_note_events,
@@ -306,6 +307,12 @@ def process(
     limit_per_split: Optional[int],
 ) -> None:
     """执行 tokenization 主流程。"""
+    ensure_clean_directory(output_dir)
+    if vocab_path.parent.resolve() != output_dir.resolve():
+        remove_file_if_exists(vocab_path)
+    if stats_path.parent.resolve() != output_dir.resolve():
+        remove_file_if_exists(stats_path)
+
     midi_root = Path(config.midi_root_dir)
     vocab = build_vocab(config)
     id_to_token = [None] * len(vocab)

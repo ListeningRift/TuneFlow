@@ -20,6 +20,7 @@ from .benchmark_decode import (
 )
 from .checkpoint_selection import score_checkpoint_results
 from .config_io import dump_json_file, load_json_file, load_yaml_mapping
+from .output_cleanup import clear_directory_contents, ensure_clean_directory, remove_file_if_exists, remove_matching_children
 from .training_metrics import load_training_metrics, resolve_metrics_path, training_metrics_for_step
 from .torch_utils import count_parameters, lazy_import_torch, resolve_torch_device
 
@@ -42,6 +43,10 @@ __all__ = [
     "load_yaml_mapping",
     "load_json_file",
     "dump_json_file",
+    "clear_directory_contents",
+    "ensure_clean_directory",
+    "remove_file_if_exists",
+    "remove_matching_children",
     "load_training_metrics",
     "resolve_metrics_path",
     "training_metrics_for_step",

@@ -10,6 +10,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
+from src.utils.output_cleanup import remove_file_if_exists, remove_matching_children
+
 try:
     import yaml
 except ImportError as exc:
@@ -151,6 +153,10 @@ def dump_json(path: Path, payload: Dict[str, object]) -> None:
 def process(config: BuildConfig, report_path: Path) -> None:
     """执行训练数据打包流程。"""
     tokenized_dir = Path(config.tokenized_dir)
+    tokenized_dir.mkdir(parents=True, exist_ok=True)
+    remove_matching_children(tokenized_dir, ["*.bin", "*.idx.json"])
+    if report_path.parent.resolve() != tokenized_dir.resolve():
+        remove_file_if_exists(report_path)
     vocab = load_vocab(Path(config.vocab_path))
     type_code, dtype_name = choose_array_type(config.dtype, len(vocab))
 

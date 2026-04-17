@@ -12,6 +12,7 @@ import time
 from contextlib import nullcontext
 from pathlib import Path
 
+from ..utils.output_cleanup import ensure_clean_directory, remove_file_if_exists
 from ..utils.torch_utils import count_parameters, lazy_import_torch, resolve_torch_device
 
 _TRAIN_LOSS_EMA_ALPHA = 0.1
@@ -784,8 +785,6 @@ def _append_metrics(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8", newline="\n") as file:
         file.write(json.dumps(payload, ensure_ascii=False) + "\n")
-
-
 def _tokens_seen_for_step(step: int, *, effective_batch: int, seq_len: int) -> int:
     """Derive the approximate number of training tokens consumed by a step."""
     return max(0, int(step)) * max(1, int(effective_batch)) * max(1, int(seq_len))
@@ -1020,7 +1019,12 @@ def main(argv: list[str] | None = None) -> None:
             f"{valid_dataset.num_tokens} tokens)"
         )
 
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    if args.resume_from is None:
+        ensure_clean_directory(args.output_dir)
+        if args.metrics_path is not None:
+            remove_file_if_exists(args.metrics_path)
+    else:
+        args.output_dir.mkdir(parents=True, exist_ok=True)
     # 默认把指标写到 output_dir/metrics.jsonl。
     metrics_path = args.metrics_path if args.metrics_path is not None else (args.output_dir / "metrics.jsonl")
     _append_metrics(

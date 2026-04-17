@@ -222,7 +222,6 @@ def main() -> None:
     from src.training.train_base import build_arg_parser, main as train_base_main
 
     train_mapping = _resolve_steps_alias(_load_train_mapping(config_path), project_root)
-    _warn_if_output_dir_is_dirty(train_mapping, project_root)
     # 基于 train_base 的真实 parser 做映射，保证参数名称与行为始终一致。
     train_argv = _to_train_argv(train_mapping, build_arg_parser())
 

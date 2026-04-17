@@ -94,6 +94,41 @@ def _artifact_file_names(task_scope: str) -> tuple[str, str]:
     return f"{label}_fast_manifest.json", f"{label}_formal_manifest.json"
 
 
+def _clean_benchmark_outputs(benchmark_root: Path, task_scope: str) -> None:
+    """Remove stale artifacts for the current benchmark task before regenerating them."""
+    benchmark_root.mkdir(parents=True, exist_ok=True)
+    fast_manifest_name, formal_manifest_name = _artifact_file_names(task_scope)
+    artifact_paths = [
+        benchmark_root / _TASK_REPORT_NAMES[task_scope],
+        benchmark_root / _TASK_SUMMARY_NAMES[task_scope],
+        benchmark_root / fast_manifest_name,
+        benchmark_root / formal_manifest_name,
+        benchmark_root / f"{_TASK_LABELS[task_scope]}_core_metrics.png",
+        benchmark_root / f"{_TASK_LABELS[task_scope]}_diagnostics.png",
+        benchmark_root / f"{_TASK_LABELS[task_scope]}_training_health.png",
+    ]
+    for artifact_path in artifact_paths:
+        if artifact_path.exists():
+            artifact_path.unlink()
+
+    samples_root = benchmark_root / "samples"
+    if not samples_root.exists():
+        return
+
+    task_sample_names = [f"{task_name}.json" for task_name in _task_names_for_scope(task_scope)]
+    for checkpoint_dir in samples_root.iterdir():
+        if not checkpoint_dir.is_dir():
+            continue
+        for sample_name in task_sample_names:
+            sample_path = checkpoint_dir / sample_name
+            if sample_path.exists():
+                sample_path.unlink()
+        if not any(checkpoint_dir.iterdir()):
+            checkpoint_dir.rmdir()
+    if not any(samples_root.iterdir()):
+        samples_root.rmdir()
+
+
 def _parse_args(*, task_scope: str, argv: list[str] | None = None) -> argparse.Namespace:
     # 三个评估入口共用这一套参数，避免 all/continuation/infilling 的行为不一致。
     parser = argparse.ArgumentParser(
@@ -1271,7 +1306,7 @@ def main(*, task_scope: str = "all", argv: list[str] | None = None) -> None:
     benchmark_root = project_root / "outputs" / "benchmark" / run_id
     report_path = benchmark_root / _TASK_REPORT_NAMES[task_scope]
     summary_path = benchmark_root / _TASK_SUMMARY_NAMES[task_scope]
-    benchmark_root.mkdir(parents=True, exist_ok=True)
+    _clean_benchmark_outputs(benchmark_root, task_scope)
 
     from src.decoding import TuneFlowGrammarFSM
     from src.model.configuration import DecoderConfig

@@ -126,6 +126,20 @@ python scripts/train/regression_check.py --device cpu --precision fp32 --seq-len
 - `outputs/benchmark/<run_id>/samples/<checkpoint>/continuation.json`
 - `outputs/benchmark/<run_id>/samples/<checkpoint>/infilling.json`
 
+如果当前结果值得长期保留，可在下次训练/评估前先归档一份快照：
+## 归档命令
+
+```bash
+python scripts/tools/archive_run_artifacts.py --preset small
+python scripts/tools/archive_run_artifacts.py --config configs/train/train_base_run_small.yaml --tag baseline_v1
+python scripts/tools/archive_run_artifacts.py --preset small --dry-run
+```
+
+归档脚本会默认：
+- 优先读取 benchmark 报告里的 `recommended_checkpoint`
+- 复制该 checkpoint、`metrics.jsonl`、训练配置，以及整个 `outputs/benchmark/<run_id>/`
+- 写入 `outputs/archive/<run_id>/<run_id>__<checkpoint>__YYYYMMDD_HHMMSS[__tag]/`
+
 更详细的评估参数与使用方式见：[docs/eval_guide.md](./docs/eval_guide.md)
 
 ## 当前训练策略（NEXT + FIM）

@@ -13,6 +13,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
+from src.utils.output_cleanup import ensure_clean_directory, remove_file_if_exists
+
 try:
     import mido
 except ImportError as exc:
@@ -369,6 +371,12 @@ def process(
 
     eval_indices = choose_fixed_eval_indices(assign["test"], config)
     eval_records = [records[i] for i in eval_indices]
+
+    ensure_clean_directory(output_base_dir)
+    if output_eval_path.parent.resolve() != output_base_dir.resolve():
+        remove_file_if_exists(output_eval_path)
+    if report_path.parent.resolve() != output_base_dir.resolve():
+        remove_file_if_exists(report_path)
 
     train_path = output_base_dir / "train.jsonl"
     valid_path = output_base_dir / "valid.jsonl"
