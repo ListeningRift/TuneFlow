@@ -329,7 +329,11 @@ def main() -> None:
     if not isinstance(sample_artifacts, dict) or not sample_artifacts:
         raise ValueError(f"benchmark sample artifacts missing: {benchmark_report_path}")
 
-    for checkpoint_name, artifact_paths in sample_artifacts.items():
+    final_top3_artifacts = sample_artifacts.get("final_top3")
+    if not isinstance(final_top3_artifacts, dict) or not final_top3_artifacts:
+        raise ValueError(f"final_top3 sample artifacts missing: {benchmark_report_path}")
+
+    for checkpoint_name, artifact_paths in final_top3_artifacts.items():
         continuation_path = artifact_paths.get("continuation")
         infilling_path = artifact_paths.get("infilling")
         if not continuation_path or not infilling_path:

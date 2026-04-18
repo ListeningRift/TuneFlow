@@ -128,6 +128,31 @@ def should_force_safe_boundary_stop(*, generated_len: int, max_can_generate: int
     return generated_len >= max(8, min(24, max_can_generate // 4))
 
 
+def _forward_decode_step(
+    *,
+    model,
+    torch_mod,
+    input_ids,
+    past_key_values,
+    device,
+    use_amp: bool,
+    amp_dtype,
+    autocast_context_fn,
+):
+    with autocast_context_fn(
+        torch_mod=torch_mod,
+        use_amp=use_amp,
+        device_type=device.type,
+        amp_dtype=amp_dtype,
+    ):
+        return model(
+            input_ids=input_ids,
+            past_key_values=past_key_values,
+            use_cache=True,
+            return_dict=True,
+        )
+
+
 def generate_continuation_tokens(
     *,
     model,
@@ -165,6 +190,7 @@ def generate_continuation_tokens(
     input_ids = torch_mod.tensor([prompt_ids], dtype=torch_mod.long, device=device)
     generated_tokens: list[str] = []
     reached_eos = False
+    past_key_values = None
     stats: dict[str, float | int] = {
         "step_count": 0,
         "illegal_top1_count": 0,
@@ -206,13 +232,17 @@ def generate_continuation_tokens(
                 stats["safe_boundary_stop_count"] = int(stats["safe_boundary_stop_count"]) + 1
                 break
 
-            with autocast_context_fn(
+            outputs = _forward_decode_step(
+                model=model,
                 torch_mod=torch_mod,
+                input_ids=input_ids,
+                past_key_values=past_key_values,
+                device=device,
                 use_amp=use_amp,
-                device_type=device.type,
                 amp_dtype=amp_dtype,
-            ):
-                outputs = model(input_ids=input_ids, return_dict=True)
+                autocast_context_fn=autocast_context_fn,
+            )
+            past_key_values = outputs.past_key_values
             step_logits = outputs.logits[0, -1, :]
             if grammar_fsm is None:
                 next_id = int(torch_mod.argmax(step_logits, dim=-1).item())
@@ -260,8 +290,8 @@ def generate_continuation_tokens(
             generated_tokens.append(next_token)
 
             next_ids = torch_mod.tensor([[next_id]], dtype=torch_mod.long, device=device)
-            input_ids = torch_mod.cat([input_ids, next_ids], dim=1)
-            if int(input_ids.shape[1]) >= max_positions:
+            input_ids = next_ids if past_key_values is not None else torch_mod.cat([input_ids, next_ids], dim=1)
+            if (len(prompt_ids) + len(generated_tokens)) >= max_positions:
                 stopped_without_eos = True
                 break
         else:
@@ -372,6 +402,7 @@ def generate_middle_tokens(
     input_ids = torch_mod.tensor([prompt_ids], dtype=torch_mod.long, device=device)
     middle_tokens: list[str] = []
     reached_eos = False
+    past_key_values = None
     stats: dict[str, float | int] = {
         "step_count": 0,
         "illegal_top1_count": 0,
@@ -395,13 +426,17 @@ def generate_middle_tokens(
 
     with torch_mod.no_grad():
         for _ in range(max_can_generate):
-            with autocast_context_fn(
+            outputs = _forward_decode_step(
+                model=model,
                 torch_mod=torch_mod,
+                input_ids=input_ids,
+                past_key_values=past_key_values,
+                device=device,
                 use_amp=use_amp,
-                device_type=device.type,
                 amp_dtype=amp_dtype,
-            ):
-                outputs = model(input_ids=input_ids, return_dict=True)
+                autocast_context_fn=autocast_context_fn,
+            )
+            past_key_values = outputs.past_key_values
             step_logits = outputs.logits[0, -1, :]
             if grammar_fsm is None:
                 next_id = int(torch_mod.argmax(step_logits, dim=-1).item())
@@ -448,8 +483,8 @@ def generate_middle_tokens(
             middle_tokens.append(next_token)
 
             next_ids = torch_mod.tensor([[next_id]], dtype=torch_mod.long, device=device)
-            input_ids = torch_mod.cat([input_ids, next_ids], dim=1)
-            if int(input_ids.shape[1]) >= max_positions:
+            input_ids = next_ids if past_key_values is not None else torch_mod.cat([input_ids, next_ids], dim=1)
+            if (len(prompt_ids) + len(middle_tokens)) >= max_positions:
                 break
 
     return middle_tokens, reached_eos, stats

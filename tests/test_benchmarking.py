@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
-from src.utils.benchmark_decode import discover_checkpoints
+try:
+    import torch
+except ModuleNotFoundError:  # pragma: no cover - depends on local test env
+    torch = None
+
+from src.utils.benchmark_decode import discover_checkpoints, generate_continuation_tokens, generate_middle_tokens
 from src.utils.benchmarking import analyze_token_sequence, build_benchmark_manifest
 
 
@@ -62,6 +69,80 @@ def _long_sequence() -> list[str]:
 
 
 class BenchmarkingTests(unittest.TestCase):
+    class _CacheAwareToyModel:
+        def __init__(self, *, first_next_id: int, cached_next_id: int, vocab_size: int):
+            self.first_next_id = int(first_next_id)
+            self.cached_next_id = int(cached_next_id)
+            self.vocab_size = int(vocab_size)
+            self.calls: list[dict[str, int | bool]] = []
+
+        def __call__(self, *, input_ids, past_key_values=None, use_cache=None, return_dict=True):
+            self.calls.append(
+                {
+                    "seq_len": int(input_ids.shape[1]),
+                    "used_cache": bool(past_key_values is not None),
+                    "use_cache": bool(use_cache),
+                }
+            )
+            logits = torch.full(
+                (1, int(input_ids.shape[1]), self.vocab_size),
+                fill_value=-1000.0,
+                dtype=torch.float32,
+                device=input_ids.device,
+            )
+            next_id = self.cached_next_id if past_key_values is not None else self.first_next_id
+            logits[0, -1, next_id] = 1000.0
+            return SimpleNamespace(logits=logits, past_key_values=("cached",))
+
+    class _ContinuationFSM:
+        def __init__(self, *, bar_id: int, eos_id: int):
+            self.bar_id = int(bar_id)
+            self.eos_id = int(eos_id)
+
+        def state_after_prefix_ids(self, prefix_ids):
+            return "start"
+
+        def allowed_token_ids(self, state):
+            if state == "start":
+                return [self.bar_id]
+            if state == "after_bar":
+                return [self.eos_id]
+            return [self.eos_id]
+
+        def transition(self, state, token_id):
+            if state == "start" and int(token_id) == self.bar_id:
+                return "after_bar"
+            if state == "after_bar" and int(token_id) == self.eos_id:
+                return "done"
+            if state == "done" and int(token_id) == self.eos_id:
+                return "done"
+            return None
+
+    class _InfillingFSM:
+        def __init__(self, *, middle_id: int, eos_id: int):
+            self.middle_id = int(middle_id)
+            self.eos_id = int(eos_id)
+
+        def state_after_prefix_tokens(self, prefix_tokens):
+            return "start"
+
+        def compatible_states_for_suffix_tokens(self, suffix_tokens):
+            return {"after_middle"}
+
+        def allowed_token_ids(self, state):
+            if state == "start":
+                return [self.middle_id]
+            if state == "after_middle":
+                return [self.eos_id]
+            return []
+
+        def transition(self, state, token_id):
+            if state == "start" and int(token_id) == self.middle_id:
+                return "after_middle"
+            if state == "after_middle" and int(token_id) == self.eos_id:
+                return "done"
+            return None
+
     def test_analyze_token_sequence_detects_empty_bars_and_time_order(self) -> None:
         payload = analyze_token_sequence(
             [
@@ -161,6 +242,66 @@ class BenchmarkingTests(unittest.TestCase):
                 [path.name for path in alias_paths],
                 ["step_250.pt", "step_500.pt", "best.pt", "last.pt", "latest.pt"],
             )
+
+    def test_generate_continuation_tokens_uses_cached_single_token_steps(self) -> None:
+        if torch is None:
+            self.skipTest("torch is required for benchmark decode tests")
+        token_to_id = {"BOS": 0, "BAR": 1, "EOS": 2}
+        id_to_token = ["BOS", "BAR", "EOS"]
+        model = self._CacheAwareToyModel(first_next_id=token_to_id["BAR"], cached_next_id=token_to_id["EOS"], vocab_size=len(id_to_token))
+        generated_tokens, reached_eos, stats = generate_continuation_tokens(
+            model=model,
+            torch_mod=torch,
+            prompt_tokens=["BOS", "BAR"],
+            token_to_id=token_to_id,
+            id_to_token=id_to_token,
+            grammar_fsm=self._ContinuationFSM(bar_id=token_to_id["BAR"], eos_id=token_to_id["EOS"]),
+            device=torch.device("cpu"),
+            use_amp=False,
+            amp_dtype=None,
+            autocast_context_fn=lambda **kwargs: nullcontext(),
+            max_positions=8,
+            max_new_tokens=2,
+        )
+
+        self.assertEqual(generated_tokens, ["BAR"])
+        self.assertTrue(reached_eos)
+        self.assertEqual(model.calls[0]["seq_len"], 2)
+        self.assertEqual(model.calls[1]["seq_len"], 1)
+        self.assertFalse(bool(model.calls[0]["used_cache"]))
+        self.assertTrue(bool(model.calls[1]["used_cache"]))
+        self.assertEqual(int(stats["step_count"]), 2)
+
+    def test_generate_middle_tokens_uses_cached_single_token_steps(self) -> None:
+        if torch is None:
+            self.skipTest("torch is required for benchmark decode tests")
+        token_to_id = {"BOS": 0, "BAR": 1, "EOS": 2}
+        id_to_token = ["BOS", "BAR", "EOS"]
+        model = self._CacheAwareToyModel(first_next_id=token_to_id["BAR"], cached_next_id=token_to_id["EOS"], vocab_size=len(id_to_token))
+        generated_tokens, reached_eos, stats = generate_middle_tokens(
+            model=model,
+            torch_mod=torch,
+            prompt_tokens=["BOS", "BAR"],
+            token_to_id=token_to_id,
+            id_to_token=id_to_token,
+            grammar_fsm=self._InfillingFSM(middle_id=token_to_id["BAR"], eos_id=token_to_id["EOS"]),
+            prefix_tokens=["BOS"],
+            suffix_tokens=["EOS"],
+            device=torch.device("cpu"),
+            use_amp=False,
+            amp_dtype=None,
+            autocast_context_fn=lambda **kwargs: nullcontext(),
+            max_positions=8,
+            max_new_tokens=2,
+        )
+
+        self.assertEqual(generated_tokens, ["BAR"])
+        self.assertTrue(reached_eos)
+        self.assertEqual(model.calls[0]["seq_len"], 2)
+        self.assertEqual(model.calls[1]["seq_len"], 1)
+        self.assertFalse(bool(model.calls[0]["used_cache"]))
+        self.assertTrue(bool(model.calls[1]["used_cache"]))
+        self.assertEqual(int(stats["step_count"]), 2)
 
 
 if __name__ == "__main__":

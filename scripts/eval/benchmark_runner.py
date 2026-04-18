@@ -94,6 +94,17 @@ def _artifact_file_names(task_scope: str) -> tuple[str, str]:
     return f"{label}_fast_manifest.json", f"{label}_formal_manifest.json"
 
 
+def _default_prefilter_top_k(*, preset: str | None, config_path: Path | None) -> int:
+    if preset == "full":
+        return 16
+    if config_path is not None:
+        stem = config_path.stem.lower()
+        name = config_path.name.lower()
+        if "full" in stem or "full" in name:
+            return 16
+    return 8
+
+
 def _clean_benchmark_outputs(benchmark_root: Path, task_scope: str) -> None:
     """Remove stale artifacts for the current benchmark task before regenerating them."""
     benchmark_root.mkdir(parents=True, exist_ok=True)
@@ -116,15 +127,16 @@ def _clean_benchmark_outputs(benchmark_root: Path, task_scope: str) -> None:
         return
 
     task_sample_names = [f"{task_name}.json" for task_name in _task_names_for_scope(task_scope)]
-    for checkpoint_dir in samples_root.iterdir():
-        if not checkpoint_dir.is_dir():
-            continue
-        for sample_name in task_sample_names:
-            sample_path = checkpoint_dir / sample_name
-            if sample_path.exists():
-                sample_path.unlink()
-        if not any(checkpoint_dir.iterdir()):
-            checkpoint_dir.rmdir()
+    for sample_path in samples_root.rglob("*.json"):
+        if sample_path.name in task_sample_names:
+            sample_path.unlink()
+    for directory in sorted(
+        [path for path in samples_root.rglob("*") if path.is_dir()],
+        key=lambda path: len(path.parts),
+        reverse=True,
+    ):
+        if not any(directory.iterdir()):
+            directory.rmdir()
     if not any(samples_root.iterdir()):
         samples_root.rmdir()
 
@@ -285,11 +297,12 @@ def _parse_args(*, task_scope: str, argv: list[str] | None = None) -> argparse.N
     parser.add_argument(
         "--prefilter-top-k-by-valid-loss",
         type=int,
-        default=8,
+        default=None,
         help=(
             "checkpoint 预筛数量。作用：在 fast benchmark 前，先按训练期 valid_loss 只保留 top K 个 checkpoint。\n"
             "设为 0 表示关闭预筛，全部 checkpoint 都跑。\n"
-            "例子：--prefilter-top-k-by-valid-loss 8"
+            "默认值会按 run 类型自动决定：small=8，full=16。\n"
+            "例子：--prefilter-top-k-by-valid-loss 16"
         ),
     )
     parser.add_argument(
@@ -1138,6 +1151,20 @@ def _sample_success_key(task_name: str) -> str:
     return "time_order_valid"
 
 
+def _sample_group_artifacts(
+    group_mapping: dict[str, dict[str, dict[str, str]]],
+    group_name: str,
+) -> dict[str, dict[str, str]]:
+    return dict(group_mapping.get(group_name, {}))
+
+
+def _sample_group_exports(
+    group_mapping: dict[str, dict[str, dict[str, list[dict[str, Any]]]]],
+    group_name: str,
+) -> dict[str, dict[str, list[dict[str, Any]]]]:
+    return dict(group_mapping.get(group_name, {}))
+
+
 def _build_summary_markdown(
     *,
     run_id: str,
@@ -1147,11 +1174,14 @@ def _build_summary_markdown(
     top_results: list[dict[str, Any]],
     training_summary: dict[str, Any],
     plot_artifacts: dict[str, str],
-    sample_artifacts: dict[str, dict[str, str]],
-    exported_samples: dict[str, dict[str, list[dict[str, Any]]]],
+    sample_artifacts: dict[str, dict[str, dict[str, str]]],
+    exported_samples: dict[str, dict[str, dict[str, list[dict[str, Any]]]]],
     manifest_stats: dict[str, Any],
     checkpoint_prefilter: dict[str, Any],
 ) -> str:
+    final_sample_artifacts = _sample_group_artifacts(sample_artifacts, "final_top3")
+    final_exported_samples = _sample_group_exports(exported_samples, "final_top3")
+    formal_candidate_artifacts = _sample_group_artifacts(sample_artifacts, "formal_candidates")
     lines = [f"# {_TASK_TITLES[task_scope]}: {run_id}", ""]
     if recommended is None:
         lines.extend(["没有 checkpoint 通过当前 benchmark 流程。", ""])
@@ -1180,6 +1210,12 @@ def _build_summary_markdown(
                 f"实际保留 {checkpoint_prefilter.get('selected_count', 0)} / {checkpoint_prefilter.get('original_count', 0)}"
                 if checkpoint_prefilter.get("enabled")
                 else "- checkpoint 预筛：关闭"
+            ),
+            "- samples 默认导出到 `samples/final_top3/`，与最终 Top 3 保持一致",
+            (
+                "- `samples/formal_candidates/` 保留进入 formal 复评的候选 checkpoint，便于排查"
+                if formal_candidate_artifacts
+                else "- 未导出 formal_candidates 样本"
             ),
             "",
             "## Top 3 排行",
@@ -1262,14 +1298,14 @@ def _build_summary_markdown(
         lines.extend(_markdown_table(["失败原因", "次数"], _counter_table_rows(_scoped_failure_counts(result, task_scope=task_scope))))
         lines.append("### 高频语法原因")
         lines.extend(_markdown_table(["语法原因", "次数"], _counter_table_rows(_scoped_syntax_counts(result, task_scope=task_scope))))
-        artifact_paths = sample_artifacts.get(checkpoint_name, {})
+        artifact_paths = final_sample_artifacts.get(checkpoint_name, {})
         lines.append("### 样本产物")
         for task_name in _task_names_for_scope(task_scope):
             if task_name in artifact_paths:
                 relative_path = _relative_artifact_path(benchmark_root, artifact_paths.get(task_name, ""))
                 lines.append(f"- `{task_name}` 样本文件：`{relative_path}`")
 
-        checkpoint_samples = exported_samples.get(checkpoint_name, {})
+        checkpoint_samples = final_exported_samples.get(checkpoint_name, {})
         lines.append("### 代表样本")
         for task_name in _task_names_for_scope(task_scope):
             task_samples = checkpoint_samples.get(task_name, [])
@@ -1300,6 +1336,12 @@ def main(*, task_scope: str = "all", argv: list[str] | None = None) -> None:
     args = _parse_args(task_scope=task_scope, argv=argv)
 
     checkpoint_dir, train_mapping, run_id = _resolve_eval_target(project_root, args)
+    config_path = None
+    if args.config is not None:
+        config_path = args.config if args.config.is_absolute() else (project_root / args.config)
+        config_path = config_path.resolve()
+    elif args.preset is not None:
+        config_path = _resolve_preset_config(project_root, args.preset)
     if not checkpoint_dir.exists():
         raise FileNotFoundError(f"checkpoint directory not found: {checkpoint_dir}")
 
@@ -1364,11 +1406,16 @@ def main(*, task_scope: str = "all", argv: list[str] | None = None) -> None:
     metrics_path = resolve_metrics_path(checkpoint_dir, None)
     training_metrics_payload = load_training_metrics(metrics_path)
     training_summary = summarize_training_metrics(training_metrics_payload)
+    prefilter_top_k = (
+        int(args.prefilter_top_k_by_valid_loss)
+        if args.prefilter_top_k_by_valid_loss is not None
+        else _default_prefilter_top_k(preset=args.preset, config_path=config_path)
+    )
     # fast 前先做训练期 valid_loss 预筛，尽量减少需要真正推理的 checkpoint 数量。
     checkpoints, checkpoint_prefilter = prefilter_checkpoints_by_valid_loss(
         checkpoints,
         training_metrics_payload,
-        top_k=int(args.prefilter_top_k_by_valid_loss),
+        top_k=prefilter_top_k,
         preserve_earliest=int(args.prefilter_preserve_earliest),
     )
 
@@ -1500,40 +1547,52 @@ def main(*, task_scope: str = "all", argv: list[str] | None = None) -> None:
         recommended = formal_selection.get("recommended_checkpoint")
 
     samples_root = benchmark_root / "samples"
-    sample_artifacts: dict[str, dict[str, str]] = {}
-    exported_samples: dict[str, dict[str, list[dict[str, Any]]]] = {}
+    sample_artifacts: dict[str, dict[str, dict[str, str]]] = {
+        "final_top3": {},
+        "formal_candidates": {},
+    }
+    exported_samples: dict[str, dict[str, dict[str, list[dict[str, Any]]]]] = {
+        "final_top3": {},
+        "formal_candidates": {},
+    }
     sample_tasks = _task_names_for_scope(task_scope)
-    # 样本导出直接复用 fast 阶段抓到的结果，不再重复推理。
-    for ckpt_path in candidate_paths:
-        checkpoint_name = ckpt_path.name
-        print(f"[{_TASK_LABELS[task_scope]}][samples] checkpoint={checkpoint_name}")
-        captured = fast_samples_by_checkpoint.get(
-            str(ckpt_path),
-            {"continuation": [], "infilling": []},
-        )
-        checkpoint_sample_dir = samples_root / ckpt_path.stem
-        checkpoint_sample_dir.mkdir(parents=True, exist_ok=True)
-        checkpoint_artifacts: dict[str, str] = {}
-        checkpoint_exports: dict[str, list[dict[str, Any]]] = {}
-        for task_name in sample_tasks:
-            sample_path = checkpoint_sample_dir / f"{task_name}.json"
-            payload = {
-                "run_id": run_id,
-                "checkpoint_name": checkpoint_name,
-                "checkpoint_path": str(ckpt_path),
-                "task": task_name,
-                "cases": captured[task_name],
-            }
-            dump_json_file(sample_path, payload, ensure_ascii=False, indent=2)
-            checkpoint_artifacts[task_name] = str(sample_path)
-            checkpoint_exports[task_name] = captured[task_name]
-        sample_artifacts[checkpoint_name] = checkpoint_artifacts
-        exported_samples[checkpoint_name] = checkpoint_exports
-
     top_results = sorted(
         [item for item in combined_results if item.get("balanced_rank") is not None],
         key=lambda item: int(item["balanced_rank"]),
     )[:3]
+
+    def _export_sample_group(group_name: str, checkpoint_paths: list[Path]) -> None:
+        group_root = samples_root / group_name
+        for ckpt_path in checkpoint_paths:
+            checkpoint_name = ckpt_path.name
+            print(f"[{_TASK_LABELS[task_scope]}][samples:{group_name}] checkpoint={checkpoint_name}")
+            captured = fast_samples_by_checkpoint.get(
+                str(ckpt_path),
+                {"continuation": [], "infilling": []},
+            )
+            checkpoint_sample_dir = group_root / ckpt_path.stem
+            checkpoint_sample_dir.mkdir(parents=True, exist_ok=True)
+            checkpoint_artifacts: dict[str, str] = {}
+            checkpoint_exports: dict[str, list[dict[str, Any]]] = {}
+            for task_name in sample_tasks:
+                sample_path = checkpoint_sample_dir / f"{task_name}.json"
+                payload = {
+                    "run_id": run_id,
+                    "sample_group": group_name,
+                    "checkpoint_name": checkpoint_name,
+                    "checkpoint_path": str(ckpt_path),
+                    "task": task_name,
+                    "cases": captured[task_name],
+                }
+                dump_json_file(sample_path, payload, ensure_ascii=False, indent=2)
+                checkpoint_artifacts[task_name] = str(sample_path)
+                checkpoint_exports[task_name] = captured[task_name]
+            sample_artifacts[group_name][checkpoint_name] = checkpoint_artifacts
+            exported_samples[group_name][checkpoint_name] = checkpoint_exports
+
+    _export_sample_group("formal_candidates", candidate_paths)
+    final_top_paths = [Path(str(result["checkpoint_path"])) for result in top_results]
+    _export_sample_group("final_top3", final_top_paths)
     plot_results = sorted(combined_results, key=lambda item: int(item.get("step", -1)))
     plot_artifacts: dict[str, str] = {}
     if plot_results:
@@ -1587,6 +1646,7 @@ def main(*, task_scope: str = "all", argv: list[str] | None = None) -> None:
         "summary": {
             "recommended_checkpoint": recommended,
             "top_k_candidates": [str(path.name) for path in candidate_paths],
+            "final_top3_checkpoints": [str(path.name) for path in final_top_paths],
             "sample_artifacts": sample_artifacts,
         },
         "fast_pass": {

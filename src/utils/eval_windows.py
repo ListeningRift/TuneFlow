@@ -1,9 +1,37 @@
-"""用于从 token 序列中构造语法保持型评估窗口的辅助函数。"""
+"""Helpers for building valid evaluation windows from token sequences."""
 
 from __future__ import annotations
 
 import random
 from typing import Sequence
+
+from src.music_analysis import analyze_phrase_candidates
+
+
+def _build_bar_span_window(
+    source_tokens: Sequence[str],
+    *,
+    start_bar: int,
+    end_bar: int,
+) -> list[str] | None:
+    analysis = analyze_phrase_candidates(source_tokens)
+    if not analysis.bars or not (0 <= start_bar < end_bar <= len(analysis.bars)):
+        return None
+
+    window_tokens: list[str] = ["BOS"]
+    leading_tempo = analysis.bars[start_bar].effective_tempo_token
+    if leading_tempo is not None:
+        window_tokens.append(leading_tempo)
+
+    for bar_index in range(start_bar, end_bar):
+        bar = analysis.bars[bar_index]
+        raw_bar_tokens = [str(token) for token in source_tokens[bar.start_token : bar.end_token]]
+        if len(raw_bar_tokens) >= 2 and raw_bar_tokens[0] == "BAR" and raw_bar_tokens[1].startswith("TEMPO_"):
+            raw_bar_tokens = ["BAR", *raw_bar_tokens[2:]]
+        window_tokens.extend(raw_bar_tokens)
+
+    window_tokens.append("EOS")
+    return window_tokens
 
 
 def sample_bar_aligned_subsequence(
@@ -15,13 +43,10 @@ def sample_bar_aligned_subsequence(
     max_attempts: int = 64,
 ) -> list[str] | None:
     """
-    截取一段自洽且结构合法的子序列。
+    Sample a valid normalized subsequence in `BOS [TEMPO] BAR ... EOS` form.
 
-    返回结果始终满足如下形式：
-    `BOS [TEMPO_*] BAR ... BAR ... EOS`
-
-    这样可以避免旧逻辑把长样本从任意中间位置截断后，再强行包上
-    `BOS/EOS`，从而把“真值重建”本身裁成语法非法序列的问题。
+    The window keeps only the tempo active at the window start, matching the
+    phrase-oriented training view.
     """
     if max_core_tokens <= 0:
         return None
@@ -30,27 +55,8 @@ def sample_bar_aligned_subsequence(
     if not source_tokens or source_tokens[0] != "BOS" or source_tokens[-1] != "EOS":
         return None
 
-    initial_tempo = None
-    if len(source_tokens) > 2 and str(source_tokens[1]).startswith("TEMPO_"):
-        initial_tempo = str(source_tokens[1])
-
-    idx = 2 if initial_tempo is not None else 1
-    seq_end = len(source_tokens) - 1
-    bars: list[tuple[int, int, str | None]] = []
-    current_tempo = initial_tempo
-
-    while idx < seq_end:
-        if source_tokens[idx] != "BAR":
-            return None
-        bar_start = idx
-        leading_tempo = current_tempo
-        idx += 1
-        if idx < seq_end and str(source_tokens[idx]).startswith("TEMPO_"):
-            current_tempo = str(source_tokens[idx])
-            idx += 1
-        while idx < seq_end and source_tokens[idx] != "BAR":
-            idx += 1
-        bars.append((bar_start, idx, leading_tempo))
+    analysis = analyze_phrase_candidates(source_tokens)
+    bars = list(analysis.bars)
 
     if not bars:
         body = [str(token) for token in source_tokens[1:-1]]
@@ -59,24 +65,22 @@ def sample_bar_aligned_subsequence(
         return ["BOS", *body, "EOS"]
 
     def _build_window(start_bar: int, choose_random_end: bool) -> list[str] | None:
-        leading_tempo = bars[start_bar][2]
-        body: list[str] = [] if leading_tempo is None else [leading_tempo]
-        candidate_lengths: list[int] = []
-
-        for end_bar in range(start_bar, len(bars)):
-            bar_start, bar_end, _ = bars[end_bar]
-            bar_tokens = [str(token) for token in source_tokens[bar_start:bar_end]]
-            if len(body) + len(bar_tokens) > max_core_tokens:
+        candidate_ends: list[int] = []
+        for end_bar in range(start_bar + 1, len(bars) + 1):
+            window = _build_bar_span_window(source_tokens, start_bar=start_bar, end_bar=end_bar)
+            if window is None:
+                return None
+            body_len = len(window) - 2
+            if body_len > max_core_tokens:
                 break
-            body.extend(bar_tokens)
-            if len(body) >= min_core_tokens:
-                candidate_lengths.append(len(body))
+            if body_len >= min_core_tokens:
+                candidate_ends.append(end_bar)
 
-        if not candidate_lengths:
+        if not candidate_ends:
             return None
 
-        body_len = rng.choice(candidate_lengths) if choose_random_end else candidate_lengths[-1]
-        return ["BOS", *body[:body_len], "EOS"]
+        chosen_end = rng.choice(candidate_ends) if choose_random_end else candidate_ends[-1]
+        return _build_bar_span_window(source_tokens, start_bar=start_bar, end_bar=chosen_end)
 
     for _ in range(max_attempts):
         start_bar = rng.randrange(len(bars))

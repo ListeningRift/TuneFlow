@@ -152,6 +152,12 @@ python scripts/tools/archive_run_artifacts.py --preset small --dry-run
 - `fim_min_span`：FIM 挖洞最小 token 长度
 - `fim_max_span`：FIM 挖洞最大 token 长度
 
+## TODO 模块
+
+当前待办事项统一维护在文档中：
+
+- [docs/todo.md](./docs/todo.md)
+
 ## 代码结构
 - `scripts/data/`：数据清洗、切分、分词、打包、校验
 - `scripts/train/`：训练入口与训练链路工具

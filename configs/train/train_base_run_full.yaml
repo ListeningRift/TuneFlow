@@ -14,7 +14,7 @@ train:
 
   # 优化配置
   # full 档位：使用固定训练预算，避免在增强后数据规模下 `one_pass` 过重。
-  steps: 150000
+  steps: 100000
   batch_size: 2
   grad_accum_steps: 4
   seq_len: 512
@@ -28,6 +28,18 @@ train:
   bos_sample_ratio: 0.05
   eos_sample_ratio: 0.45
   fim_eos_ratio: 1.0
+  use_phrase_window_sampling: true
+  single_phrase_sample_ratio: 0.40
+  cross_phrase_sample_ratio: 0.40
+  long_context_sample_ratio: 0.20
+  phrase_min_bars: 2
+  phrase_max_bars: 8
+  single_phrase_bar_min: 2
+  single_phrase_bar_max: 4
+  cross_phrase_bar_min: 4
+  cross_phrase_bar_max: 8
+  long_context_bar_min: 12
+  long_context_bar_max: 24
 
   # 学习率调度
   scheduler: cosine
