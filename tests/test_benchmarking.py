@@ -9,9 +9,10 @@ from types import SimpleNamespace
 
 try:
     import torch
-except ModuleNotFoundError:  # pragma: no cover - depends on local test env
+except ModuleNotFoundError:  # pragma: no cover - 取决于本地测试环境
     torch = None
 
+from src.decoding import TuneFlowGrammarFSM
 from src.utils.benchmark_decode import discover_checkpoints, generate_continuation_tokens, generate_middle_tokens
 from src.utils.benchmarking import analyze_token_sequence, build_benchmark_manifest
 
@@ -66,6 +67,22 @@ def _long_sequence() -> list[str]:
         "VEL_8",
         "EOS",
     ]
+
+
+def _sequence_with_pitches(pitches: list[int]) -> list[str]:
+    tokens = ["BOS", "BAR"]
+    for index, pitch in enumerate(pitches):
+        tokens.extend(
+            [
+                f"POS_{index * 4}",
+                "INST_PIANO",
+                f"PITCH_{int(pitch)}",
+                "DUR_4",
+                "VEL_8",
+            ]
+        )
+    tokens.append("EOS")
+    return tokens
 
 
 class BenchmarkingTests(unittest.TestCase):
@@ -166,6 +183,23 @@ class BenchmarkingTests(unittest.TestCase):
         self.assertFalse(payload["time_order_valid"])
         self.assertEqual(payload["empty_bar_count"], 2)
         self.assertTrue(payload["has_multi_empty_bar_run"])
+
+    def test_analyze_token_sequence_detects_most_common_pitch_ratio(self) -> None:
+        payload = analyze_token_sequence(_sequence_with_pitches([60, 60, 60, 60, 60, 64, 67, 69]))
+        self.assertAlmostEqual(float(payload["most_common_pitch_ratio"]), 5.0 / 8.0)
+        self.assertGreater(float(payload["most_common_pitch_ratio"]), 0.6)
+
+    def test_analyze_token_sequence_detects_long_same_pitch_run_ratio(self) -> None:
+        payload = analyze_token_sequence(_sequence_with_pitches([60, 62, 64, 64, 64, 64, 64, 67]))
+        self.assertAlmostEqual(float(payload["longest_same_pitch_run_ratio"]), 5.0 / 8.0)
+        self.assertGreater(float(payload["longest_same_pitch_run_ratio"]), 0.6)
+
+    def test_analyze_token_sequence_pitch_diversity_distinguishes_low_and_high_diversity(self) -> None:
+        low_diversity = analyze_token_sequence(_sequence_with_pitches([60, 60, 60, 60, 60, 61, 60, 60]))
+        high_diversity = analyze_token_sequence(_sequence_with_pitches([60, 62, 64, 65, 67, 69, 71, 72]))
+        self.assertIsNotNone(low_diversity["pitch_diversity_score"])
+        self.assertIsNotNone(high_diversity["pitch_diversity_score"])
+        self.assertLess(float(low_diversity["pitch_diversity_score"]), float(high_diversity["pitch_diversity_score"]))
 
     def test_build_benchmark_manifest_is_deterministic(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -302,6 +336,113 @@ class BenchmarkingTests(unittest.TestCase):
         self.assertFalse(bool(model.calls[0]["used_cache"]))
         self.assertTrue(bool(model.calls[1]["used_cache"]))
         self.assertEqual(int(stats["step_count"]), 2)
+
+    def test_bridgeable_states_for_suffix_include_incomplete_note_states(self) -> None:
+        vocab_tokens = [
+            "BOS",
+            "EOS",
+            "BAR",
+            "POS_0",
+            "POS_4",
+            "INST_PIANO",
+            "PITCH_60",
+            "PITCH_64",
+            "DUR_4",
+            "VEL_8",
+        ]
+        token_to_id = {token: index for index, token in enumerate(vocab_tokens)}
+        grammar_fsm = TuneFlowGrammarFSM.from_vocab(token_to_id)
+
+        suffix_tokens = ["POS_4", "INST_PIANO", "PITCH_64", "DUR_4", "VEL_8"]
+        prefix_state = grammar_fsm.state_after_prefix_tokens(["BOS", "BAR"])
+        bridgeable_states = grammar_fsm.bridgeable_states_for_suffix_tokens(suffix_tokens)
+
+        self.assertEqual(prefix_state, "after_bar")
+        self.assertIn("after_bar", bridgeable_states)
+        self.assertIn("after_pos", bridgeable_states)
+        self.assertIn("after_inst", bridgeable_states)
+        self.assertIn("after_pitch", bridgeable_states)
+        self.assertIn("after_dur", bridgeable_states)
+        self.assertEqual(
+            grammar_fsm.transition(prefix_state, token_to_id["POS_0"]),
+            "after_pos",
+        )
+
+    def test_generate_middle_tokens_allows_note_prefix_that_becomes_suffix_compatible_later(self) -> None:
+        if torch is None:
+            self.skipTest("torch is required for benchmark decode tests")
+
+        vocab_tokens = [
+            "BOS",
+            "EOS",
+            "BAR",
+            "FIM_HOLE",
+            "FIM_MID",
+            "POS_0",
+            "POS_4",
+            "INST_PIANO",
+            "PITCH_60",
+            "PITCH_64",
+            "DUR_4",
+            "VEL_8",
+        ]
+        token_to_id = {token: index for index, token in enumerate(vocab_tokens)}
+        id_to_token = list(vocab_tokens)
+
+        class _PlannedToyModel:
+            def __init__(self, plan: list[int], vocab_size: int):
+                self.plan = [int(token_id) for token_id in plan]
+                self.vocab_size = int(vocab_size)
+                self.calls = 0
+
+            def __call__(self, *, input_ids, past_key_values=None, use_cache=None, return_dict=True):
+                next_id = self.plan[min(self.calls, len(self.plan) - 1)]
+                self.calls += 1
+                logits = torch.full(
+                    (1, int(input_ids.shape[1]), self.vocab_size),
+                    fill_value=-1000.0,
+                    dtype=torch.float32,
+                    device=input_ids.device,
+                )
+                logits[0, -1, next_id] = 1000.0
+                return SimpleNamespace(logits=logits, past_key_values=("cached",))
+
+        model = _PlannedToyModel(
+            plan=[
+                token_to_id["POS_0"],
+                token_to_id["INST_PIANO"],
+                token_to_id["PITCH_60"],
+                token_to_id["DUR_4"],
+                token_to_id["VEL_8"],
+                token_to_id["EOS"],
+            ],
+            vocab_size=len(id_to_token),
+        )
+        grammar_fsm = TuneFlowGrammarFSM.from_vocab(token_to_id)
+
+        generated_tokens, reached_eos, stats = generate_middle_tokens(
+            model=model,
+            torch_mod=torch,
+            prompt_tokens=["BOS", "BAR", "FIM_HOLE", "POS_4", "INST_PIANO", "PITCH_64", "DUR_4", "VEL_8", "FIM_MID"],
+            token_to_id=token_to_id,
+            id_to_token=id_to_token,
+            grammar_fsm=grammar_fsm,
+            prefix_tokens=["BOS", "BAR"],
+            suffix_tokens=["POS_4", "INST_PIANO", "PITCH_64", "DUR_4", "VEL_8"],
+            device=torch.device("cpu"),
+            use_amp=False,
+            amp_dtype=None,
+            autocast_context_fn=lambda **kwargs: nullcontext(),
+            max_positions=32,
+            max_new_tokens=8,
+        )
+
+        self.assertEqual(
+            generated_tokens,
+            ["POS_0", "INST_PIANO", "PITCH_60", "DUR_4", "VEL_8"],
+        )
+        self.assertTrue(reached_eos)
+        self.assertEqual(int(stats["dead_end_count"]), 0)
 
 
 if __name__ == "__main__":

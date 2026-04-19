@@ -240,6 +240,35 @@ class TuneFlowGrammarFSM:
                 break
         return reachable
 
+    def bridgeable_states_for_suffix_tokens(self, suffix_tokens: Sequence[str]) -> set[str]:
+        """返回仍可在不发出 EOS 的前提下走到 suffix 兼容态的状态集合。"""
+
+        compatible_states = self.compatible_states_for_suffix_tokens(suffix_tokens)
+        return self.bridgeable_states_for_target_states(compatible_states)
+
+    def bridgeable_states_for_target_states(self, target_states: set[str]) -> set[str]:
+        """返回可经由零到多步非 EOS 转移到达目标状态的状态集合。"""
+
+        if not target_states:
+            return set()
+
+        reachable = set(target_states)
+        changed = True
+        while changed:
+            changed = False
+            for state in self._NON_TERMINAL_STATES:
+                if state in reachable:
+                    continue
+                for token_id in self.allowed_token_ids(state):
+                    if token_id == self.eos_id:
+                        continue
+                    next_state = self.transition(state, token_id)
+                    if next_state in reachable:
+                        reachable.add(state)
+                        changed = True
+                        break
+        return reachable
+
     def _unexpected_reason(self, *, state: str, index: int, token: str) -> str:
         if state == EXPECT_BOS:
             return f"expected_bos@{index}:{token}"

@@ -413,10 +413,12 @@ def generate_middle_tokens(
 
     fsm_state = None
     compatible_states: set[str] | None = None
+    bridgeable_states: set[str] | None = None
     if grammar_fsm is not None:
         fsm_state = grammar_fsm.state_after_prefix_tokens(prefix_tokens)
         compatible_states = grammar_fsm.compatible_states_for_suffix_tokens(suffix_tokens)
-        if fsm_state is None or not compatible_states:
+        bridgeable_states = grammar_fsm.bridgeable_states_for_suffix_tokens(suffix_tokens)
+        if fsm_state is None or not compatible_states or not bridgeable_states or fsm_state not in bridgeable_states:
             stats["dead_end_count"] = 1
             return middle_tokens, False, stats
 
@@ -446,7 +448,7 @@ def generate_middle_tokens(
                     if token_id == grammar_fsm.eos_id:
                         continue
                     next_state = grammar_fsm.transition(fsm_state, token_id)
-                    if next_state is not None and next_state in compatible_states:
+                    if next_state is not None and next_state in bridgeable_states:
                         allowed_ids.append(token_id)
                 if fsm_state in compatible_states:
                     allowed_ids.append(grammar_fsm.eos_id)
@@ -476,7 +478,7 @@ def generate_middle_tokens(
                 break
             if grammar_fsm is not None:
                 next_state = grammar_fsm.transition(fsm_state, next_id)
-                if next_state is None or next_state not in compatible_states:
+                if next_state is None or next_state not in bridgeable_states:
                     stats["dead_end_count"] = int(stats["dead_end_count"]) + 1
                     return middle_tokens, False, stats
                 fsm_state = next_state

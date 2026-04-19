@@ -8,6 +8,8 @@ TuneFlow 现在保留三种评估入口，但它们共用同一套 benchmark 核
 
 训练期指标统一来自 checkpoint 目录下的 `metrics.jsonl`，benchmark 阶段不再重算 `valid_loss`。
 
+指标定义、absolute score、pitch collapse 检测与使用建议见：[benchmark_metrics.md](./benchmark_metrics.md)
+
 ## 入口区别
 
 ### `eval_all.py`

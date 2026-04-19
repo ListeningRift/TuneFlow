@@ -1,4 +1,4 @@
-"""Checkpoint ranking and recommendation helpers."""
+"""Checkpoint 排名与推荐辅助工具。"""
 
 from __future__ import annotations
 
@@ -125,6 +125,19 @@ _PROFILE_SPECS: dict[str, dict[str, Any]] = {
 }
 
 _COMMON_SUMMARY_KEYS = (
+    "absolute_score_version",
+    "absolute_score",
+    "absolute_score_coverage",
+    "absolute_score_proxy_dimension_count",
+    "absolute_score_proxy_dimensions",
+    "absolute_score_missing_dimensions",
+    "absolute_score_breakdown",
+    "continuation_closure_score",
+    "continuation_structure_score",
+    "infilling_integrity_score",
+    "phrase_coherence_score",
+    "long_context_stability_score",
+    "training_health_score",
     "valid_loss",
     "ppl",
     "valid_loss_from_training",
@@ -149,6 +162,18 @@ _COMMON_SUMMARY_KEYS = (
     "continuation_syntax_invalid_rate",
     "append_eos_recoverable_rate",
     "infilling_syntax_invalid_rate",
+    "continuation_most_common_pitch_ratio",
+    "continuation_longest_same_pitch_run_ratio",
+    "continuation_pitch_diversity_score",
+    "continuation_pitch_collapse_coverage",
+    "infilling_most_common_pitch_ratio",
+    "infilling_longest_same_pitch_run_ratio",
+    "infilling_pitch_diversity_score",
+    "infilling_pitch_collapse_coverage",
+    "overall_most_common_pitch_ratio",
+    "overall_longest_same_pitch_run_ratio",
+    "overall_pitch_diversity_score",
+    "overall_pitch_collapse_coverage",
     "low_density_bar_rate",
     "multi_empty_bar_run_rate",
     "generated_bar_delta_mean",
@@ -256,7 +281,7 @@ def score_checkpoint_results(
     *,
     profile: str,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Rank checkpoint result rows under a named scoring profile."""
+    """按指定评分配置对 checkpoint 结果行进行排序。"""
     if profile not in _PROFILE_SPECS:
         raise ValueError(f"Unsupported checkpoint selection profile: {profile}")
 

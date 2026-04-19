@@ -1,8 +1,9 @@
-"""Benchmark manifest builders and music-oriented token diagnostics."""
+"""Benchmark manifest 构建与面向音乐的 token 诊断工具。"""
 
 from __future__ import annotations
 
 import json
+import math
 import random
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -163,7 +164,7 @@ def _choose_infill_hole_bounds(
 
 
 def load_benchmark_config(path: Path) -> dict[str, Any]:
-    """Load a benchmark YAML config and fill simple defaults."""
+    """加载 benchmark YAML 配置，并补齐简单默认值。"""
     payload = load_yaml_mapping(path, "benchmark config")
     payload.setdefault("tier", path.stem.replace("benchmark_", ""))
     payload.setdefault("seed", 42)
@@ -180,7 +181,7 @@ def load_benchmark_config(path: Path) -> dict[str, Any]:
 
 
 def load_eval_rows(eval_jsonl_path: Path, eval_tok_path: Path) -> list[dict[str, Any]]:
-    """Load benchmark metadata rows and aligned tokenized sequences."""
+    """加载 benchmark 元数据行与对齐后的 token 序列。"""
     with eval_jsonl_path.open("r", encoding="utf-8") as file:
         meta_rows = [json.loads(line) for line in file if line.strip()]
     token_rows = []
@@ -217,7 +218,7 @@ def build_continuation_case(
     prefix_ratio_max: float,
     seed: int,
 ) -> dict[str, Any] | None:
-    """Build a deterministic continuation case."""
+    """构建可复现的 continuation case。"""
     if len(source_tokens) < 30 or source_tokens[0] != "BOS" or source_tokens[-1] != "EOS":
         return None
 
@@ -279,7 +280,7 @@ def build_infilling_case(
     hole_ratio_max: float,
     seed: int,
 ) -> dict[str, Any] | None:
-    """Build a deterministic infilling case."""
+    """构建可复现的 infilling case。"""
     if len(source_tokens) < 30 or source_tokens[0] != "BOS" or source_tokens[-1] != "EOS":
         return None
 
@@ -335,7 +336,7 @@ def build_benchmark_manifest(
     config: dict[str, Any],
     max_positions: int,
 ) -> dict[str, Any]:
-    """Build a deterministic benchmark manifest."""
+    """构建可复现的 benchmark manifest。"""
     rows = load_eval_rows(eval_jsonl_path, eval_tok_path)
     note_thresholds = _quartile_thresholds([float(row["meta"]["note_count"]) for row in rows])
     duration_thresholds = _quartile_thresholds([float(row["meta"]["duration_sec"]) for row in rows])
@@ -442,7 +443,7 @@ def duration_l1_distance(
     generated_counts: dict[str, int],
     target_counts: dict[str, int],
 ) -> float:
-    """Return the L1 distance between normalized duration histograms."""
+    """返回归一化时值直方图之间的 L1 距离。"""
     keys = sorted(set(generated_counts) | set(target_counts))
     if not keys:
         return 0.0
@@ -458,8 +459,75 @@ def duration_l1_distance(
     return distance
 
 
+_MIN_PITCH_EVENTS_FOR_COLLAPSE_METRICS = 6
+_PITCH_DIVERSITY_REFERENCE_UNIQUES = 12
+
+
+def _pitch_collapse_metrics(pitch_values: Sequence[int]) -> dict[str, Any]:
+    """汇总生成旋律片段的 pitch 塌缩风险。"""
+    pitch_list = [int(value) for value in pitch_values]
+    pitch_event_count = len(pitch_list)
+    unique_pitch_count = len(set(pitch_list))
+    if pitch_event_count <= 0:
+        return {
+            "pitch_event_count": 0,
+            "pitch_unique_count": 0,
+            "pitch_analysis_coverage": 0.0,
+            "most_common_pitch_ratio": None,
+            "longest_same_pitch_run_ratio": None,
+            "pitch_diversity_score": None,
+        }
+
+    if pitch_event_count < _MIN_PITCH_EVENTS_FOR_COLLAPSE_METRICS:
+        return {
+            "pitch_event_count": pitch_event_count,
+            "pitch_unique_count": unique_pitch_count,
+            "pitch_analysis_coverage": (pitch_event_count / float(_MIN_PITCH_EVENTS_FOR_COLLAPSE_METRICS)),
+            "most_common_pitch_ratio": None,
+            "longest_same_pitch_run_ratio": None,
+            "pitch_diversity_score": None,
+        }
+
+    pitch_counter = Counter(pitch_list)
+    most_common_pitch_count = max(pitch_counter.values(), default=0)
+
+    longest_same_pitch_run = 0
+    current_same_pitch_run = 0
+    previous_pitch: int | None = None
+    for pitch_value in pitch_list:
+        if previous_pitch is not None and pitch_value == previous_pitch:
+            current_same_pitch_run += 1
+        else:
+            current_same_pitch_run = 1
+            previous_pitch = pitch_value
+        longest_same_pitch_run = max(longest_same_pitch_run, current_same_pitch_run)
+
+    normalized_unique_count = min(unique_pitch_count, _PITCH_DIVERSITY_REFERENCE_UNIQUES) / float(
+        _PITCH_DIVERSITY_REFERENCE_UNIQUES
+    )
+    entropy = 0.0
+    for count in pitch_counter.values():
+        probability = float(count) / float(pitch_event_count)
+        entropy -= probability * math.log(probability)
+    entropy_norm = (
+        entropy / math.log(float(unique_pitch_count))
+        if unique_pitch_count > 1
+        else 0.0
+    )
+    pitch_diversity_score = (0.6 * entropy_norm) + (0.4 * normalized_unique_count)
+
+    return {
+        "pitch_event_count": pitch_event_count,
+        "pitch_unique_count": unique_pitch_count,
+        "pitch_analysis_coverage": 1.0,
+        "most_common_pitch_ratio": (most_common_pitch_count / float(pitch_event_count)),
+        "longest_same_pitch_run_ratio": (longest_same_pitch_run / float(pitch_event_count)),
+        "pitch_diversity_score": max(0.0, min(1.0, pitch_diversity_score)),
+    }
+
+
 def analyze_token_sequence(tokens: Sequence[str]) -> dict[str, Any]:
-    """Analyze basic musical structure from a possibly partial token sequence."""
+    """从可能不完整的 token 序列中分析基础音乐结构。"""
     idx = 0
     values = list(tokens)
     bar_event_counts: list[int] = []
@@ -543,6 +611,7 @@ def analyze_token_sequence(tokens: Sequence[str]) -> dict[str, Any]:
     pitch_span = 0
     if pitch_values:
         pitch_span = max(pitch_values) - min(pitch_values)
+    pitch_metrics = _pitch_collapse_metrics(pitch_values)
 
     return {
         "bar_count": len(bar_event_counts),
@@ -557,11 +626,17 @@ def analyze_token_sequence(tokens: Sequence[str]) -> dict[str, Any]:
         "duration_counts": dict(duration_counts),
         "time_order_valid": (time_order_violation_count == 0),
         "time_order_violation_count": time_order_violation_count,
+        "pitch_event_count": int(pitch_metrics["pitch_event_count"]),
+        "pitch_unique_count": int(pitch_metrics["pitch_unique_count"]),
+        "pitch_analysis_coverage": float(pitch_metrics["pitch_analysis_coverage"]),
+        "most_common_pitch_ratio": pitch_metrics["most_common_pitch_ratio"],
+        "longest_same_pitch_run_ratio": pitch_metrics["longest_same_pitch_run_ratio"],
+        "pitch_diversity_score": pitch_metrics["pitch_diversity_score"],
     }
 
 
 def enrich_continuation_record(record: dict[str, Any], *, target_tokens: Sequence[str]) -> dict[str, Any]:
-    """Attach music-oriented diagnostics to a continuation decode trace."""
+    """为 continuation decode 轨迹补充面向音乐的诊断字段。"""
     generated_analysis = analyze_token_sequence(record.get("generated_tokens", []))
     target_analysis = analyze_token_sequence([token for token in target_tokens if token != "EOS"])
     reconstructed_analysis = analyze_token_sequence(record.get("reconstructed_tokens", []))
@@ -586,6 +661,12 @@ def enrich_continuation_record(record: dict[str, Any], *, target_tokens: Sequenc
             "generated_bar_count": int(generated_analysis["bar_count"]),
             "generated_event_count": int(generated_analysis["event_count"]),
             "generated_pitch_span": int(generated_analysis["pitch_span"]),
+            "generated_pitch_event_count": int(generated_analysis["pitch_event_count"]),
+            "generated_pitch_unique_count": int(generated_analysis["pitch_unique_count"]),
+            "pitch_analysis_coverage": float(generated_analysis["pitch_analysis_coverage"]),
+            "most_common_pitch_ratio": generated_analysis["most_common_pitch_ratio"],
+            "longest_same_pitch_run_ratio": generated_analysis["longest_same_pitch_run_ratio"],
+            "pitch_diversity_score": generated_analysis["pitch_diversity_score"],
             "target_bar_count": int(target_analysis["bar_count"]),
             "target_event_count": int(target_analysis["event_count"]),
             "target_pitch_span": int(target_analysis["pitch_span"]),
@@ -602,7 +683,7 @@ def enrich_continuation_record(record: dict[str, Any], *, target_tokens: Sequenc
 
 
 def enrich_infilling_record(record: dict[str, Any], *, target_hole_tokens: Sequence[str]) -> dict[str, Any]:
-    """Attach music-oriented diagnostics to an infilling decode trace."""
+    """为 infilling decode 轨迹补充面向音乐的诊断字段。"""
     generated_analysis = analyze_token_sequence(record.get("generated_middle_tokens", []))
     target_analysis = analyze_token_sequence(target_hole_tokens)
     reconstructed_analysis = analyze_token_sequence(record.get("reconstructed_tokens", []))
@@ -614,6 +695,12 @@ def enrich_infilling_record(record: dict[str, Any], *, target_hole_tokens: Seque
             "generated_bar_count": int(generated_analysis["bar_count"]),
             "generated_event_count": int(generated_analysis["event_count"]),
             "generated_pitch_span": int(generated_analysis["pitch_span"]),
+            "generated_pitch_event_count": int(generated_analysis["pitch_event_count"]),
+            "generated_pitch_unique_count": int(generated_analysis["pitch_unique_count"]),
+            "pitch_analysis_coverage": float(generated_analysis["pitch_analysis_coverage"]),
+            "most_common_pitch_ratio": generated_analysis["most_common_pitch_ratio"],
+            "longest_same_pitch_run_ratio": generated_analysis["longest_same_pitch_run_ratio"],
+            "pitch_diversity_score": generated_analysis["pitch_diversity_score"],
             "target_bar_count": int(target_analysis["bar_count"]),
             "target_event_count": int(target_analysis["event_count"]),
             "target_pitch_span": int(target_analysis["pitch_span"]),
@@ -630,7 +717,7 @@ def enrich_infilling_record(record: dict[str, Any], *, target_hole_tokens: Seque
 
 
 def select_export_cases(cases: Sequence[dict[str, Any]], *, count: int) -> list[dict[str, Any]]:
-    """Choose evenly bucketed sample cases for artifact export."""
+    """为产物导出挑选尽量均匀分桶的样本 case。"""
     buckets: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for case in cases:
         buckets[str(case["bucket"])].append(case)

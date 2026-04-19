@@ -1,5 +1,6 @@
 """通用工具集合。"""
 
+from .absolute_benchmark_scoring import attach_absolute_capability_scores, score_absolute_capabilities
 from .benchmarking import (
     analyze_token_sequence,
     build_benchmark_manifest,
@@ -25,6 +26,7 @@ from .training_metrics import load_training_metrics, resolve_metrics_path, train
 from .torch_utils import count_parameters, lazy_import_torch, resolve_torch_device
 
 __all__ = [
+    "attach_absolute_capability_scores",
     "analyze_token_sequence",
     "build_benchmark_manifest",
     "build_continuation_trace",
@@ -37,6 +39,7 @@ __all__ = [
     "generate_middle_tokens",
     "load_benchmark_config",
     "load_vocab",
+    "score_absolute_capabilities",
     "sample_step_checkpoints",
     "select_export_cases",
     "score_checkpoint_results",

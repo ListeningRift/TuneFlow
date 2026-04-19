@@ -12,6 +12,7 @@ class CheckpointSelectionTests(unittest.TestCase):
                 "checkpoint_name": "step_1.pt",
                 "checkpoint_path": "outputs/checkpoints/run/step_1.pt",
                 "step": 1,
+                "absolute_score": 42.0,
                 "continuation_stop_success_rate": 0.10,
                 "continuation_budget_stop_rate": 0.90,
                 "continuation_structural_validity_rate": 0.40,
@@ -24,6 +25,7 @@ class CheckpointSelectionTests(unittest.TestCase):
                 "checkpoint_name": "step_2.pt",
                 "checkpoint_path": "outputs/checkpoints/run/step_2.pt",
                 "step": 2,
+                "absolute_score": 61.5,
                 "continuation_stop_success_rate": 0.60,
                 "continuation_budget_stop_rate": 0.20,
                 "continuation_structural_validity_rate": 0.80,
@@ -39,6 +41,8 @@ class CheckpointSelectionTests(unittest.TestCase):
         self.assertEqual(selection["recommended_checkpoint"]["checkpoint_name"], "step_2.pt")
         top = next(item for item in scored if item["checkpoint_name"] == "step_2.pt")
         self.assertTrue(top["gate_passed"])
+        self.assertAlmostEqual(float(selection["recommended_checkpoint"]["absolute_score"]), 61.5)
+        self.assertAlmostEqual(float(selection["leaderboard"][0]["absolute_score"]), 61.5)
 
     def test_infilling_profile_prefers_structural_validity(self) -> None:
         results = [
