@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from benchmark_runner import main as _run_benchmark
+from .benchmark_runner import main as _run_benchmark
 
 
 def main() -> None:

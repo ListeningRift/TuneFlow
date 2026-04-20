@@ -11,7 +11,7 @@ try:
     import mido
 except ImportError as exc:
     raise SystemExit(
-        "缺少依赖：mido。请先执行 `python -m pip install mido`。"
+        "缺少依赖：mido。请先在你当前环境中执行 `uv sync --active`。"
     ) from exc
 
 from ..utils.config_io import load_yaml_mapping

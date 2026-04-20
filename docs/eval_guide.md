@@ -51,17 +51,17 @@ TuneFlow 现在保留三种评估入口，但它们共用同一套 benchmark 核
 使用内置训练 preset：
 
 ```bash
-python scripts/eval/eval_all.py --preset small
-python scripts/eval/eval_infilling.py --preset small
-python scripts/eval/eval_continuation.py --preset small
+uv run eval-all --preset small
+uv run eval-infilling --preset small
+uv run eval-continuation --preset small
 ```
 
 使用自定义训练配置：
 
 ```bash
-python scripts/eval/eval_all.py --config configs/train/train_base_run_small.yaml
-python scripts/eval/eval_infilling.py --config configs/train/train_base_run_small.yaml
-python scripts/eval/eval_continuation.py --config configs/train/train_base_run_small.yaml
+uv run eval-all --config configs/train/train_base_run_small.yaml
+uv run eval-infilling --config configs/train/train_base_run_small.yaml
+uv run eval-continuation --config configs/train/train_base_run_small.yaml
 ```
 
 三个脚本都会从训练配置里的 `output_dir` 自动定位 checkpoint 目录，不再需要手动传 `--checkpoint-dir`。
@@ -118,7 +118,7 @@ outputs/benchmark/<run_id>/
 如果你想把 sample JSON 里的完整序列直接导出为 MIDI 来听效果，可以使用：
 
 ```bash
-python scripts/eval/export_tokens_to_midi.py --input-json outputs/benchmark/base_full/samples/final_top3/step_100000/continuation.json --output outputs/debug/sample_case_all
+uv run eval-export-midi --input-json outputs/benchmark/base_full/samples/final_top3/step_100000/continuation.json --output outputs/debug/sample_case_all
 ```
 
 不传 `--case-index` 时，会把 JSON 里的所有 case 都导出到目标目录：
@@ -129,7 +129,7 @@ python scripts/eval/export_tokens_to_midi.py --input-json outputs/benchmark/base
 如果只想导出单条：
 
 ```bash
-python scripts/eval/export_tokens_to_midi.py --input-json outputs/benchmark/base_full/samples/final_top3/step_100000/continuation.json --case-index 0 --output outputs/debug/sample_case_0.mid
+uv run eval-export-midi --input-json outputs/benchmark/base_full/samples/final_top3/step_100000/continuation.json --case-index 0 --output outputs/debug/sample_case_0.mid
 ```
 
 这时会同时生成：
@@ -141,7 +141,7 @@ python scripts/eval/export_tokens_to_midi.py --input-json outputs/benchmark/base
 默认导出 `fsm_reconstructed_tokens`。如果想对比未加约束的完整重建结果：
 
 ```bash
-python scripts/eval/export_tokens_to_midi.py \
+uv run eval-export-midi \
   --input-json outputs/benchmark/base_full/samples/final_top3/step_100000/continuation.json \
   --case-index 0 \
   --token-field raw_reconstructed_tokens \
@@ -152,58 +152,58 @@ python scripts/eval/export_tokens_to_midi.py \
 
 - `--config <train-yaml>`
   作用：指定训练配置文件，从里面自动读取 `output_dir` 找到对应 checkpoint 目录。
-  例子：`python scripts/eval/eval_all.py --config configs/train/train_base_run_small.yaml`
+  例子：`uv run eval-all --config configs/train/train_base_run_small.yaml`
 - `--preset {small,full}`
   作用：直接使用内置训练预设，省掉手写配置路径。
-  例子：`python scripts/eval/eval_all.py --preset small`
+  例子：`uv run eval-all --preset small`
 - `--device {auto,cpu,cuda}`
   作用：指定评估在哪个设备上跑。`auto` 会自动优先 GPU。
-  例子：`python scripts/eval/eval_all.py --preset small --device cpu`
+  例子：`uv run eval-all --preset small --device cpu`
 - `--precision {auto,fp32,bf16,fp16}`
   作用：指定推理精度。GPU 上通常 `bf16/fp16` 更快，CPU 上一般用 `fp32`。
-  例子：`python scripts/eval/eval_all.py --preset small --device cuda --precision bf16`
+  例子：`uv run eval-all --preset small --device cuda --precision bf16`
 - `--max-new-tokens N`
   作用：限制单条样本最多能生成多少个新 token。值越大越慢，但也越不容易被长度截断。
-  例子：`python scripts/eval/eval_all.py --preset small --max-new-tokens 96`
+  例子：`uv run eval-all --preset small --max-new-tokens 96`
 - `--limit-checkpoints N`
   作用：只评估前 N 个 checkpoint，适合 smoke 测试。
-  例子：`python scripts/eval/eval_all.py --preset small --limit-checkpoints 2`
+  例子：`uv run eval-all --preset small --limit-checkpoints 2`
 - `--checkpoint-policy {all,sampled}`
   作用：决定 fast 阶段跑全部 checkpoint 还是均匀抽样。
-  例子：`python scripts/eval/eval_all.py --preset small --checkpoint-policy sampled`
+  例子：`uv run eval-all --preset small --checkpoint-policy sampled`
 - `--sample-count N`
   作用：当 `--checkpoint-policy sampled` 时，指定要保留多少个 step checkpoint。
-  例子：`python scripts/eval/eval_all.py --preset small --checkpoint-policy sampled --sample-count 6`
+  例子：`uv run eval-all --preset small --checkpoint-policy sampled --sample-count 6`
 - `--include-alias-checkpoints`
   作用：把 `best.pt`、`last.pt`、`latest.pt` 这类别名 checkpoint 也加入 fast 扫描。默认不加。
-  例子：`python scripts/eval/eval_all.py --preset small --include-alias-checkpoints`
+  例子：`uv run eval-all --preset small --include-alias-checkpoints`
 - `--prefilter-top-k-by-valid-loss N`
   作用：fast benchmark 之前先按训练期 `valid_loss` 只保留 top K 个 checkpoint。设成 `0` 表示关闭。
-  例子：`python scripts/eval/eval_all.py --preset small --prefilter-top-k-by-valid-loss 8`
+  例子：`uv run eval-all --preset small --prefilter-top-k-by-valid-loss 8`
 - `--prefilter-preserve-earliest N`
   作用：在按 `valid_loss` 预筛时，额外保留最早的 N 个 eval 对齐 checkpoint，避免早期峰值被误删。
-  例子：`python scripts/eval/eval_all.py --preset small --prefilter-top-k-by-valid-loss 8 --prefilter-preserve-earliest 4`
+  例子：`uv run eval-all --preset small --prefilter-top-k-by-valid-loss 8 --prefilter-preserve-earliest 4`
 - `--fast-config <yaml>`
   作用：指定 fast benchmark 的配置文件，比如样本抽样数量、样本导出数量。
-  例子：`python scripts/eval/eval_all.py --preset small --fast-config configs/eval/benchmark_fast.yaml`
+  例子：`uv run eval-all --preset small --fast-config configs/eval/benchmark_fast.yaml`
 - `--formal-config <yaml>`
   作用：指定 formal benchmark 的配置文件，一般控制全量复评集。
-  例子：`python scripts/eval/eval_all.py --preset small --formal-config configs/eval/benchmark_formal.yaml`
+  例子：`uv run eval-all --preset small --formal-config configs/eval/benchmark_formal.yaml`
 
 最常用的几个命令组合：
 
 ```bash
 # 直接跑默认 small 综合 benchmark
-python scripts/eval/eval_all.py --preset small
+uv run eval-all --preset small
 
 # 只做一次很快的 smoke 检查
-python scripts/eval/eval_all.py --preset small --limit-checkpoints 2 --max-new-tokens 64
+uv run eval-all --preset small --limit-checkpoints 2 --max-new-tokens 64
 
 # 用 sampled 模式快速看趋势
-python scripts/eval/eval_all.py --preset small --checkpoint-policy sampled --sample-count 6
+uv run eval-all --preset small --checkpoint-policy sampled --sample-count 6
 
 # 关闭 valid_loss 预筛，强制跑全部 step checkpoint
-python scripts/eval/eval_all.py --preset small --prefilter-top-k-by-valid-loss 0
+uv run eval-all --preset small --prefilter-top-k-by-valid-loss 0
 ```
 
 ## Benchmark 配置
@@ -226,7 +226,7 @@ python scripts/eval/eval_all.py --preset small --prefilter-top-k-by-valid-loss 0
 项目里的 smoke 回归默认验证完整 benchmark：
 
 ```bash
-python scripts/train/regression_check.py --device cpu --precision fp32 --seq-len 64 --batch-size 1
+uv run train-regression-check --device cpu --precision fp32 --seq-len 64 --batch-size 1
 ```
 
 它会训练 2 步、恢复一次训练、然后跑缩小版 benchmark，最后校验报告和样本导出是否完整。

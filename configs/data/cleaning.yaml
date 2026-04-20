@@ -22,7 +22,7 @@ keep_pitch_max: 108
 track_selection_mode: piano_first_then_most_notes
 piano_program: 0
 
-max_simultaneous_notes: 16
+max_simultaneous_notes: 24
 
 # Drum filtering
 remove_drum_channel_10: true

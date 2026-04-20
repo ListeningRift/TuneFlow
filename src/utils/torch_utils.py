@@ -9,7 +9,7 @@ def lazy_import_torch():
         import torch
     except ImportError as exc:
         raise SystemExit(
-            "缺少依赖：torch。请先执行 README 中的 conda 安装命令。"
+            "缺少依赖：torch。请先在你当前环境中执行 `uv sync --active`。"
         ) from exc
     return torch
 
@@ -27,7 +27,7 @@ def resolve_torch_device(torch_mod, choice: str):
         return torch_mod.device("cpu")
     if choice == "cuda":
         if not torch_mod.cuda.is_available():
-            raise SystemExit("指定了 --device cuda，但当前环境不可用。")
+            raise SystemExit("指定了 `--device cuda`，但当前环境不可用。")
         return torch_mod.device("cuda")
     return torch_mod.device("cuda" if torch_mod.cuda.is_available() else "cpu")
 
@@ -35,4 +35,3 @@ def resolve_torch_device(torch_mod, choice: str):
 def count_parameters(model) -> int:
     """统计模型总参数量。"""
     return sum(p.numel() for p in model.parameters())
-

@@ -45,15 +45,15 @@ TuneFlow 当前采用混合训练：
 ## 训练命令
 
 ```bash
-python scripts/train/train_base_from_config.py --preset small
-python scripts/train/train_base_from_config.py --preset full
+uv run train-base --preset small
+uv run train-base --preset full
 ```
 
 或：
 
 ```bash
-python scripts/train/train_base_from_config.py --config configs/train/train_base_run_small.yaml
-python scripts/train/train_base_from_config.py --config configs/train/train_base_run_full.yaml
+uv run train-base --config configs/train/train_base_run_small.yaml
+uv run train-base --config configs/train/train_base_run_full.yaml
 ```
 
 ## 评估闭环
@@ -61,17 +61,17 @@ python scripts/train/train_base_from_config.py --config configs/train/train_base
 训练完成后，可以按需求选择 benchmark 入口：
 
 ```bash
-python scripts/eval/eval_all.py --preset small
-python scripts/eval/eval_infilling.py --preset small
-python scripts/eval/eval_continuation.py --preset small
+uv run eval-all --preset small
+uv run eval-infilling --preset small
+uv run eval-continuation --preset small
 ```
 
 如果训练使用自定义 YAML：
 
 ```bash
-python scripts/eval/eval_all.py --config configs/train/train_base_run_small.yaml
-python scripts/eval/eval_infilling.py --config configs/train/train_base_run_small.yaml
-python scripts/eval/eval_continuation.py --config configs/train/train_base_run_small.yaml
+uv run eval-all --config configs/train/train_base_run_small.yaml
+uv run eval-infilling --config configs/train/train_base_run_small.yaml
+uv run eval-continuation --config configs/train/train_base_run_small.yaml
 ```
 
 三个入口都会自动从训练配置里的 `output_dir` 读取 checkpoint，不再需要手动指定 checkpoint 目录。
@@ -83,7 +83,7 @@ python scripts/eval/eval_continuation.py --config configs/train/train_base_run_s
 回归脚本会固定开启 `fim_ratio=1.0`，确保 FIM 分支被覆盖：
 
 ```bash
-python scripts/train/regression_check.py --device cpu --precision fp32 --seq-len 64 --batch-size 1
+uv run train-regression-check --device cpu --precision fp32 --seq-len 64 --batch-size 1
 ```
 
 它会验证：

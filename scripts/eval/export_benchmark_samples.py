@@ -86,14 +86,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--temperature",
         type=float,
-        default=0.0,
+        default=0.9,
         help="采样温度。`0` 表示贪心解码，`>0` 时启用随机采样。",
     )
     parser.add_argument(
         "--top-p",
         dest="top_p",
         type=float,
-        default=1.0,
+        default=0.9,
         help="top-p 采样阈值，取值范围 `(0, 1]`。",
     )
     args = parser.parse_args()

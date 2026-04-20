@@ -13,7 +13,7 @@ try:
     import mido
 except ImportError as exc:
     raise SystemExit(
-        "缺少依赖：mido。请先执行 `python -m pip install mido`。"
+        "缺少依赖：mido。请先在你当前环境中执行 `uv sync --active`。"
     ) from exc
 
 
@@ -151,4 +151,3 @@ def collect_tempo_changes(midi: mido.MidiFile) -> List[Tuple[int, float]]:
         else:
             merged.append((tick, bpm))
     return merged
-

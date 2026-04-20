@@ -19,14 +19,14 @@ try:
     import mido
 except ImportError as exc:
     raise SystemExit(
-        "缺少依赖：mido。请先执行 `python -m pip install mido`。"
+        "缺少依赖：mido。请先在你当前环境中执行 `uv sync --active`。"
     ) from exc
 
 try:
     import yaml
 except ImportError as exc:
     raise SystemExit(
-        "缺少依赖：pyyaml。请先执行 `python -m pip install pyyaml`。"
+        "缺少依赖：pyyaml。请先在你当前环境中执行 `uv sync --active`。"
     ) from exc
 
 
