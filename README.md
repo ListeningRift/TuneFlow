@@ -133,6 +133,35 @@ python scripts/train/regression_check.py --device cpu --precision fp32 --seq-len
 - `outputs/benchmark/<run_id>/samples/<checkpoint>/continuation.json`
 - `outputs/benchmark/<run_id>/samples/<checkpoint>/infilling.json`
 
+如果你想把某条 benchmark sample 直接反编译成 MIDI 来听结果，可以使用：
+
+```bash
+python scripts/eval/export_tokens_to_midi.py --input-json outputs/benchmark/base_full/samples/final_top3/step_100000/continuation.json --output outputs/debug/sample_case_all
+```
+
+不传 `--case-index` 时，会把 JSON 里的所有 case 都导出到目标目录下：
+- continuation 样本会生成 `0_full.mid`、`0_continuation.mid`
+- infilling 样本会生成 `0_full.mid`、`0_infilling.mid`
+- 另外还会生成 `0_target.mid` 和 `0_reference_full.mid`，用于和原始真值对比
+
+如果只想导出某一条 case：
+
+```bash
+python scripts/eval/export_tokens_to_midi.py --input-json outputs/benchmark/base_full/samples/final_top3/step_100000/continuation.json --case-index 0 --output outputs/debug/sample_case_0.mid
+```
+
+这时会同时生成：
+- `sample_case_0.mid` 作为完整结果
+- `sample_case_0_continuation.mid` 或 `sample_case_0_infilling.mid` 作为模型新增部分
+- `sample_case_0_target.mid` 作为原始真值片段
+- `sample_case_0_reference_full.mid` 作为原始真值完整拼接结果
+
+默认会导出 `fsm_reconstructed_tokens`；如果要对比未加约束的完整结果，可额外传：
+
+```bash
+python scripts/eval/export_tokens_to_midi.py --input-json outputs/benchmark/base_full/samples/final_top3/step_100000/continuation.json --case-index 0 --token-field raw_reconstructed_tokens --output outputs/debug/sample_case_0_raw.mid
+```
+
 如果当前结果值得长期保留，可在下次训练/评估前先归档一份快照：
 ## 归档命令
 

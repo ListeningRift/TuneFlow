@@ -1,5 +1,13 @@
 """Tokenizer 核心模块。"""
 
+from .midi_codec import (
+    TokenizerConfig,
+    build_vocab,
+    load_config,
+    tokenize_midi,
+    tokens_to_midi,
+    validate_token_order,
+)
 from .velocity import (
     VelocityConfig,
     bin_to_velocity,
@@ -16,7 +24,13 @@ def tokenize_main() -> None:
 
 
 __all__ = [
+    "TokenizerConfig",
     "VelocityConfig",
+    "build_vocab",
+    "load_config",
+    "tokenize_midi",
+    "tokens_to_midi",
+    "validate_token_order",
     "velocity_to_bin",
     "bin_to_velocity",
     "build_velocity_table",

@@ -4,10 +4,9 @@
 from __future__ import annotations
 
 import argparse
-from collections import defaultdict
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional
 
 try:
     import mido
@@ -16,110 +15,20 @@ except ImportError as exc:
         "缺少依赖：mido。请先执行 `python -m pip install mido`。"
     ) from exc
 
-from ..utils.config_io import dump_json_file, load_yaml_mapping
+from ..utils.config_io import dump_json_file
 from ..utils.output_cleanup import ensure_clean_directory, remove_file_if_exists
-from .common import (
-    NoteEvent,
-    collect_note_events,
-    collect_tempo_changes,
-    get_bar_ticks,
-    load_jsonl,
-    nearest_value,
-    summarize_lengths,
-    write_tok_lines,
+from .common import collect_tempo_changes, get_bar_ticks, load_jsonl, summarize_lengths, write_tok_lines
+from .midi_codec import (
+    TokenizerConfig,
+    _collect_tokenizer_notes,
+    _tokenize_note_events,
+    _transpose_notes,
+    build_vocab,
+    load_config,
+    validate_token_order,
+    velocity_to_bucket,
 )
-from .velocity import VelocityConfig, build_velocity_table, velocity_to_bin
-
-
-@dataclass
-class TokenizerConfig:
-    """分词配置。"""
-
-    midi_root_dir: str = "data/clean"
-    positions_per_bar: int = 32
-    pitch_min: int = 21
-    pitch_max: int = 108
-    duration_bins: List[int] = field(
-        default_factory=lambda: [1, 2, 3, 4, 6, 8, 12, 16, 24, 32]
-    )
-    velocity_bins: int = 16
-    velocity_mu: float = 8.0
-    velocity_center: float = 64.0
-    velocity_radius: float = 63.0
-    tempo_min: int = 40
-    tempo_max: int = 220
-    tempo_step: int = 2
-    inst_classes: List[str] = field(default_factory=lambda: ["PIANO"])
-    default_inst: str = "PIANO"
-    special_tokens: List[str] = field(
-        default_factory=lambda: ["BOS", "EOS", "FIM_HOLE", "FIM_MID"]
-    )
-    include_task_tokens: bool = False
-    task_tokens: List[str] = field(
-        default_factory=lambda: ["TASK_INFILL", "TASK_CONT", "TASK_GEN"]
-    )
-    train_transpose_offsets: List[int] = field(default_factory=list)
-    recursive: bool = True
-    split_files: Dict[str, str] = field(
-        default_factory=lambda: {
-            "train": "data/base/train.jsonl",
-            "valid": "data/base/valid.jsonl",
-            "test": "data/base/test.jsonl",
-            "eval": "data/eval/fixed_eval.jsonl",
-        }
-    )
-
-    @classmethod
-    def from_mapping(cls, data: Dict[str, object]) -> "TokenizerConfig":
-        """从 YAML 字典构建配置，并忽略未知字段。"""
-        valid_keys = {f.name for f in cls.__dataclass_fields__.values()}  # type: ignore[attr-defined]
-        safe = {k: v for k, v in data.items() if k in valid_keys}
-        velocity_cfg = VelocityConfig.from_mapping(data)
-        safe.update(
-            {
-                "velocity_bins": velocity_cfg.num_bins,
-                "velocity_mu": velocity_cfg.mu,
-                "velocity_center": velocity_cfg.center,
-                "velocity_radius": velocity_cfg.half_range,
-            }
-        )
-        cfg = cls(**safe)
-        if cfg.positions_per_bar <= 0:
-            raise ValueError("positions_per_bar 必须为正数")
-        if cfg.tempo_step <= 0:
-            raise ValueError("tempo_step 必须为正数")
-        if cfg.pitch_min > cfg.pitch_max:
-            raise ValueError("pitch_min 不能大于 pitch_max")
-        if cfg.default_inst not in cfg.inst_classes:
-            raise ValueError("default_inst 必须在 inst_classes 内")
-        cfg.train_transpose_offsets = [
-            int(offset)
-            for offset in dict.fromkeys(cfg.train_transpose_offsets)
-            if int(offset) != 0
-        ]
-        return cfg
-
-    def velocity_config(self) -> VelocityConfig:
-        """返回当前 tokenizer 配置对应的力度映射配置。"""
-        cfg = VelocityConfig(
-            num_bins=self.velocity_bins,
-            mu=self.velocity_mu,
-            center=self.velocity_center,
-            half_range=self.velocity_radius,
-        )
-        cfg.validate()
-        return cfg
-
-
-def load_config(path: Path) -> TokenizerConfig:
-    """读取 tokenizer 配置。"""
-    raw = load_yaml_mapping(path, "tokenizer 配置")
-    return TokenizerConfig.from_mapping(raw)
-
-
-def velocity_to_bucket(velocity: int, velocity_config: VelocityConfig) -> int:
-    """将 MIDI velocity 映射到 `VEL_0..N-1`。"""
-    return velocity_to_bin(velocity, velocity_config)
+from .velocity import build_velocity_table
 
 
 def print_velocity_table(config: TokenizerConfig) -> None:
@@ -133,170 +42,6 @@ def print_velocity_table(config: TokenizerConfig) -> None:
     print("\nSample encoding (velocity -> bin):")
     for velocity in [1, 16, 32, 48, 64, 80, 96, 112, 127]:
         print(f"  {velocity:3d} -> VEL_{velocity_to_bucket(velocity, velocity_config):02d}")
-
-
-def bpm_to_token(bpm: float, config: TokenizerConfig) -> str:
-    """将 BPM 映射到离散 `TEMPO_x` token。"""
-    clipped = min(config.tempo_max, max(config.tempo_min, int(round(bpm))))
-    q = int(round((clipped - config.tempo_min) / config.tempo_step))
-    value = config.tempo_min + q * config.tempo_step
-    value = min(config.tempo_max, max(config.tempo_min, value))
-    return f"TEMPO_{value}"
-
-
-def build_vocab(config: TokenizerConfig) -> Dict[str, int]:
-    """构建词表映射 token -> id。"""
-    vocab: List[str] = []
-    vocab.extend(config.special_tokens)
-    if config.include_task_tokens:
-        vocab.extend(config.task_tokens)
-    vocab.append("BAR")
-    vocab.extend([f"POS_{i}" for i in range(config.positions_per_bar)])
-    vocab.extend([f"INST_{x}" for x in config.inst_classes])
-    vocab.extend([f"PITCH_{p}" for p in range(config.pitch_min, config.pitch_max + 1)])
-    vocab.extend([f"DUR_{d}" for d in config.duration_bins])
-    vocab.extend([f"VEL_{i}" for i in range(config.velocity_bins)])
-    for tempo in range(config.tempo_min, config.tempo_max + 1, config.tempo_step):
-        vocab.append(f"TEMPO_{tempo}")
-
-    seen = set()
-    deduped: List[str] = []
-    for token in vocab:
-        if token not in seen:
-            seen.add(token)
-            deduped.append(token)
-    return {token: idx for idx, token in enumerate(deduped)}
-
-
-def _collect_tokenizer_notes(midi: mido.MidiFile, config: TokenizerConfig) -> List[NoteEvent]:
-    """收集落在当前音高范围内、可用于分词的音符事件。"""
-    return [
-        note
-        for note in collect_note_events(midi)
-        if config.pitch_min <= note.pitch <= config.pitch_max and note.duration_tick > 0
-    ]
-
-
-def _transpose_notes(
-    notes: Sequence[NoteEvent], semitone_offset: int, config: TokenizerConfig
-) -> List[NoteEvent] | None:
-    """对音符事件做移调；若超出音域范围则返回 `None`。"""
-    shifted_notes: List[NoteEvent] = []
-    for note in notes:
-        shifted_pitch = note.pitch + semitone_offset
-        if shifted_pitch < config.pitch_min or shifted_pitch > config.pitch_max:
-            return None
-        shifted_notes.append(
-            NoteEvent(
-                start_tick=note.start_tick,
-                end_tick=note.end_tick,
-                pitch=shifted_pitch,
-                velocity=note.velocity,
-            )
-        )
-    return shifted_notes
-
-
-def _tokenize_note_events(
-    notes: Sequence[NoteEvent],
-    tempo_events: Sequence[Tuple[int, float]],
-    bar_ticks: int,
-    config: TokenizerConfig,
-) -> List[str]:
-    """将音符事件与节奏信息编码成 token 序列。"""
-    if not notes:
-        return ["BOS", "EOS"]
-
-    pos_ticks = bar_ticks / config.positions_per_bar
-    velocity_config = config.velocity_config()
-
-    per_bar: Dict[int, List[Tuple[int, int, int, int]]] = defaultdict(list)
-    max_bar_idx = 0
-    for note in notes:
-        bar_idx = note.start_tick // bar_ticks
-        max_bar_idx = max(max_bar_idx, bar_idx)
-        in_bar_tick = note.start_tick % bar_ticks
-        pos = int(round(in_bar_tick / max(1e-9, pos_ticks)))
-        pos = min(config.positions_per_bar - 1, max(0, pos))
-
-        dur_pos = int(round(note.duration_tick / max(1e-9, pos_ticks)))
-        dur_pos = max(1, dur_pos)
-        dur_bin = nearest_value(dur_pos, config.duration_bins)
-        vel_bin = velocity_to_bucket(note.velocity, velocity_config)
-        per_bar[bar_idx].append((pos, note.pitch, dur_bin, vel_bin))
-
-    tokens: List[str] = ["BOS"]
-    first_tempo_token = bpm_to_token(tempo_events[0][1], config)
-    tokens.append(first_tempo_token)
-    last_tempo_token = first_tempo_token
-
-    tempo_idx = 0
-    for bar_idx in range(max_bar_idx + 1):
-        bar_start = bar_idx * bar_ticks
-        while tempo_idx + 1 < len(tempo_events) and tempo_events[tempo_idx + 1][0] <= bar_start:
-            tempo_idx += 1
-        current_tempo_token = bpm_to_token(tempo_events[tempo_idx][1], config)
-
-        tokens.append("BAR")
-        if current_tempo_token != last_tempo_token:
-            tokens.append(current_tempo_token)
-            last_tempo_token = current_tempo_token
-
-        events = per_bar.get(bar_idx, [])
-        events.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
-        for pos, pitch, dur_bin, vel_bin in events:
-            tokens.append(f"POS_{pos}")
-            tokens.append(f"INST_{config.default_inst}")
-            tokens.append(f"PITCH_{pitch}")
-            tokens.append(f"DUR_{dur_bin}")
-            tokens.append(f"VEL_{vel_bin}")
-
-    tokens.append("EOS")
-    return tokens
-
-
-def tokenize_midi(midi: mido.MidiFile, config: TokenizerConfig) -> List[str]:
-    """将单个 MIDI 编码成 token 序列。"""
-    notes = _collect_tokenizer_notes(midi, config)
-    bar_ticks = get_bar_ticks(midi)
-    tempo_events = collect_tempo_changes(midi)
-    return _tokenize_note_events(notes, tempo_events, bar_ticks, config)
-
-
-def validate_token_order(tokens: Sequence[str], vocab: Dict[str, int]) -> Tuple[bool, int]:
-    """校验 token 顺序是否合法，并返回 `(is_valid, oov_count)`。"""
-    oov = sum(1 for token in tokens if token not in vocab)
-    if not tokens or tokens[0] != "BOS":
-        return False, oov
-    if tokens[-1] != "EOS":
-        return False, oov
-
-    idx = 1
-    if idx < len(tokens) - 1 and tokens[idx].startswith("TEMPO_"):
-        idx += 1
-
-    while idx < len(tokens) - 1:
-        if tokens[idx] != "BAR":
-            return False, oov
-        idx += 1
-        if idx < len(tokens) - 1 and tokens[idx].startswith("TEMPO_"):
-            idx += 1
-        while idx < len(tokens) - 1 and tokens[idx].startswith("POS_"):
-            if idx + 4 >= len(tokens):
-                return False, oov
-            if not tokens[idx + 1].startswith("INST_"):
-                return False, oov
-            if not tokens[idx + 2].startswith("PITCH_"):
-                return False, oov
-            if not tokens[idx + 3].startswith("DUR_"):
-                return False, oov
-            if not tokens[idx + 4].startswith("VEL_"):
-                return False, oov
-            idx += 5
-        if idx < len(tokens) - 1 and tokens[idx] != "BAR":
-            return False, oov
-
-    return True, oov
 
 
 def process(
@@ -339,8 +84,12 @@ def process(
         invalid_count = 0
         augmented_rows = 0
         skipped_transpose_rows = 0
-        applied_transpose_counts = {str(offset): 0 for offset in config.train_transpose_offsets}
-        skipped_transpose_counts = {str(offset): 0 for offset in config.train_transpose_offsets}
+        applied_transpose_counts = {
+            str(offset): 0 for offset in config.train_transpose_offsets
+        }
+        skipped_transpose_counts = {
+            str(offset): 0 for offset in config.train_transpose_offsets
+        }
 
         for row_idx, row in enumerate(rows, 1):
             rel = str(row.get("midi_path", "")).strip()
