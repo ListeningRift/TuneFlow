@@ -256,6 +256,27 @@ def _parse_args(*, task_scope: str, argv: list[str] | None = None) -> argparse.N
         ),
     )
     parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.9,
+        help=(
+            "采样温度。`0` 表示贪心解码，`>0` 时启用随机采样。\n"
+            "数值越大越发散，越小越保守。\n"
+            "例子：--temperature 0.9"
+        ),
+    )
+    parser.add_argument(
+        "--top-p",
+        dest="top_p",
+        type=float,
+        default=0.9,
+        help=(
+            "top-p 采样的累计概率阈值，取值范围 `(0, 1]`。\n"
+            "`1.0` 表示不截断，较小值会更保守。\n"
+            "例子：--top-p 0.9"
+        ),
+    )
+    parser.add_argument(
         "--limit-checkpoints",
         type=int,
         default=None,
@@ -316,7 +337,12 @@ def _parse_args(*, task_scope: str, argv: list[str] | None = None) -> argparse.N
             "例子：--prefilter-preserve-earliest 4"
         ),
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if float(args.temperature) < 0.0:
+        parser.error("--temperature must be >= 0.")
+    if not (0.0 < float(args.top_p) <= 1.0):
+        parser.error("--top-p must be within (0, 1].")
+    return args
 
 
 def _load_train_mapping(config_path: Path) -> dict[str, Any]:
@@ -698,6 +724,8 @@ def _evaluate_checkpoint_on_manifest(
                     autocast_context_fn=autocast_context_fn,
                     max_positions=int(config.max_position_embeddings),
                     max_new_tokens=dyn_max_new,
+                    temperature=float(getattr(args, "temperature", 0.0)),
+                    top_p=float(getattr(args, "top_p", 1.0)),
                 )
                 fsm_generated_tokens, fsm_reached_eos, fsm_stats = generate_continuation_tokens_fn(
                     model=model,
@@ -712,6 +740,8 @@ def _evaluate_checkpoint_on_manifest(
                     autocast_context_fn=autocast_context_fn,
                     max_positions=int(config.max_position_embeddings),
                     max_new_tokens=dyn_max_new,
+                    temperature=float(getattr(args, "temperature", 0.0)),
+                    top_p=float(getattr(args, "top_p", 1.0)),
                 )
                 raw_record = build_continuation_trace_fn(
                     prompt_tokens=prompt_tokens,
@@ -827,6 +857,8 @@ def _evaluate_checkpoint_on_manifest(
                     autocast_context_fn=autocast_context_fn,
                     max_positions=int(config.max_position_embeddings),
                     max_new_tokens=dyn_max_new,
+                    temperature=float(getattr(args, "temperature", 0.0)),
+                    top_p=float(getattr(args, "top_p", 1.0)),
                 )
                 fsm_middle_tokens, fsm_reached_eos, fsm_infill_stats = generate_middle_tokens_fn(
                     model=model,
@@ -843,6 +875,8 @@ def _evaluate_checkpoint_on_manifest(
                     autocast_context_fn=autocast_context_fn,
                     max_positions=int(config.max_position_embeddings),
                     max_new_tokens=dyn_max_new,
+                    temperature=float(getattr(args, "temperature", 0.0)),
+                    top_p=float(getattr(args, "top_p", 1.0)),
                 )
                 raw_infill_record = build_infilling_trace_fn(
                     prefix_tokens=prefix_tokens,
@@ -2420,6 +2454,11 @@ def main(*, task_scope: str = "all", argv: list[str] | None = None) -> None:
         "benchmark_configs": {
             "fast": fast_config,
             "formal": formal_config,
+        },
+        "decoding": {
+            "max_new_tokens": int(args.max_new_tokens),
+            "temperature": float(args.temperature),
+            "top_p": float(args.top_p),
         },
         "manifests": {
             "fast_path": str(fast_manifest_path),

@@ -1,4 +1,4 @@
-"""Finite-state grammar helpers for TuneFlow token sequences."""
+"""TuneFlow token 序列的有限状态语法辅助工具。"""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ TERMINAL = "terminal"
 
 @dataclass(frozen=True)
 class GreedyMaskDecision:
-    """Masked greedy decision plus diagnostics about the raw logits."""
+    """带合法性掩码的单步决策结果，以及原始 logits 的诊断信息。"""
 
     next_id: int | None
     raw_top1_id: int | None
@@ -30,7 +30,7 @@ class GreedyMaskDecision:
 
 
 class TuneFlowGrammarFSM:
-    """DFA for the TuneFlow token grammar."""
+    """TuneFlow token 语法对应的 DFA。"""
 
     _NON_TERMINAL_STATES = (
         EXPECT_BOS,
@@ -89,7 +89,7 @@ class TuneFlowGrammarFSM:
 
     @classmethod
     def from_vocab(cls, token_to_id: Mapping[str, int]) -> "TuneFlowGrammarFSM":
-        """Build an FSM from the tokenizer vocab mapping."""
+        """根据 tokenizer 词表映射构建 FSM。"""
 
         return cls(token_to_id)
 
@@ -105,12 +105,12 @@ class TuneFlowGrammarFSM:
             self._category_by_id[int(token_id)] = category
 
     def allowed_token_ids(self, state: str) -> tuple[int, ...]:
-        """Return the token ids allowed by the grammar in the current state."""
+        """返回当前状态下语法允许的 token id。"""
 
         return self._allowed_ids_by_state.get(state, ())
 
     def transition(self, state: str, token_id: int) -> str | None:
-        """Run one DFA transition; return None when the token is illegal."""
+        """执行一次 DFA 状态转移；若 token 非法则返回 `None`。"""
 
         category = self._category_by_id.get(int(token_id))
         if category is None:
@@ -169,7 +169,7 @@ class TuneFlowGrammarFSM:
         return None
 
     def state_after_prefix_tokens(self, tokens: Sequence[str]) -> str | None:
-        """Return the DFA state after consuming a token prefix."""
+        """返回消费完给定 token 前缀后的 DFA 状态。"""
 
         state = EXPECT_BOS
         for token in tokens:
@@ -182,7 +182,7 @@ class TuneFlowGrammarFSM:
         return state
 
     def state_after_prefix_ids(self, token_ids: Sequence[int]) -> str | None:
-        """Return the DFA state after consuming a token-id prefix."""
+        """返回消费完给定 token id 前缀后的 DFA 状态。"""
 
         state = EXPECT_BOS
         for token_id in token_ids:
@@ -192,7 +192,7 @@ class TuneFlowGrammarFSM:
         return state
 
     def inspect_complete_tokens(self, tokens: Sequence[str]) -> tuple[bool, str]:
-        """Validate a complete sequence and return the first failure reason."""
+        """校验完整序列，并返回首个失败原因。"""
 
         if not tokens:
             return False, "empty_sequence"
@@ -213,7 +213,7 @@ class TuneFlowGrammarFSM:
         return True, "ok"
 
     def compatible_states_for_suffix_tokens(self, suffix_tokens: Sequence[str]) -> set[str]:
-        """Return states from which `suffix + EOS` can complete legally."""
+        """返回哪些状态可以在接上 `suffix + EOS` 后合法结束。"""
 
         suffix_ids: list[int] = []
         for token in suffix_tokens:
@@ -224,7 +224,7 @@ class TuneFlowGrammarFSM:
         return self.compatible_states_for_suffix_ids(suffix_ids)
 
     def compatible_states_for_suffix_ids(self, suffix_ids: Sequence[int]) -> set[str]:
-        """Return states from which `suffix + EOS` can complete legally."""
+        """返回哪些状态可以在接上 `suffix id + EOS` 后合法结束。"""
 
         required_ids = [int(token_id) for token_id in suffix_ids]
         required_ids.append(self.eos_id)
@@ -241,13 +241,13 @@ class TuneFlowGrammarFSM:
         return reachable
 
     def bridgeable_states_for_suffix_tokens(self, suffix_tokens: Sequence[str]) -> set[str]:
-        """返回仍可在不发出 EOS 的前提下走到 suffix 兼容态的状态集合。"""
+        """返回无需先输出 EOS、仍可走到 suffix 兼容状态的状态集合。"""
 
         compatible_states = self.compatible_states_for_suffix_tokens(suffix_tokens)
         return self.bridgeable_states_for_target_states(compatible_states)
 
     def bridgeable_states_for_target_states(self, target_states: set[str]) -> set[str]:
-        """返回可经由零到多步非 EOS 转移到达目标状态的状态集合。"""
+        """返回可通过零到多步非 EOS 转移到达目标状态的状态集合。"""
 
         if not target_states:
             return set()
@@ -311,27 +311,91 @@ class TuneFlowGrammarFSM:
 
 
 def select_masked_argmax(logits, allowed_token_ids: Sequence[int]) -> GreedyMaskDecision:
-    """Greedy argmax with a hard legality mask plus diagnostics."""
+    """兼容旧接口的贪心 `argmax` 包装器。"""
+
+    return select_masked_token(logits, allowed_token_ids, temperature=0.0, top_p=1.0)
+
+
+def select_token(
+    logits,
+    *,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
+    generator=None,
+) -> GreedyMaskDecision:
+    """在整个词表上采样一个 token。"""
+
+    flat_logits = logits.reshape(-1)
+    return select_masked_token(
+        flat_logits,
+        None,
+        temperature=temperature,
+        top_p=top_p,
+        generator=generator,
+    )
+
+
+def select_masked_token(
+    logits,
+    allowed_token_ids: Sequence[int] | None,
+    *,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
+    generator=None,
+) -> GreedyMaskDecision:
+    """在硬合法性掩码约束下采样一个合法 token，并返回诊断信息。"""
 
     import torch
+
+    temperature = float(temperature)
+    top_p = float(top_p)
+    if temperature < 0.0:
+        raise ValueError(f"temperature must be >= 0, got {temperature}")
+    if not (0.0 < top_p <= 1.0):
+        raise ValueError(f"top_p must be within (0, 1], got {top_p}")
 
     flat_logits = logits.reshape(-1)
     if flat_logits.numel() == 0:
         return GreedyMaskDecision(next_id=None, raw_top1_id=None, raw_top1_is_legal=False, legal_mass=0.0)
 
     raw_top1_id = int(torch.argmax(flat_logits).item())
-    if not allowed_token_ids:
+    if allowed_token_ids is not None and not allowed_token_ids:
         return GreedyMaskDecision(next_id=None, raw_top1_id=raw_top1_id, raw_top1_is_legal=False, legal_mass=0.0)
 
-    legal_mask = torch.zeros_like(flat_logits, dtype=torch.bool)
-    legal_mask[list(allowed_token_ids)] = True
-    legal_mass = float(torch.softmax(flat_logits.float(), dim=-1)[legal_mask].sum().item())
-    raw_top1_is_legal = bool(legal_mask[raw_top1_id].item())
+    if allowed_token_ids is None:
+        legal_mask = torch.ones_like(flat_logits, dtype=torch.bool)
+        legal_mass = 1.0
+        raw_top1_is_legal = True
+    else:
+        legal_mask = torch.zeros_like(flat_logits, dtype=torch.bool)
+        legal_mask[list(allowed_token_ids)] = True
+        legal_mass = float(torch.softmax(flat_logits.float(), dim=-1)[legal_mask].sum().item())
+        raw_top1_is_legal = bool(legal_mask[raw_top1_id].item())
 
-    min_value = torch.finfo(flat_logits.dtype).min
-    masked_logits = torch.full_like(flat_logits, min_value)
-    masked_logits[legal_mask] = flat_logits[legal_mask]
-    next_id = int(torch.argmax(masked_logits).item())
+    legal_ids = torch.nonzero(legal_mask, as_tuple=False).reshape(-1)
+    legal_logits = flat_logits[legal_ids].float()
+    if temperature == 0.0 or legal_logits.numel() == 1:
+        next_id = int(legal_ids[int(torch.argmax(legal_logits).item())].item())
+    else:
+        scaled_logits = legal_logits / temperature
+        legal_probs = torch.softmax(scaled_logits, dim=-1)
+        if top_p < 1.0:
+            sorted_probs, sorted_indices = torch.sort(legal_probs, descending=True)
+            sorted_remove = torch.cumsum(sorted_probs, dim=-1) > top_p
+            if sorted_remove.numel() > 0:
+                sorted_remove[1:] = sorted_remove[:-1].clone()
+                sorted_remove[0] = False
+            filtered_probs = sorted_probs.masked_fill(sorted_remove, 0.0)
+            filtered_mass = float(filtered_probs.sum().item())
+            if filtered_mass <= 0.0:
+                chosen_legal_index = int(sorted_indices[0].item())
+            else:
+                filtered_probs = filtered_probs / filtered_probs.sum()
+                sampled_sorted_index = int(torch.multinomial(filtered_probs, 1, generator=generator).item())
+                chosen_legal_index = int(sorted_indices[sampled_sorted_index].item())
+        else:
+            chosen_legal_index = int(torch.multinomial(legal_probs, 1, generator=generator).item())
+        next_id = int(legal_ids[chosen_legal_index].item())
     return GreedyMaskDecision(
         next_id=next_id,
         raw_top1_id=raw_top1_id,

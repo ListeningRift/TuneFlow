@@ -1,8 +1,7 @@
-"""Shared decoding helpers for TuneFlow benchmark evaluation."""
+"""TuneFlow benchmark 评估共用的解码辅助函数。"""
 
 from __future__ import annotations
 
-import random
 import re
 from pathlib import Path
 from typing import Any
@@ -18,7 +17,7 @@ _SAFE_CLOSE_STATES = {
 
 
 def checkpoint_sort_key(path: Path) -> tuple[int, int, str]:
-    """Sort checkpoints by step first, then by special aliases."""
+    """按 step 优先、再按特殊别名顺序对 checkpoint 排序。"""
     match = _STEP_RE.match(path.name)
     if match:
         return (0, int(match.group(1)), path.name)
@@ -32,7 +31,7 @@ def checkpoint_sort_key(path: Path) -> tuple[int, int, str]:
 
 
 def sample_step_checkpoints(step_paths: list[Path], sample_count: int) -> list[Path]:
-    """Sample step checkpoints uniformly while keeping endpoints."""
+    """在保留首尾 checkpoint 的前提下，对 step checkpoint 做均匀抽样。"""
     if sample_count <= 0 or len(step_paths) <= sample_count:
         return step_paths
     if sample_count == 1:
@@ -53,7 +52,7 @@ def discover_checkpoints(
     *,
     include_aliases: bool = False,
 ) -> list[Path]:
-    """Discover checkpoints under a run directory."""
+    """在 run 目录下发现并筛选 checkpoint。"""
     paths = sorted([path for path in checkpoint_dir.glob("*.pt") if path.is_file()], key=checkpoint_sort_key)
     step_paths = [path for path in paths if _STEP_RE.match(path.name)]
     extra_paths = [path for path in paths if not _STEP_RE.match(path.name)]
@@ -72,7 +71,7 @@ def discover_checkpoints(
 
 
 def load_vocab(vocab_path: Path) -> tuple[dict[str, int], list[str]]:
-    """Load tokenizer vocab and build token/id mappings."""
+    """加载 tokenizer 词表，并构建 token/id 双向映射。"""
     import json
 
     payload = json.loads(vocab_path.read_text(encoding="utf-8"))
@@ -94,7 +93,7 @@ def load_vocab(vocab_path: Path) -> tuple[dict[str, int], list[str]]:
 
 
 def continuation_eos_bias(*, generated_len: int, max_can_generate: int, fsm_state: str | None) -> float:
-    """Length-aware EOS bias for FSM continuation decoding."""
+    """为 FSM 续写解码提供与长度相关的 EOS 偏置。"""
     if max_can_generate <= 0 or generated_len < 0:
         return 0.0
 
@@ -117,7 +116,7 @@ def continuation_eos_bias(*, generated_len: int, max_can_generate: int, fsm_stat
 
 
 def should_force_safe_boundary_stop(*, generated_len: int, max_can_generate: int, fsm_state: str | None) -> bool:
-    """Stop deterministically at a safe boundary near budget exhaustion."""
+    """在预算将耗尽时，是否应在安全边界处确定性停止。"""
     if fsm_state not in _SAFE_CLOSE_STATES:
         return False
     if generated_len <= 0 or max_can_generate <= 0:
@@ -167,9 +166,11 @@ def generate_continuation_tokens(
     autocast_context_fn,
     max_positions: int,
     max_new_tokens: int,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
 ) -> tuple[list[str], bool, dict[str, float | int]]:
-    """Greedy continuation decoding with optional grammar constraints."""
-    from src.decoding import select_masked_argmax
+    """使用温度和 top-p 采样执行续写解码，可选启用语法约束。"""
+    from src.decoding import select_masked_token, select_token
 
     prompt_ids: list[int] = []
     for token in prompt_tokens:
@@ -245,7 +246,10 @@ def generate_continuation_tokens(
             past_key_values = outputs.past_key_values
             step_logits = outputs.logits[0, -1, :]
             if grammar_fsm is None:
-                next_id = int(torch_mod.argmax(step_logits, dim=-1).item())
+                decision = select_token(step_logits, temperature=temperature, top_p=top_p)
+                if decision.next_id is None:
+                    return generated_tokens, False, stats
+                next_id = int(decision.next_id)
             else:
                 if grammar_fsm.eos_id in grammar_fsm.allowed_token_ids(fsm_state):
                     eos_bias = continuation_eos_bias(
@@ -258,7 +262,12 @@ def generate_continuation_tokens(
                         step_logits[grammar_fsm.eos_id] = step_logits[grammar_fsm.eos_id] + float(eos_bias)
                         stats["eos_bias_step_count"] = int(stats["eos_bias_step_count"]) + 1
                 allowed_ids = grammar_fsm.allowed_token_ids(fsm_state)
-                decision = select_masked_argmax(step_logits, allowed_ids)
+                decision = select_masked_token(
+                    step_logits,
+                    allowed_ids,
+                    temperature=temperature,
+                    top_p=top_p,
+                )
                 stats["step_count"] = int(stats["step_count"]) + 1
                 stats["legal_mass_sum"] = float(stats["legal_mass_sum"]) + float(decision.legal_mass)
                 if not decision.raw_top1_is_legal:
@@ -320,7 +329,7 @@ def build_continuation_trace(
     grammar_fsm,
     extra_fields: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Build a structured record for one continuation decode."""
+    """为单条续写解码构建结构化记录。"""
     reconstructed = [*prompt_tokens, *generated_tokens, "EOS"] if reached_eos else [*prompt_tokens, *generated_tokens]
     appended_eos_tokens = [*prompt_tokens, *generated_tokens, "EOS"]
     append_eos_would_validate, append_eos_syntax_reason = grammar_fsm.inspect_complete_tokens(appended_eos_tokens)
@@ -382,9 +391,11 @@ def generate_middle_tokens(
     autocast_context_fn,
     max_positions: int,
     max_new_tokens: int,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
 ) -> tuple[list[str], bool, dict[str, float | int]]:
-    """Greedy infilling middle decoding with optional grammar constraints."""
-    from src.decoding import select_masked_argmax
+    """使用温度和 top-p 采样执行中间补全解码，可选启用语法约束。"""
+    from src.decoding import select_masked_token, select_token
 
     prompt_ids: list[int] = []
     for token in prompt_tokens:
@@ -441,7 +452,10 @@ def generate_middle_tokens(
             past_key_values = outputs.past_key_values
             step_logits = outputs.logits[0, -1, :]
             if grammar_fsm is None:
-                next_id = int(torch_mod.argmax(step_logits, dim=-1).item())
+                decision = select_token(step_logits, temperature=temperature, top_p=top_p)
+                if decision.next_id is None:
+                    return middle_tokens, False, stats
+                next_id = int(decision.next_id)
             else:
                 allowed_ids: list[int] = []
                 for token_id in grammar_fsm.allowed_token_ids(fsm_state):
@@ -453,7 +467,12 @@ def generate_middle_tokens(
                 if fsm_state in compatible_states:
                     allowed_ids.append(grammar_fsm.eos_id)
 
-                decision = select_masked_argmax(step_logits, allowed_ids)
+                decision = select_masked_token(
+                    step_logits,
+                    allowed_ids,
+                    temperature=temperature,
+                    top_p=top_p,
+                )
                 stats["step_count"] = int(stats["step_count"]) + 1
                 stats["legal_mass_sum"] = float(stats["legal_mass_sum"]) + float(decision.legal_mass)
                 if not decision.raw_top1_is_legal:
@@ -503,7 +522,7 @@ def build_infilling_trace(
     grammar_fsm,
     extra_fields: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Build a structured record for one infilling decode."""
+    """为单条补全解码构建结构化记录。"""
     reconstructed = [*prefix_tokens, *generated_middle_tokens, *suffix_tokens, "EOS"]
     is_valid, syntax_reason = grammar_fsm.inspect_complete_tokens(reconstructed)
     failure_reason = ("ok" if is_valid else "syntax_invalid")

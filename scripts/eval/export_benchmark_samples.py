@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""只重导出指定 checkpoint 的 benchmark samples，不重跑完整 ranking。"""
+"""只重导出指定 checkpoint 的 benchmark samples，不重跑完整排名。"""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from typing import Any
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "只重放指定 checkpoint 的少量 sample case 来重新导出 benchmark samples，"
+            "只重放指定 checkpoint 的少量样本用例，重新导出 benchmark samples，"
             "跳过 fast/formal 排名和图表生成。"
         )
     )
@@ -75,7 +75,7 @@ def _parse_args() -> argparse.Namespace:
         "--max-new-tokens",
         type=int,
         default=128,
-        help="每个 sample case 最多生成多少 token。",
+        help="每个样本用例最多生成多少 token。",
     )
     parser.add_argument(
         "--vocab-path",
@@ -83,7 +83,25 @@ def _parse_args() -> argparse.Namespace:
         default=Path("data/tokenized/tokenizer_vocab.json"),
         help="tokenizer 词表路径。",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.0,
+        help="采样温度。`0` 表示贪心解码，`>0` 时启用随机采样。",
+    )
+    parser.add_argument(
+        "--top-p",
+        dest="top_p",
+        type=float,
+        default=1.0,
+        help="top-p 采样阈值，取值范围 `(0, 1]`。",
+    )
+    args = parser.parse_args()
+    if float(args.temperature) < 0.0:
+        parser.error("--temperature must be >= 0.")
+    if not (0.0 < float(args.top_p) <= 1.0):
+        parser.error("--top-p must be within (0, 1].")
+    return args
 
 
 def _parse_checkpoint_names(raw_value: str | None) -> list[str]:
@@ -212,6 +230,8 @@ def main() -> None:
         device=args.device,
         precision=args.precision,
         max_new_tokens=int(args.max_new_tokens),
+        temperature=float(args.temperature),
+        top_p=float(args.top_p),
         prefilter_top_k_by_valid_loss=prefilter_top_k,
         prefilter_preserve_earliest=4,
     )

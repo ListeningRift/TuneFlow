@@ -118,9 +118,7 @@ outputs/benchmark/<run_id>/
 如果你想把 sample JSON 里的完整序列直接导出为 MIDI 来听效果，可以使用：
 
 ```bash
-python scripts/eval/export_tokens_to_midi.py \
-  --input-json outputs/benchmark/base_full/samples/final_top3/step_100000/continuation.json \
-  --output outputs/debug/sample_case_all
+python scripts/eval/export_tokens_to_midi.py --input-json outputs/benchmark/base_full/samples/final_top3/step_100000/continuation.json --output outputs/debug/sample_case_all
 ```
 
 不传 `--case-index` 时，会把 JSON 里的所有 case 都导出到目标目录：
@@ -131,10 +129,7 @@ python scripts/eval/export_tokens_to_midi.py \
 如果只想导出单条：
 
 ```bash
-python scripts/eval/export_tokens_to_midi.py \
-  --input-json outputs/benchmark/base_full/samples/final_top3/step_100000/continuation.json \
-  --case-index 0 \
-  --output outputs/debug/sample_case_0.mid
+python scripts/eval/export_tokens_to_midi.py --input-json outputs/benchmark/base_full/samples/final_top3/step_100000/continuation.json --case-index 0 --output outputs/debug/sample_case_0.mid
 ```
 
 这时会同时生成：
