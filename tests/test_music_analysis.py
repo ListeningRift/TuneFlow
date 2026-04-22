@@ -4,8 +4,10 @@ import random
 import unittest
 
 from src.music_analysis import (
+    KeyAnalysisConfig,
     PhraseAnalysisConfig,
     PhraseWindowPolicy,
+    analyze_key_timeline,
     analyze_phrase_candidates,
     extract_phrase,
     sample_phrase_window,
@@ -69,6 +71,72 @@ def _long_phrase_source_tokens() -> list[str]:
         tokens.extend(_bar(*events, tempo=tempo))
     tokens.append("EOS")
     return tokens
+
+
+def _bars_to_tokens(bar_specs: list[list[tuple[int, int, int]]], *, append_eos: bool = True) -> list[str]:
+    tokens = ["BOS", "TEMPO_120"]
+    for bar_events in bar_specs:
+        tokens.extend(_bar(*bar_events))
+    if append_eos:
+        tokens.append("EOS")
+    return tokens
+
+
+def _c_major_tokens() -> list[str]:
+    return _bars_to_tokens(
+        [
+            [(0, 60, 12), (8, 64, 8), (16, 67, 12)],
+            [(0, 57, 12), (8, 60, 8), (16, 64, 12)],
+            [(0, 65, 12), (8, 69, 8), (16, 72, 12)],
+            [(0, 60, 12), (8, 64, 8), (16, 67, 12)],
+        ]
+    )
+
+
+def _a_minor_tokens() -> list[str]:
+    return _bars_to_tokens(
+        [
+            [(0, 57, 12), (8, 60, 8), (16, 64, 12)],
+            [(0, 57, 12), (8, 64, 8), (16, 69, 12)],
+            [(0, 55, 12), (8, 60, 8), (16, 64, 12)],
+            [(0, 57, 12), (8, 60, 8), (16, 64, 12)],
+        ]
+    )
+
+
+def _c_to_g_major_tokens() -> list[str]:
+    return _bars_to_tokens(
+        [
+            [(0, 60, 12), (8, 64, 8), (16, 67, 12)],
+            [(0, 57, 12), (8, 60, 8), (16, 64, 12)],
+            [(0, 65, 12), (8, 69, 8), (16, 72, 12)],
+            [(0, 60, 12), (8, 64, 8), (16, 67, 12)],
+            [(0, 67, 12), (8, 71, 8), (16, 74, 12)],
+            [(0, 64, 12), (8, 67, 8), (16, 71, 12)],
+            [(0, 60, 12), (8, 67, 8), (16, 71, 12)],
+            [(0, 67, 12), (8, 71, 8), (16, 74, 12)],
+        ]
+    )
+
+
+def _single_misleading_bar_tokens() -> list[str]:
+    return _bars_to_tokens(
+        [
+            [(0, 60, 12), (8, 64, 8), (16, 67, 12)],
+            [(0, 57, 12), (8, 60, 8), (16, 64, 12)],
+            [(0, 65, 12), (8, 69, 8), (16, 72, 12)],
+            [(0, 60, 12), (8, 64, 8), (16, 67, 12)],
+            [(0, 67, 12), (8, 71, 8), (16, 66, 12)],
+            [(0, 60, 12), (8, 64, 8), (16, 67, 12)],
+            [(0, 57, 12), (8, 60, 8), (16, 64, 12)],
+            [(0, 65, 12), (8, 69, 8), (16, 72, 12)],
+        ]
+    )
+
+
+def _ambiguous_tokens() -> list[str]:
+    chromatic_bar = [(index * 2, 60 + index, 1) for index in range(12)]
+    return _bars_to_tokens([chromatic_bar, chromatic_bar, chromatic_bar, chromatic_bar])
 
 
 class MusicAnalysisTests(unittest.TestCase):
@@ -215,6 +283,55 @@ class MusicAnalysisTests(unittest.TestCase):
         self.assertIn(token_to_id["FIM_HOLE"], fim_input)
         self.assertIn(token_to_id["FIM_MID"], fim_input)
         self.assertIn(-100, fim_labels)
+
+    def test_key_timeline_detects_single_major_key(self) -> None:
+        analysis = analyze_key_timeline(_c_major_tokens())
+        self.assertEqual(analysis.initial_key, "C:maj")
+        self.assertEqual(len(analysis.segments), 1)
+        self.assertEqual(analysis.segments[0].key, "C:maj")
+        self.assertEqual(len(analysis.modulation_points), 0)
+
+    def test_key_timeline_detects_single_minor_key(self) -> None:
+        analysis = analyze_key_timeline(_a_minor_tokens())
+        self.assertEqual(analysis.initial_key, "A:min")
+        self.assertEqual(len(analysis.segments), 1)
+        self.assertEqual(analysis.segments[0].key, "A:min")
+
+    def test_key_timeline_detects_modulation_point(self) -> None:
+        analysis = analyze_key_timeline(_c_to_g_major_tokens())
+        self.assertEqual(analysis.initial_key, "C:maj")
+        self.assertEqual([segment.key for segment in analysis.segments], ["C:maj", "G:maj"])
+        self.assertEqual(len(analysis.modulation_points), 1)
+        self.assertEqual(analysis.modulation_points[0].from_key, "C:maj")
+        self.assertEqual(analysis.modulation_points[0].to_key, "G:maj")
+        self.assertGreaterEqual(analysis.modulation_points[0].bar_index, 3)
+
+    def test_key_timeline_ignores_single_misleading_bar(self) -> None:
+        analysis = analyze_key_timeline(_single_misleading_bar_tokens())
+        self.assertEqual(len(analysis.segments), 1)
+        self.assertEqual(analysis.segments[0].key, "C:maj")
+        self.assertEqual(len(analysis.modulation_points), 0)
+
+    def test_key_timeline_marks_ambiguous_sequence_uncertain(self) -> None:
+        analysis = analyze_key_timeline(_ambiguous_tokens())
+        self.assertEqual(analysis.initial_key, "uncertain")
+        self.assertFalse(analysis.segments)
+        self.assertTrue(any(frame.is_uncertain for frame in analysis.frames))
+
+    def test_key_timeline_accepts_missing_terminal_eos(self) -> None:
+        tokens = _c_major_tokens()[:-1]
+        analysis = analyze_key_timeline(tokens)
+        self.assertEqual(analysis.initial_key, "C:maj")
+        self.assertEqual(len(analysis.segments), 1)
+
+    def test_key_timeline_keeps_finer_frames_than_segments(self) -> None:
+        analysis = analyze_key_timeline(_c_major_tokens(), config=KeyAnalysisConfig(window_bars=1.0, hop_bars=0.5))
+        self.assertGreater(len(analysis.frames), len(analysis.segments))
+        self.assertEqual(len(analysis.frames), 7)
+        self.assertEqual(analysis.segments[0].start_bar, 0)
+        self.assertEqual(analysis.segments[0].start_pos, 0)
+        self.assertEqual(analysis.segments[0].end_bar, 4)
+        self.assertEqual(analysis.segments[0].end_pos, 0)
 
 
 if __name__ == "__main__":

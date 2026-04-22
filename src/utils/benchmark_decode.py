@@ -152,6 +152,55 @@ def _forward_decode_step(
         )
 
 
+def _fallback_bridgeable_states_for_suffix_tokens(
+    grammar_fsm,
+    *,
+    suffix_tokens: list[str],
+    start_state: str | None,
+) -> set[str]:
+    """为缺少桥接辅助接口的旧版/简化 FSM 近似推断可桥接状态集合。"""
+    if start_state is None:
+        return set()
+
+    compatible_states = grammar_fsm.compatible_states_for_suffix_tokens(suffix_tokens)
+    if not compatible_states:
+        return set()
+
+    # 先从当前起始状态出发，只沿着非 EOS 转移做一次可达搜索，
+    # 避免把理论上兼容、但实际上从当前前缀根本走不到的状态误算进去。
+    reachable_states: set[str] = {start_state}
+    frontier = [start_state]
+    while frontier:
+        state = frontier.pop()
+        for token_id in grammar_fsm.allowed_token_ids(state):
+            if token_id == grammar_fsm.eos_id:
+                continue
+            next_state = grammar_fsm.transition(state, token_id)
+            if next_state is None or next_state in reachable_states:
+                continue
+            reachable_states.add(next_state)
+            frontier.append(next_state)
+
+    # 先取“既兼容 suffix，又从当前前缀能到达”的状态作为种子，
+    # 再反向扩一层，把能够通过若干个非 EOS token 走到这些种子状态的前置状态也纳入 bridgeable。
+    bridgeable_states = {state for state in compatible_states if state in reachable_states}
+    changed = True
+    while changed:
+        changed = False
+        for state in list(reachable_states):
+            if state in bridgeable_states:
+                continue
+            for token_id in grammar_fsm.allowed_token_ids(state):
+                if token_id == grammar_fsm.eos_id:
+                    continue
+                next_state = grammar_fsm.transition(state, token_id)
+                if next_state in bridgeable_states:
+                    bridgeable_states.add(state)
+                    changed = True
+                    break
+    return bridgeable_states
+
+
 def generate_continuation_tokens(
     *,
     model,
@@ -428,7 +477,14 @@ def generate_middle_tokens(
     if grammar_fsm is not None:
         fsm_state = grammar_fsm.state_after_prefix_tokens(prefix_tokens)
         compatible_states = grammar_fsm.compatible_states_for_suffix_tokens(suffix_tokens)
-        bridgeable_states = grammar_fsm.bridgeable_states_for_suffix_tokens(suffix_tokens)
+        if hasattr(grammar_fsm, "bridgeable_states_for_suffix_tokens"):
+            bridgeable_states = grammar_fsm.bridgeable_states_for_suffix_tokens(suffix_tokens)
+        else:
+            bridgeable_states = _fallback_bridgeable_states_for_suffix_tokens(
+                grammar_fsm,
+                suffix_tokens=suffix_tokens,
+                start_state=fsm_state,
+            )
         if fsm_state is None or not compatible_states or not bridgeable_states or fsm_state not in bridgeable_states:
             stats["dead_end_count"] = 1
             return middle_tokens, False, stats
