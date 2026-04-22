@@ -207,6 +207,56 @@ TuneFlow benchmark 现在把指标分成 5 层：
 
 如果你看到 `continuation_pitch_collapse_coverage` 或 `infilling_pitch_collapse_coverage` 很低，说明这批样本中可用于 pitch collapse 判断的片段偏少，结论要更保守。
 
+### 额外补进的 rhythm richness / repetition 指标
+
+这次 benchmark 还补进了一组专门抓“节奏太保守”和“局部 pattern 重复过多”的指标。它们仍然是诊断项，不直接等同于人工听感，但能帮助更早发现“都合法、却越来越像模板”的退化。
+
+#### `onset_position_l1_distance`
+- 方向：越低越好
+- 定义：生成结果与目标片段在 bar 内起拍位置分布之间的 L1 距离
+- 抓什么问题：虽然事件数量差不多，但起拍习惯明显漂移，例如过度集中在固定拍点
+
+#### `onset_position_entropy`
+- 方向：越高越好
+- 定义：生成片段起拍位置分布的归一化熵
+- 抓什么问题：起拍位置过于单一，几乎总落在极少数位置
+
+#### `bar_start_onset_ratio`
+- 方向：越低越好
+- 定义：所有 onset 中落在 bar 起点的位置占比
+- 抓什么问题：几乎“每小节都从头砸一下”，节奏落点过度保守
+
+#### `strong_beat_onset_ratio`
+- 方向：越低越好
+- 定义：所有 onset 中落在强拍网格的位置占比
+- 抓什么问题：几乎全部踩在整拍 / 强拍，弱拍和切分很少出现
+- 注意：它不是越低越绝对更好，只是用于抓“过度保守”的极端情况
+
+#### `duration_diversity_score`
+- 方向：越高越好
+- 定义：基于时值类别 entropy 和 unique duration 数量构成的 `0-1` 分数
+- 抓什么问题：时值种类过少，几乎只有单一时值反复出现
+
+#### `rhythm_diversity_score`
+- 方向：越高越好
+- 定义：综合起拍位置熵、起拍位置覆盖、时值多样性，以及对“全踩强拍 / 全在 bar 起点”的惩罚得到的 `0-1` 代理分数
+- 抓什么问题：整体节奏组织是否显得僵硬、单一、过度模板化
+
+#### `event_ngram_repeat_ratio`
+- 方向：越低越好
+- 定义：事件级 n-gram 重复占比，当前使用 `POS + PITCH + DUR` 的 bigram / trigram 额外重复比例
+- 抓什么问题：局部事件 pattern 机械复读，例如同一小动机被连续原样拼贴
+
+#### `rhythm_ngram_repeat_ratio`
+- 方向：越低越好
+- 定义：节奏级 n-gram 重复占比，当前使用 `POS + DUR` 的 bigram / trigram 额外重复比例
+- 抓什么问题：音高不一定塌缩，但节奏骨架在短窗口内反复复制
+
+#### `rhythm_metric_coverage` / `repetition_metric_coverage`
+- 方向：越高越好
+- 含义：有多少样本长度足够，能够稳定计算节奏丰富性 / 重复度指标
+- 用法：如果 coverage 很低，说明这批样本偏短，对这些指标的结论要更保守
+
 ## 5. absolute capability panel
 
 `absolute_score` 由 6 个固定能力维度组成：

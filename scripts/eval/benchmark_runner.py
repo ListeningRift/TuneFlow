@@ -464,12 +464,42 @@ def _to_jsonable_result(result: dict[str, Any]) -> dict[str, Any]:
         "continuation_most_common_pitch_ratio": result.get("continuation_most_common_pitch_ratio"),
         "continuation_longest_same_pitch_run_ratio": result.get("continuation_longest_same_pitch_run_ratio"),
         "continuation_pitch_diversity_score": result.get("continuation_pitch_diversity_score"),
+        "continuation_onset_position_l1_distance": result.get("continuation_onset_position_l1_distance"),
+        "continuation_onset_position_entropy": result.get("continuation_onset_position_entropy"),
+        "continuation_bar_start_onset_ratio": result.get("continuation_bar_start_onset_ratio"),
+        "continuation_strong_beat_onset_ratio": result.get("continuation_strong_beat_onset_ratio"),
+        "continuation_duration_diversity_score": result.get("continuation_duration_diversity_score"),
+        "continuation_rhythm_diversity_score": result.get("continuation_rhythm_diversity_score"),
+        "continuation_rhythm_metric_coverage": result.get("continuation_rhythm_metric_coverage"),
+        "continuation_event_ngram_repeat_ratio": result.get("continuation_event_ngram_repeat_ratio"),
+        "continuation_rhythm_ngram_repeat_ratio": result.get("continuation_rhythm_ngram_repeat_ratio"),
+        "continuation_repetition_metric_coverage": result.get("continuation_repetition_metric_coverage"),
         "infilling_most_common_pitch_ratio": result.get("infilling_most_common_pitch_ratio"),
         "infilling_longest_same_pitch_run_ratio": result.get("infilling_longest_same_pitch_run_ratio"),
         "infilling_pitch_diversity_score": result.get("infilling_pitch_diversity_score"),
+        "infilling_onset_position_l1_distance": result.get("infilling_onset_position_l1_distance"),
+        "infilling_onset_position_entropy": result.get("infilling_onset_position_entropy"),
+        "infilling_bar_start_onset_ratio": result.get("infilling_bar_start_onset_ratio"),
+        "infilling_strong_beat_onset_ratio": result.get("infilling_strong_beat_onset_ratio"),
+        "infilling_duration_diversity_score": result.get("infilling_duration_diversity_score"),
+        "infilling_rhythm_diversity_score": result.get("infilling_rhythm_diversity_score"),
+        "infilling_rhythm_metric_coverage": result.get("infilling_rhythm_metric_coverage"),
+        "infilling_event_ngram_repeat_ratio": result.get("infilling_event_ngram_repeat_ratio"),
+        "infilling_rhythm_ngram_repeat_ratio": result.get("infilling_rhythm_ngram_repeat_ratio"),
+        "infilling_repetition_metric_coverage": result.get("infilling_repetition_metric_coverage"),
         "overall_most_common_pitch_ratio": result.get("overall_most_common_pitch_ratio"),
         "overall_longest_same_pitch_run_ratio": result.get("overall_longest_same_pitch_run_ratio"),
         "overall_pitch_diversity_score": result.get("overall_pitch_diversity_score"),
+        "overall_onset_position_l1_distance": result.get("overall_onset_position_l1_distance"),
+        "overall_onset_position_entropy": result.get("overall_onset_position_entropy"),
+        "overall_bar_start_onset_ratio": result.get("overall_bar_start_onset_ratio"),
+        "overall_strong_beat_onset_ratio": result.get("overall_strong_beat_onset_ratio"),
+        "overall_duration_diversity_score": result.get("overall_duration_diversity_score"),
+        "overall_rhythm_diversity_score": result.get("overall_rhythm_diversity_score"),
+        "overall_rhythm_metric_coverage": result.get("overall_rhythm_metric_coverage"),
+        "overall_event_ngram_repeat_ratio": result.get("overall_event_ngram_repeat_ratio"),
+        "overall_rhythm_ngram_repeat_ratio": result.get("overall_rhythm_ngram_repeat_ratio"),
+        "overall_repetition_metric_coverage": result.get("overall_repetition_metric_coverage"),
         "balanced_score": result.get("balanced_score"),
         "balanced_rank": result.get("balanced_rank"),
         "balanced_score_coverage": result.get("balanced_score_coverage"),
@@ -528,9 +558,18 @@ def _case_sample_payload(case: dict[str, Any], record: dict[str, Any], fsm_recor
         "time_order_valid": record.get("time_order_valid"),
         "empty_bar_rate": record.get("empty_bar_rate"),
         "pitch_analysis_coverage": record.get("pitch_analysis_coverage"),
+        "rhythm_analysis_coverage": record.get("rhythm_analysis_coverage"),
+        "repetition_analysis_coverage": record.get("repetition_analysis_coverage"),
         "most_common_pitch_ratio": record.get("most_common_pitch_ratio"),
         "longest_same_pitch_run_ratio": record.get("longest_same_pitch_run_ratio"),
         "pitch_diversity_score": record.get("pitch_diversity_score"),
+        "onset_position_entropy": record.get("onset_position_entropy"),
+        "bar_start_onset_ratio": record.get("bar_start_onset_ratio"),
+        "strong_beat_onset_ratio": record.get("strong_beat_onset_ratio"),
+        "duration_diversity_score": record.get("duration_diversity_score"),
+        "rhythm_diversity_score": record.get("rhythm_diversity_score"),
+        "event_ngram_repeat_ratio": record.get("event_ngram_repeat_ratio"),
+        "rhythm_ngram_repeat_ratio": record.get("rhythm_ngram_repeat_ratio"),
     }
     if task == "continuation":
         payload["target_tokens"] = list(case["continuation_case"]["target_tokens"])
@@ -671,11 +710,21 @@ def _evaluate_checkpoint_on_manifest(
     continuation_bar_deltas: list[float] = []
     continuation_event_deltas: list[float] = []
     continuation_pitch_span_deltas: list[float] = []
+    continuation_onset_position_l1: list[float] = []
     continuation_duration_l1: list[float] = []
     continuation_most_common_pitch_ratios: list[float] = []
     continuation_longest_same_pitch_run_ratios: list[float] = []
     continuation_pitch_diversity_scores: list[float] = []
     continuation_pitch_collapse_valid = 0
+    continuation_onset_position_entropies: list[float] = []
+    continuation_bar_start_onset_ratios: list[float] = []
+    continuation_strong_beat_onset_ratios: list[float] = []
+    continuation_duration_diversity_scores: list[float] = []
+    continuation_rhythm_diversity_scores: list[float] = []
+    continuation_rhythm_metric_valid = 0
+    continuation_event_ngram_repeat_ratios: list[float] = []
+    continuation_rhythm_ngram_repeat_ratios: list[float] = []
+    continuation_repetition_metric_valid = 0
     continuation_failure_reason_counts: Counter[str] = Counter()
     continuation_syntax_reason_counts: Counter[str] = Counter()
     fsm_cont_structural_valid = 0
@@ -690,10 +739,20 @@ def _evaluate_checkpoint_on_manifest(
     infilling_structural_valid = 0
     infilling_time_order_valid = 0
     infilling_syntax_invalid = 0
+    infilling_onset_position_l1: list[float] = []
     infilling_most_common_pitch_ratios: list[float] = []
     infilling_longest_same_pitch_run_ratios: list[float] = []
     infilling_pitch_diversity_scores: list[float] = []
     infilling_pitch_collapse_valid = 0
+    infilling_onset_position_entropies: list[float] = []
+    infilling_bar_start_onset_ratios: list[float] = []
+    infilling_strong_beat_onset_ratios: list[float] = []
+    infilling_duration_diversity_scores: list[float] = []
+    infilling_rhythm_diversity_scores: list[float] = []
+    infilling_rhythm_metric_valid = 0
+    infilling_event_ngram_repeat_ratios: list[float] = []
+    infilling_rhythm_ngram_repeat_ratios: list[float] = []
+    infilling_repetition_metric_valid = 0
     infilling_failure_reason_counts: Counter[str] = Counter()
     infilling_syntax_reason_counts: Counter[str] = Counter()
     fsm_infill_structural_valid = 0
@@ -798,6 +857,7 @@ def _evaluate_checkpoint_on_manifest(
                 continuation_bar_deltas.append(float(raw_record["generated_bar_delta"]))
                 continuation_event_deltas.append(float(raw_record["generated_event_delta"]))
                 continuation_pitch_span_deltas.append(float(raw_record["pitch_span_delta"]))
+                continuation_onset_position_l1.append(float(raw_record["onset_position_l1_distance"]))
                 continuation_duration_l1.append(float(raw_record["duration_bin_l1_distance"]))
                 pitch_metric_present = False
                 pitch_metric_present = _append_if_finite(
@@ -813,6 +873,38 @@ def _evaluate_checkpoint_on_manifest(
                     raw_record.get("pitch_diversity_score"),
                 ) or pitch_metric_present
                 continuation_pitch_collapse_valid += int(pitch_metric_present)
+                rhythm_metric_present = False
+                rhythm_metric_present = _append_if_finite(
+                    continuation_onset_position_entropies,
+                    raw_record.get("onset_position_entropy"),
+                ) or rhythm_metric_present
+                rhythm_metric_present = _append_if_finite(
+                    continuation_bar_start_onset_ratios,
+                    raw_record.get("bar_start_onset_ratio"),
+                ) or rhythm_metric_present
+                rhythm_metric_present = _append_if_finite(
+                    continuation_strong_beat_onset_ratios,
+                    raw_record.get("strong_beat_onset_ratio"),
+                ) or rhythm_metric_present
+                rhythm_metric_present = _append_if_finite(
+                    continuation_duration_diversity_scores,
+                    raw_record.get("duration_diversity_score"),
+                ) or rhythm_metric_present
+                rhythm_metric_present = _append_if_finite(
+                    continuation_rhythm_diversity_scores,
+                    raw_record.get("rhythm_diversity_score"),
+                ) or rhythm_metric_present
+                continuation_rhythm_metric_valid += int(rhythm_metric_present)
+                repetition_metric_present = False
+                repetition_metric_present = _append_if_finite(
+                    continuation_event_ngram_repeat_ratios,
+                    raw_record.get("event_ngram_repeat_ratio"),
+                ) or repetition_metric_present
+                repetition_metric_present = _append_if_finite(
+                    continuation_rhythm_ngram_repeat_ratios,
+                    raw_record.get("rhythm_ngram_repeat_ratio"),
+                ) or repetition_metric_present
+                continuation_repetition_metric_valid += int(repetition_metric_present)
                 continuation_failure_reason_counts[str(raw_record["failure_reason"])] += 1
                 continuation_syntax_reason_counts[str(raw_record["syntax_reason"])] += 1
 
@@ -914,6 +1006,7 @@ def _evaluate_checkpoint_on_manifest(
                 infilling_structural_valid += int(bool(raw_infill_record["is_structurally_valid"]))
                 infilling_time_order_valid += int(bool(raw_infill_record["time_order_valid"]))
                 infilling_syntax_invalid += int(not bool(raw_infill_record["is_structurally_valid"]))
+                infilling_onset_position_l1.append(float(raw_infill_record["onset_position_l1_distance"]))
                 pitch_metric_present = False
                 pitch_metric_present = _append_if_finite(
                     infilling_most_common_pitch_ratios,
@@ -928,6 +1021,38 @@ def _evaluate_checkpoint_on_manifest(
                     raw_infill_record.get("pitch_diversity_score"),
                 ) or pitch_metric_present
                 infilling_pitch_collapse_valid += int(pitch_metric_present)
+                rhythm_metric_present = False
+                rhythm_metric_present = _append_if_finite(
+                    infilling_onset_position_entropies,
+                    raw_infill_record.get("onset_position_entropy"),
+                ) or rhythm_metric_present
+                rhythm_metric_present = _append_if_finite(
+                    infilling_bar_start_onset_ratios,
+                    raw_infill_record.get("bar_start_onset_ratio"),
+                ) or rhythm_metric_present
+                rhythm_metric_present = _append_if_finite(
+                    infilling_strong_beat_onset_ratios,
+                    raw_infill_record.get("strong_beat_onset_ratio"),
+                ) or rhythm_metric_present
+                rhythm_metric_present = _append_if_finite(
+                    infilling_duration_diversity_scores,
+                    raw_infill_record.get("duration_diversity_score"),
+                ) or rhythm_metric_present
+                rhythm_metric_present = _append_if_finite(
+                    infilling_rhythm_diversity_scores,
+                    raw_infill_record.get("rhythm_diversity_score"),
+                ) or rhythm_metric_present
+                infilling_rhythm_metric_valid += int(rhythm_metric_present)
+                repetition_metric_present = False
+                repetition_metric_present = _append_if_finite(
+                    infilling_event_ngram_repeat_ratios,
+                    raw_infill_record.get("event_ngram_repeat_ratio"),
+                ) or repetition_metric_present
+                repetition_metric_present = _append_if_finite(
+                    infilling_rhythm_ngram_repeat_ratios,
+                    raw_infill_record.get("rhythm_ngram_repeat_ratio"),
+                ) or repetition_metric_present
+                infilling_repetition_metric_valid += int(repetition_metric_present)
                 infilling_failure_reason_counts[str(raw_infill_record["failure_reason"])] += 1
                 infilling_syntax_reason_counts[str(raw_infill_record["syntax_reason"])] += 1
                 fsm_infill_structural_valid += int(bool(fsm_infill_record["is_structurally_valid"]))
@@ -972,15 +1097,42 @@ def _evaluate_checkpoint_on_manifest(
         "generated_bar_delta_mean": _safe_mean(continuation_bar_deltas),
         "generated_event_delta_mean": _safe_mean(continuation_event_deltas),
         "pitch_span_delta_mean": _safe_mean(continuation_pitch_span_deltas),
+        "continuation_onset_position_l1_distance": _safe_mean(continuation_onset_position_l1),
+        "infilling_onset_position_l1_distance": _safe_mean(infilling_onset_position_l1),
+        "overall_onset_position_l1_distance": _safe_mean(continuation_onset_position_l1 + infilling_onset_position_l1),
         "duration_bin_l1_distance": _safe_mean(continuation_duration_l1),
         "continuation_most_common_pitch_ratio": _safe_mean(continuation_most_common_pitch_ratios),
         "continuation_longest_same_pitch_run_ratio": _safe_mean(continuation_longest_same_pitch_run_ratios),
         "continuation_pitch_diversity_score": _safe_mean(continuation_pitch_diversity_scores),
         "continuation_pitch_collapse_coverage": _safe_rate(continuation_pitch_collapse_valid, continuation_attempted),
+        "continuation_onset_position_entropy": _safe_mean(continuation_onset_position_entropies),
+        "continuation_bar_start_onset_ratio": _safe_mean(continuation_bar_start_onset_ratios),
+        "continuation_strong_beat_onset_ratio": _safe_mean(continuation_strong_beat_onset_ratios),
+        "continuation_duration_diversity_score": _safe_mean(continuation_duration_diversity_scores),
+        "continuation_rhythm_diversity_score": _safe_mean(continuation_rhythm_diversity_scores),
+        "continuation_rhythm_metric_coverage": _safe_rate(continuation_rhythm_metric_valid, continuation_attempted),
+        "continuation_event_ngram_repeat_ratio": _safe_mean(continuation_event_ngram_repeat_ratios),
+        "continuation_rhythm_ngram_repeat_ratio": _safe_mean(continuation_rhythm_ngram_repeat_ratios),
+        "continuation_repetition_metric_coverage": _safe_rate(
+            continuation_repetition_metric_valid,
+            continuation_attempted,
+        ),
         "infilling_most_common_pitch_ratio": _safe_mean(infilling_most_common_pitch_ratios),
         "infilling_longest_same_pitch_run_ratio": _safe_mean(infilling_longest_same_pitch_run_ratios),
         "infilling_pitch_diversity_score": _safe_mean(infilling_pitch_diversity_scores),
         "infilling_pitch_collapse_coverage": _safe_rate(infilling_pitch_collapse_valid, infilling_attempted),
+        "infilling_onset_position_entropy": _safe_mean(infilling_onset_position_entropies),
+        "infilling_bar_start_onset_ratio": _safe_mean(infilling_bar_start_onset_ratios),
+        "infilling_strong_beat_onset_ratio": _safe_mean(infilling_strong_beat_onset_ratios),
+        "infilling_duration_diversity_score": _safe_mean(infilling_duration_diversity_scores),
+        "infilling_rhythm_diversity_score": _safe_mean(infilling_rhythm_diversity_scores),
+        "infilling_rhythm_metric_coverage": _safe_rate(infilling_rhythm_metric_valid, infilling_attempted),
+        "infilling_event_ngram_repeat_ratio": _safe_mean(infilling_event_ngram_repeat_ratios),
+        "infilling_rhythm_ngram_repeat_ratio": _safe_mean(infilling_rhythm_ngram_repeat_ratios),
+        "infilling_repetition_metric_coverage": _safe_rate(
+            infilling_repetition_metric_valid,
+            infilling_attempted,
+        ),
         "overall_most_common_pitch_ratio": _safe_mean(
             continuation_most_common_pitch_ratios + infilling_most_common_pitch_ratios
         ),
@@ -989,6 +1141,43 @@ def _evaluate_checkpoint_on_manifest(
         ),
         "overall_pitch_diversity_score": _safe_mean(
             continuation_pitch_diversity_scores + infilling_pitch_diversity_scores
+        ),
+        "overall_onset_position_entropy": _safe_mean(
+            continuation_onset_position_entropies + infilling_onset_position_entropies
+        ),
+        "overall_bar_start_onset_ratio": _safe_mean(
+            continuation_bar_start_onset_ratios + infilling_bar_start_onset_ratios
+        ),
+        "overall_strong_beat_onset_ratio": _safe_mean(
+            continuation_strong_beat_onset_ratios + infilling_strong_beat_onset_ratios
+        ),
+        "overall_duration_diversity_score": _safe_mean(
+            continuation_duration_diversity_scores + infilling_duration_diversity_scores
+        ),
+        "overall_rhythm_diversity_score": _safe_mean(
+            continuation_rhythm_diversity_scores + infilling_rhythm_diversity_scores
+        ),
+        "overall_rhythm_metric_coverage": (
+            (
+                float(continuation_rhythm_metric_valid + infilling_rhythm_metric_valid)
+                / float(continuation_attempted + infilling_attempted)
+            )
+            if (continuation_attempted + infilling_attempted) > 0
+            else float("nan")
+        ),
+        "overall_event_ngram_repeat_ratio": _safe_mean(
+            continuation_event_ngram_repeat_ratios + infilling_event_ngram_repeat_ratios
+        ),
+        "overall_rhythm_ngram_repeat_ratio": _safe_mean(
+            continuation_rhythm_ngram_repeat_ratios + infilling_rhythm_ngram_repeat_ratios
+        ),
+        "overall_repetition_metric_coverage": (
+            (
+                float(continuation_repetition_metric_valid + infilling_repetition_metric_valid)
+                / float(continuation_attempted + infilling_attempted)
+            )
+            if (continuation_attempted + infilling_attempted) > 0
+            else float("nan")
         ),
         "overall_pitch_collapse_coverage": (
             (
@@ -1563,6 +1752,24 @@ _PERCENT_METRICS_V2 = {
     "fsm_time_order_validity_rate",
     "fsm_illegal_top1_rate",
     "fsm_mask_intervention_rate",
+    "continuation_bar_start_onset_ratio",
+    "continuation_strong_beat_onset_ratio",
+    "continuation_rhythm_metric_coverage",
+    "continuation_event_ngram_repeat_ratio",
+    "continuation_rhythm_ngram_repeat_ratio",
+    "continuation_repetition_metric_coverage",
+    "infilling_bar_start_onset_ratio",
+    "infilling_strong_beat_onset_ratio",
+    "infilling_rhythm_metric_coverage",
+    "infilling_event_ngram_repeat_ratio",
+    "infilling_rhythm_ngram_repeat_ratio",
+    "infilling_repetition_metric_coverage",
+    "overall_bar_start_onset_ratio",
+    "overall_strong_beat_onset_ratio",
+    "overall_rhythm_metric_coverage",
+    "overall_event_ngram_repeat_ratio",
+    "overall_rhythm_ngram_repeat_ratio",
+    "overall_repetition_metric_coverage",
     "continuation_pitch_collapse_coverage",
     "infilling_pitch_collapse_coverage",
     "overall_pitch_collapse_coverage",
@@ -1611,6 +1818,9 @@ _METRIC_LABELS_V2 = {
     "infilling_time_order_validity_rate": "补全时间顺序合法率",
     "infilling_syntax_invalid_rate": "补全语法非法率",
     "continuation_first_event_hit_rate": "续写首事件命中率",
+    "continuation_onset_position_l1_distance": "续写起拍位置分布 L1 距离",
+    "infilling_onset_position_l1_distance": "补全起拍位置分布 L1 距离",
+    "overall_onset_position_l1_distance": "总体起拍位置分布 L1 距离",
     "duration_bin_l1_distance": "时值分桶 L1 距离",
     "low_density_bar_rate": "低密度 BAR 率",
     "multi_empty_bar_run_rate": "连续空 BAR 样本率",
@@ -1626,14 +1836,41 @@ _METRIC_LABELS_V2 = {
     "continuation_longest_same_pitch_run_ratio": "续写最长同 pitch 连续 run 占比",
     "continuation_pitch_diversity_score": "续写音高多样性分数",
     "continuation_pitch_collapse_coverage": "续写 pitch 指标覆盖率",
+    "continuation_onset_position_entropy": "续写起拍位置熵",
+    "continuation_bar_start_onset_ratio": "续写小节起点占比",
+    "continuation_strong_beat_onset_ratio": "续写强拍占比",
+    "continuation_duration_diversity_score": "续写时值多样性分数",
+    "continuation_rhythm_diversity_score": "续写节奏多样性分数",
+    "continuation_rhythm_metric_coverage": "续写节奏指标覆盖率",
+    "continuation_event_ngram_repeat_ratio": "续写事件 n-gram 重复占比",
+    "continuation_rhythm_ngram_repeat_ratio": "续写节奏 n-gram 重复占比",
+    "continuation_repetition_metric_coverage": "续写重复指标覆盖率",
     "infilling_most_common_pitch_ratio": "补全最高频 pitch 占比",
     "infilling_longest_same_pitch_run_ratio": "补全最长同 pitch 连续 run 占比",
     "infilling_pitch_diversity_score": "补全音高多样性分数",
     "infilling_pitch_collapse_coverage": "补全 pitch 指标覆盖率",
+    "infilling_onset_position_entropy": "补全起拍位置熵",
+    "infilling_bar_start_onset_ratio": "补全小节起点占比",
+    "infilling_strong_beat_onset_ratio": "补全强拍占比",
+    "infilling_duration_diversity_score": "补全时值多样性分数",
+    "infilling_rhythm_diversity_score": "补全节奏多样性分数",
+    "infilling_rhythm_metric_coverage": "补全节奏指标覆盖率",
+    "infilling_event_ngram_repeat_ratio": "补全事件 n-gram 重复占比",
+    "infilling_rhythm_ngram_repeat_ratio": "补全节奏 n-gram 重复占比",
+    "infilling_repetition_metric_coverage": "补全重复指标覆盖率",
     "overall_most_common_pitch_ratio": "总体最高频 pitch 占比",
     "overall_longest_same_pitch_run_ratio": "总体最长同 pitch 连续 run 占比",
     "overall_pitch_diversity_score": "总体音高多样性分数",
     "overall_pitch_collapse_coverage": "总体 pitch 指标覆盖率",
+    "overall_onset_position_entropy": "总体起拍位置熵",
+    "overall_bar_start_onset_ratio": "总体小节起点占比",
+    "overall_strong_beat_onset_ratio": "总体强拍占比",
+    "overall_duration_diversity_score": "总体时值多样性分数",
+    "overall_rhythm_diversity_score": "总体节奏多样性分数",
+    "overall_rhythm_metric_coverage": "总体节奏指标覆盖率",
+    "overall_event_ngram_repeat_ratio": "总体事件 n-gram 重复占比",
+    "overall_rhythm_ngram_repeat_ratio": "总体节奏 n-gram 重复占比",
+    "overall_repetition_metric_coverage": "总体重复指标覆盖率",
     "fsm_structural_validity_rate": "FSM 结构合法率",
     "fsm_time_order_validity_rate": "FSM 时间顺序合法率",
     "fsm_illegal_top1_rate": "FSM 非法 top1 率",
@@ -1802,6 +2039,58 @@ def _pitch_metric_specs_v2(task_scope: str) -> list[tuple[str, str]]:
     ]
 
 
+def _rhythm_metric_specs_v2(task_scope: str) -> list[tuple[str, str]]:
+    if task_scope == "continuation":
+        return [
+            ("continuation_onset_position_l1_distance", "续写起拍位置分布 L1 距离"),
+            ("continuation_onset_position_entropy", "续写起拍位置熵"),
+            ("continuation_bar_start_onset_ratio", "续写小节起点占比"),
+            ("continuation_strong_beat_onset_ratio", "续写强拍占比"),
+            ("continuation_duration_diversity_score", "续写时值多样性分数"),
+            ("continuation_rhythm_diversity_score", "续写节奏多样性分数"),
+            ("continuation_rhythm_metric_coverage", "续写节奏指标覆盖率"),
+        ]
+    if task_scope == "infilling":
+        return [
+            ("infilling_onset_position_l1_distance", "补全起拍位置分布 L1 距离"),
+            ("infilling_onset_position_entropy", "补全起拍位置熵"),
+            ("infilling_bar_start_onset_ratio", "补全小节起点占比"),
+            ("infilling_strong_beat_onset_ratio", "补全强拍占比"),
+            ("infilling_duration_diversity_score", "补全时值多样性分数"),
+            ("infilling_rhythm_diversity_score", "补全节奏多样性分数"),
+            ("infilling_rhythm_metric_coverage", "补全节奏指标覆盖率"),
+        ]
+    return [
+        ("overall_onset_position_l1_distance", "总体起拍位置分布 L1 距离"),
+        ("overall_onset_position_entropy", "总体起拍位置熵"),
+        ("overall_bar_start_onset_ratio", "总体小节起点占比"),
+        ("overall_strong_beat_onset_ratio", "总体强拍占比"),
+        ("overall_duration_diversity_score", "总体时值多样性分数"),
+        ("overall_rhythm_diversity_score", "总体节奏多样性分数"),
+        ("overall_rhythm_metric_coverage", "总体节奏指标覆盖率"),
+    ]
+
+
+def _repetition_metric_specs_v2(task_scope: str) -> list[tuple[str, str]]:
+    if task_scope == "continuation":
+        return [
+            ("continuation_event_ngram_repeat_ratio", "续写事件 n-gram 重复占比"),
+            ("continuation_rhythm_ngram_repeat_ratio", "续写节奏 n-gram 重复占比"),
+            ("continuation_repetition_metric_coverage", "续写重复指标覆盖率"),
+        ]
+    if task_scope == "infilling":
+        return [
+            ("infilling_event_ngram_repeat_ratio", "补全事件 n-gram 重复占比"),
+            ("infilling_rhythm_ngram_repeat_ratio", "补全节奏 n-gram 重复占比"),
+            ("infilling_repetition_metric_coverage", "补全重复指标覆盖率"),
+        ]
+    return [
+        ("overall_event_ngram_repeat_ratio", "总体事件 n-gram 重复占比"),
+        ("overall_rhythm_ngram_repeat_ratio", "总体节奏 n-gram 重复占比"),
+        ("overall_repetition_metric_coverage", "总体重复指标覆盖率"),
+    ]
+
+
 def _training_metric_specs_v2() -> list[tuple[str, str]]:
     return [
         ("step", "Step"),
@@ -1819,24 +2108,27 @@ def _plot_metric_specs_v2(task_scope: str, *, diagnostics: bool) -> list[dict[st
             return [
                 {"key": "continuation_missing_eos_rate", "label": "续写缺失 EOS 率", "percent": True, "goal": "min", "color": "#dc2626"},
                 {"key": "continuation_most_common_pitch_ratio", "label": "最高频 pitch 占比", "goal": "min", "color": "#2563eb"},
-                {"key": "continuation_longest_same_pitch_run_ratio", "label": "最长同 pitch 连续 run 占比", "goal": "min", "color": "#7c3aed"},
-                {"key": "continuation_pitch_diversity_score", "label": "音高多样性分数", "goal": "max", "color": "#16a34a"},
-                {"key": "multi_empty_bar_run_rate", "label": "连续空 BAR 样本率", "percent": True, "goal": "min", "color": "#0891b2"},
+                {"key": "continuation_rhythm_diversity_score", "label": "节奏多样性分数", "goal": "max", "color": "#16a34a"},
+                {"key": "continuation_bar_start_onset_ratio", "label": "小节起点占比", "percent": True, "goal": "min", "color": "#7c3aed"},
+                {"key": "continuation_event_ngram_repeat_ratio", "label": "事件 n-gram 重复占比", "percent": True, "goal": "min", "color": "#0891b2"},
+                {"key": "multi_empty_bar_run_rate", "label": "连续空 BAR 样本率", "percent": True, "goal": "min", "color": "#ea580c"},
             ]
         if task_scope == "infilling":
             return [
                 {"key": "infilling_syntax_invalid_rate", "label": "补全语法非法率", "percent": True, "goal": "min", "color": "#dc2626"},
                 {"key": "infilling_most_common_pitch_ratio", "label": "最高频 pitch 占比", "goal": "min", "color": "#2563eb"},
-                {"key": "infilling_longest_same_pitch_run_ratio", "label": "最长同 pitch 连续 run 占比", "goal": "min", "color": "#7c3aed"},
-                {"key": "infilling_pitch_diversity_score", "label": "音高多样性分数", "goal": "max", "color": "#16a34a"},
-                {"key": "infilling_pitch_collapse_coverage", "label": "pitch 指标覆盖率", "percent": True, "goal": "max", "color": "#0891b2"},
+                {"key": "infilling_rhythm_diversity_score", "label": "节奏多样性分数", "goal": "max", "color": "#16a34a"},
+                {"key": "infilling_bar_start_onset_ratio", "label": "小节起点占比", "percent": True, "goal": "min", "color": "#7c3aed"},
+                {"key": "infilling_event_ngram_repeat_ratio", "label": "事件 n-gram 重复占比", "percent": True, "goal": "min", "color": "#0891b2"},
+                {"key": "infilling_rhythm_metric_coverage", "label": "节奏指标覆盖率", "percent": True, "goal": "max", "color": "#ea580c"},
             ]
         return [
             {"key": "continuation_missing_eos_rate", "label": "续写缺失 EOS 率", "percent": True, "goal": "min", "color": "#dc2626"},
             {"key": "overall_most_common_pitch_ratio", "label": "总体最高频 pitch 占比", "goal": "min", "color": "#2563eb"},
-            {"key": "overall_longest_same_pitch_run_ratio", "label": "总体最长同 pitch 连续 run 占比", "goal": "min", "color": "#7c3aed"},
-            {"key": "overall_pitch_diversity_score", "label": "总体音高多样性分数", "goal": "max", "color": "#16a34a"},
-            {"key": "overall_pitch_collapse_coverage", "label": "总体 pitch 指标覆盖率", "percent": True, "goal": "max", "color": "#0891b2"},
+            {"key": "overall_rhythm_diversity_score", "label": "总体节奏多样性分数", "goal": "max", "color": "#16a34a"},
+            {"key": "overall_bar_start_onset_ratio", "label": "总体小节起点占比", "percent": True, "goal": "min", "color": "#7c3aed"},
+            {"key": "overall_event_ngram_repeat_ratio", "label": "总体事件 n-gram 重复占比", "percent": True, "goal": "min", "color": "#0891b2"},
+            {"key": "overall_rhythm_metric_coverage", "label": "总体节奏指标覆盖率", "percent": True, "goal": "max", "color": "#ea580c"},
         ]
     if task_scope == "continuation":
         return [
@@ -2090,6 +2382,22 @@ def _build_summary_markdown_v2(
         _markdown_table_v2(
             [label for _key, label in _pitch_metric_specs_v2(task_scope)],
             _result_table_rows_v2(top_results, _pitch_metric_specs_v2(task_scope)),
+        )
+    )
+
+    lines.extend(["## Top 3 节奏丰富性摘要", ""])
+    lines.extend(
+        _markdown_table_v2(
+            [label for _key, label in _rhythm_metric_specs_v2(task_scope)],
+            _result_table_rows_v2(top_results, _rhythm_metric_specs_v2(task_scope)),
+        )
+    )
+
+    lines.extend(["## Top 3 重复度摘要", ""])
+    lines.extend(
+        _markdown_table_v2(
+            [label for _key, label in _repetition_metric_specs_v2(task_scope)],
+            _result_table_rows_v2(top_results, _repetition_metric_specs_v2(task_scope)),
         )
     )
 

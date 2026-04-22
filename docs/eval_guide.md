@@ -92,6 +92,10 @@ uv run eval-continuation --config configs/train/train_base_run_small.yaml
 
 ## 输出目录
 
+内置训练 preset 的推荐定位：
+- `small`: validation / fast iteration, default `seq_len=512`
+- `full`: release / long-context training, default `seq_len=640`
+
 默认输出到：
 
 ```text

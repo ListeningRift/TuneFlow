@@ -49,6 +49,9 @@ uv run train-base --preset small
 uv run train-base --preset full
 ```
 
+- `small`: validation / fast iteration, default `seq_len=512`
+- `full`: release / long-context training, default `seq_len=640`
+
 或：
 
 ```bash

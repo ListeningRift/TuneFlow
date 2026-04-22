@@ -87,6 +87,8 @@ uv run train-base --preset small --dry-run
 ```
 
 2. 启动训练：
+`small` 预设用于验证和快速迭代，默认 `seq_len=512`；
+`full` 预设用于正式长上下文训练，默认 `seq_len=640`。
 ```bash
 uv run train-base --preset small
 uv run train-base --preset full

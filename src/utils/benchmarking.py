@@ -439,12 +439,12 @@ def _extract_first_unit(tokens: Sequence[str]) -> tuple[str, ...] | None:
     return None
 
 
-def duration_l1_distance(
-    generated_counts: dict[str, int],
-    target_counts: dict[str, int],
+def histogram_l1_distance(
+    generated_counts: dict[Any, int],
+    target_counts: dict[Any, int],
 ) -> float:
-    """返回归一化时值直方图之间的 L1 距离。"""
-    keys = sorted(set(generated_counts) | set(target_counts))
+    """返回两个离散直方图之间的归一化 L1 距离。"""
+    keys = sorted(set(generated_counts) | set(target_counts), key=lambda item: str(item))
     if not keys:
         return 0.0
     generated_total = sum(max(0, int(generated_counts.get(key, 0))) for key in keys)
@@ -459,8 +459,168 @@ def duration_l1_distance(
     return distance
 
 
+def duration_l1_distance(
+    generated_counts: dict[str, int],
+    target_counts: dict[str, int],
+) -> float:
+    """返回归一化时值直方图之间的 L1 距离。"""
+    return histogram_l1_distance(generated_counts, target_counts)
+
+
 _MIN_PITCH_EVENTS_FOR_COLLAPSE_METRICS = 6
 _PITCH_DIVERSITY_REFERENCE_UNIQUES = 12
+_POSITIONS_PER_BAR = 32
+_STRONG_BEAT_STRIDE = 8
+_MIN_RHYTHM_EVENTS_FOR_DIVERSITY_METRICS = 6
+_MIN_EVENTS_FOR_REPETITION_METRICS = 8
+_ONSET_DIVERSITY_REFERENCE_UNIQUES = 8
+_DURATION_DIVERSITY_REFERENCE_UNIQUES = 6
+
+
+def _normalized_entropy(counter: Counter[Any], total_count: int, *, normalizer: float) -> float:
+    if total_count <= 0 or normalizer <= 0.0 or not counter:
+        return 0.0
+    entropy = 0.0
+    for count in counter.values():
+        probability = float(count) / float(total_count)
+        if probability > 0.0:
+            entropy -= probability * math.log(probability)
+    return max(0.0, min(1.0, entropy / normalizer))
+
+
+def _categorical_diversity_score(
+    values: Sequence[Any],
+    *,
+    reference_uniques: int,
+) -> tuple[int, float]:
+    value_list = list(values)
+    unique_count = len(set(value_list))
+    if not value_list:
+        return 0, 0.0
+    counter = Counter(value_list)
+    entropy_norm = (
+        _normalized_entropy(counter, len(value_list), normalizer=math.log(float(unique_count)))
+        if unique_count > 1
+        else 0.0
+    )
+    normalized_unique_count = min(unique_count, max(1, reference_uniques)) / float(max(1, reference_uniques))
+    score = (0.6 * entropy_norm) + (0.4 * normalized_unique_count)
+    return unique_count, max(0.0, min(1.0, score))
+
+
+def _rhythm_diversity_metrics(
+    onset_positions: Sequence[int],
+    duration_tokens: Sequence[str],
+) -> dict[str, Any]:
+    event_count = len(onset_positions)
+    onset_unique_count = len(set(int(position) for position in onset_positions))
+    if event_count <= 0:
+        return {
+            "rhythm_event_count": 0,
+            "onset_unique_count": 0,
+            "rhythm_analysis_coverage": 0.0,
+            "onset_position_entropy": None,
+            "bar_start_onset_ratio": None,
+            "strong_beat_onset_ratio": None,
+            "duration_diversity_score": None,
+            "rhythm_diversity_score": None,
+        }
+
+    if event_count < _MIN_RHYTHM_EVENTS_FOR_DIVERSITY_METRICS:
+        return {
+            "rhythm_event_count": event_count,
+            "onset_unique_count": onset_unique_count,
+            "rhythm_analysis_coverage": (event_count / float(_MIN_RHYTHM_EVENTS_FOR_DIVERSITY_METRICS)),
+            "onset_position_entropy": None,
+            "bar_start_onset_ratio": None,
+            "strong_beat_onset_ratio": None,
+            "duration_diversity_score": None,
+            "rhythm_diversity_score": None,
+        }
+
+    onset_counter = Counter(int(position) for position in onset_positions)
+    onset_entropy_norm = _normalized_entropy(
+        onset_counter,
+        event_count,
+        normalizer=math.log(float(_POSITIONS_PER_BAR)),
+    )
+    onset_unique_norm = min(onset_unique_count, _ONSET_DIVERSITY_REFERENCE_UNIQUES) / float(
+        _ONSET_DIVERSITY_REFERENCE_UNIQUES
+    )
+    _duration_unique_count, duration_diversity_score = _categorical_diversity_score(
+        duration_tokens,
+        reference_uniques=_DURATION_DIVERSITY_REFERENCE_UNIQUES,
+    )
+    bar_start_onset_ratio = (
+        sum(1 for position in onset_positions if int(position) == 0) / float(event_count)
+    )
+    strong_beat_onset_ratio = (
+        sum(1 for position in onset_positions if int(position) % _STRONG_BEAT_STRIDE == 0) / float(event_count)
+    )
+    rhythm_diversity_score = (
+        (0.35 * onset_entropy_norm)
+        + (0.20 * onset_unique_norm)
+        + (0.20 * float(duration_diversity_score))
+        + (0.15 * (1.0 - strong_beat_onset_ratio))
+        + (0.10 * (1.0 - bar_start_onset_ratio))
+    )
+
+    return {
+        "rhythm_event_count": event_count,
+        "onset_unique_count": onset_unique_count,
+        "rhythm_analysis_coverage": 1.0,
+        "onset_position_entropy": max(0.0, min(1.0, onset_entropy_norm)),
+        "bar_start_onset_ratio": max(0.0, min(1.0, bar_start_onset_ratio)),
+        "strong_beat_onset_ratio": max(0.0, min(1.0, strong_beat_onset_ratio)),
+        "duration_diversity_score": float(duration_diversity_score),
+        "rhythm_diversity_score": max(0.0, min(1.0, rhythm_diversity_score)),
+    }
+
+
+def _ngram_extra_repeat_ratio(items: Sequence[Any], n: int) -> float:
+    if n <= 0 or len(items) < n:
+        return 0.0
+    windows = [tuple(items[index : index + n]) for index in range(len(items) - n + 1)]
+    if not windows:
+        return 0.0
+    counter = Counter(windows)
+    repeated_window_count = sum(max(0, count - 1) for count in counter.values())
+    return repeated_window_count / float(len(windows))
+
+
+def _repetition_metrics(
+    event_signatures: Sequence[tuple[int, int, str]],
+    rhythm_signatures: Sequence[tuple[int, str]],
+) -> dict[str, Any]:
+    event_count = len(event_signatures)
+    if event_count <= 0:
+        return {
+            "repetition_event_count": 0,
+            "repetition_analysis_coverage": 0.0,
+            "event_ngram_repeat_ratio": None,
+            "rhythm_ngram_repeat_ratio": None,
+        }
+
+    if event_count < _MIN_EVENTS_FOR_REPETITION_METRICS:
+        return {
+            "repetition_event_count": event_count,
+            "repetition_analysis_coverage": (event_count / float(_MIN_EVENTS_FOR_REPETITION_METRICS)),
+            "event_ngram_repeat_ratio": None,
+            "rhythm_ngram_repeat_ratio": None,
+        }
+
+    event_ngram_repeat_ratio = 0.5 * (
+        _ngram_extra_repeat_ratio(event_signatures, 2) + _ngram_extra_repeat_ratio(event_signatures, 3)
+    )
+    rhythm_ngram_repeat_ratio = 0.5 * (
+        _ngram_extra_repeat_ratio(rhythm_signatures, 2) + _ngram_extra_repeat_ratio(rhythm_signatures, 3)
+    )
+    return {
+        "repetition_event_count": event_count,
+        "repetition_analysis_coverage": 1.0,
+        "event_ngram_repeat_ratio": max(0.0, min(1.0, event_ngram_repeat_ratio)),
+        "rhythm_ngram_repeat_ratio": max(0.0, min(1.0, rhythm_ngram_repeat_ratio)),
+    }
 
 
 def _pitch_collapse_metrics(pitch_values: Sequence[int]) -> dict[str, Any]:
@@ -536,7 +696,12 @@ def analyze_token_sequence(tokens: Sequence[str]) -> dict[str, Any]:
     time_order_violation_count = 0
     parsed_event_count = 0
     pitch_values: list[int] = []
+    onset_positions: list[int] = []
+    duration_tokens: list[str] = []
     duration_counts: Counter[str] = Counter()
+    onset_position_counts: Counter[int] = Counter()
+    event_signatures: list[tuple[int, int, str]] = []
+    rhythm_signatures: list[tuple[int, str]] = []
 
     def ensure_bar() -> None:
         nonlocal current_bar_events, current_bar_last_pos
@@ -587,8 +752,16 @@ def analyze_token_sequence(tokens: Sequence[str]) -> dict[str, Any]:
             if not vel_token.startswith("VEL_"):
                 break
             pitch_value = _parse_prefixed_int(pitch_token, "PITCH_")
+            if pos_value is not None:
+                onset_positions.append(pos_value)
+                onset_position_counts[pos_value] += 1
+            duration_tokens.append(dur_token)
             if pitch_value is not None:
                 pitch_values.append(pitch_value)
+                if pos_value is not None:
+                    event_signatures.append((pos_value, pitch_value, dur_token))
+            if pos_value is not None:
+                rhythm_signatures.append((pos_value, dur_token))
             duration_counts[dur_token] += 1
             parsed_event_count += 1
             current_bar_events = 0 if current_bar_events is None else (current_bar_events + 1)
@@ -612,6 +785,8 @@ def analyze_token_sequence(tokens: Sequence[str]) -> dict[str, Any]:
     if pitch_values:
         pitch_span = max(pitch_values) - min(pitch_values)
     pitch_metrics = _pitch_collapse_metrics(pitch_values)
+    rhythm_metrics = _rhythm_diversity_metrics(onset_positions, duration_tokens)
+    repetition_metrics = _repetition_metrics(event_signatures, rhythm_signatures)
 
     return {
         "bar_count": len(bar_event_counts),
@@ -624,6 +799,7 @@ def analyze_token_sequence(tokens: Sequence[str]) -> dict[str, Any]:
         "max_empty_bar_run_length": max_empty_run,
         "pitch_span": pitch_span,
         "duration_counts": dict(duration_counts),
+        "onset_position_counts": dict(onset_position_counts),
         "time_order_valid": (time_order_violation_count == 0),
         "time_order_violation_count": time_order_violation_count,
         "pitch_event_count": int(pitch_metrics["pitch_event_count"]),
@@ -632,6 +808,18 @@ def analyze_token_sequence(tokens: Sequence[str]) -> dict[str, Any]:
         "most_common_pitch_ratio": pitch_metrics["most_common_pitch_ratio"],
         "longest_same_pitch_run_ratio": pitch_metrics["longest_same_pitch_run_ratio"],
         "pitch_diversity_score": pitch_metrics["pitch_diversity_score"],
+        "rhythm_event_count": int(rhythm_metrics["rhythm_event_count"]),
+        "onset_unique_count": int(rhythm_metrics["onset_unique_count"]),
+        "rhythm_analysis_coverage": float(rhythm_metrics["rhythm_analysis_coverage"]),
+        "onset_position_entropy": rhythm_metrics["onset_position_entropy"],
+        "bar_start_onset_ratio": rhythm_metrics["bar_start_onset_ratio"],
+        "strong_beat_onset_ratio": rhythm_metrics["strong_beat_onset_ratio"],
+        "duration_diversity_score": rhythm_metrics["duration_diversity_score"],
+        "rhythm_diversity_score": rhythm_metrics["rhythm_diversity_score"],
+        "repetition_event_count": int(repetition_metrics["repetition_event_count"]),
+        "repetition_analysis_coverage": float(repetition_metrics["repetition_analysis_coverage"]),
+        "event_ngram_repeat_ratio": repetition_metrics["event_ngram_repeat_ratio"],
+        "rhythm_ngram_repeat_ratio": repetition_metrics["rhythm_ngram_repeat_ratio"],
     }
 
 
@@ -667,12 +855,25 @@ def enrich_continuation_record(record: dict[str, Any], *, target_tokens: Sequenc
             "most_common_pitch_ratio": generated_analysis["most_common_pitch_ratio"],
             "longest_same_pitch_run_ratio": generated_analysis["longest_same_pitch_run_ratio"],
             "pitch_diversity_score": generated_analysis["pitch_diversity_score"],
+            "rhythm_analysis_coverage": float(generated_analysis["rhythm_analysis_coverage"]),
+            "repetition_analysis_coverage": float(generated_analysis["repetition_analysis_coverage"]),
+            "onset_position_entropy": generated_analysis["onset_position_entropy"],
+            "bar_start_onset_ratio": generated_analysis["bar_start_onset_ratio"],
+            "strong_beat_onset_ratio": generated_analysis["strong_beat_onset_ratio"],
+            "duration_diversity_score": generated_analysis["duration_diversity_score"],
+            "rhythm_diversity_score": generated_analysis["rhythm_diversity_score"],
+            "event_ngram_repeat_ratio": generated_analysis["event_ngram_repeat_ratio"],
+            "rhythm_ngram_repeat_ratio": generated_analysis["rhythm_ngram_repeat_ratio"],
             "target_bar_count": int(target_analysis["bar_count"]),
             "target_event_count": int(target_analysis["event_count"]),
             "target_pitch_span": int(target_analysis["pitch_span"]),
             "generated_bar_delta": int(generated_bar_delta),
             "generated_event_delta": int(generated_event_delta),
             "pitch_span_delta": int(pitch_span_delta),
+            "onset_position_l1_distance": histogram_l1_distance(
+                generated_analysis["onset_position_counts"],
+                target_analysis["onset_position_counts"],
+            ),
             "duration_bin_l1_distance": duration_l1_distance(
                 generated_analysis["duration_counts"],
                 target_analysis["duration_counts"],
@@ -701,12 +902,25 @@ def enrich_infilling_record(record: dict[str, Any], *, target_hole_tokens: Seque
             "most_common_pitch_ratio": generated_analysis["most_common_pitch_ratio"],
             "longest_same_pitch_run_ratio": generated_analysis["longest_same_pitch_run_ratio"],
             "pitch_diversity_score": generated_analysis["pitch_diversity_score"],
+            "rhythm_analysis_coverage": float(generated_analysis["rhythm_analysis_coverage"]),
+            "repetition_analysis_coverage": float(generated_analysis["repetition_analysis_coverage"]),
+            "onset_position_entropy": generated_analysis["onset_position_entropy"],
+            "bar_start_onset_ratio": generated_analysis["bar_start_onset_ratio"],
+            "strong_beat_onset_ratio": generated_analysis["strong_beat_onset_ratio"],
+            "duration_diversity_score": generated_analysis["duration_diversity_score"],
+            "rhythm_diversity_score": generated_analysis["rhythm_diversity_score"],
+            "event_ngram_repeat_ratio": generated_analysis["event_ngram_repeat_ratio"],
+            "rhythm_ngram_repeat_ratio": generated_analysis["rhythm_ngram_repeat_ratio"],
             "target_bar_count": int(target_analysis["bar_count"]),
             "target_event_count": int(target_analysis["event_count"]),
             "target_pitch_span": int(target_analysis["pitch_span"]),
             "generated_bar_delta": int(generated_analysis["bar_count"] - target_analysis["bar_count"]),
             "generated_event_delta": int(generated_analysis["event_count"] - target_analysis["event_count"]),
             "pitch_span_delta": int(generated_analysis["pitch_span"] - target_analysis["pitch_span"]),
+            "onset_position_l1_distance": histogram_l1_distance(
+                generated_analysis["onset_position_counts"],
+                target_analysis["onset_position_counts"],
+            ),
             "duration_bin_l1_distance": duration_l1_distance(
                 generated_analysis["duration_counts"],
                 target_analysis["duration_counts"],
