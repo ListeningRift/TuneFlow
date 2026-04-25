@@ -556,6 +556,13 @@ def _case_sample_payload(case: dict[str, Any], record: dict[str, Any], fsm_recor
         "stop_success": record.get("stop_success"),
         "budget_stop": record.get("budget_stop"),
         "time_order_valid": record.get("time_order_valid"),
+        "internal_time_order_valid": record.get("internal_time_order_valid"),
+        "boundary_time_order_valid": record.get("boundary_time_order_valid"),
+        "time_order_violation_count": record.get("time_order_violation_count"),
+        "internal_time_order_violation_count": record.get("internal_time_order_violation_count"),
+        "boundary_time_order_violation_count": record.get("boundary_time_order_violation_count"),
+        "prefix_to_middle_time_order_violation_count": record.get("prefix_to_middle_time_order_violation_count"),
+        "middle_to_suffix_time_order_violation_count": record.get("middle_to_suffix_time_order_violation_count"),
         "empty_bar_rate": record.get("empty_bar_rate"),
         "pitch_analysis_coverage": record.get("pitch_analysis_coverage"),
         "rhythm_analysis_coverage": record.get("rhythm_analysis_coverage"),
@@ -738,6 +745,8 @@ def _evaluate_checkpoint_on_manifest(
     infilling_attempted = 0
     infilling_structural_valid = 0
     infilling_time_order_valid = 0
+    infilling_internal_time_order_valid = 0
+    infilling_boundary_time_order_valid = 0
     infilling_syntax_invalid = 0
     infilling_onset_position_l1: list[float] = []
     infilling_most_common_pitch_ratios: list[float] = []
@@ -1005,6 +1014,8 @@ def _evaluate_checkpoint_on_manifest(
                 infilling_attempted += 1
                 infilling_structural_valid += int(bool(raw_infill_record["is_structurally_valid"]))
                 infilling_time_order_valid += int(bool(raw_infill_record["time_order_valid"]))
+                infilling_internal_time_order_valid += int(bool(raw_infill_record["internal_time_order_valid"]))
+                infilling_boundary_time_order_valid += int(bool(raw_infill_record["boundary_time_order_valid"]))
                 infilling_syntax_invalid += int(not bool(raw_infill_record["is_structurally_valid"]))
                 infilling_onset_position_l1.append(float(raw_infill_record["onset_position_l1_distance"]))
                 pitch_metric_present = False
@@ -1091,6 +1102,14 @@ def _evaluate_checkpoint_on_manifest(
         "continuation_missing_eos_rate": _safe_rate(continuation_missing_eos, continuation_attempted),
         "continuation_syntax_invalid_rate": _safe_rate(continuation_syntax_invalid, continuation_attempted),
         "infilling_syntax_invalid_rate": _safe_rate(infilling_syntax_invalid, infilling_attempted),
+        "infilling_internal_time_order_validity_rate": _safe_rate(
+            infilling_internal_time_order_valid,
+            infilling_attempted,
+        ),
+        "infilling_boundary_time_order_validity_rate": _safe_rate(
+            infilling_boundary_time_order_valid,
+            infilling_attempted,
+        ),
         "append_eos_recoverable_rate": _safe_rate(continuation_append_eos_recoverable, continuation_attempted),
         "low_density_bar_rate": _safe_mean(continuation_low_density_rates),
         "multi_empty_bar_run_rate": _safe_rate(continuation_multi_empty_runs, continuation_attempted),
@@ -1264,6 +1283,8 @@ _PERCENT_METRICS = {
     "continuation_syntax_invalid_rate",
     "infilling_structural_validity_rate",
     "infilling_time_order_validity_rate",
+    "infilling_internal_time_order_validity_rate",
+    "infilling_boundary_time_order_validity_rate",
     "infilling_syntax_invalid_rate",
     "append_eos_recoverable_rate",
     "low_density_bar_rate",
@@ -1307,6 +1328,8 @@ _METRIC_LABELS = {
     "continuation_syntax_invalid_rate": "续写语法非法率",
     "infilling_structural_validity_rate": "补全结构合法率",
     "infilling_time_order_validity_rate": "补全时间顺序合法率",
+    "infilling_internal_time_order_validity_rate": "补全内部时间顺序合法率",
+    "infilling_boundary_time_order_validity_rate": "补全边界时间顺序合法率",
     "infilling_syntax_invalid_rate": "补全语法非法率",
     "valid_loss_from_training": "训练期验证 loss",
     "train_loss_ema": "训练 loss EMA",
@@ -1405,6 +1428,8 @@ def _diagnostic_metric_specs(task_scope: str) -> list[tuple[str, str]]:
     if task_scope == "infilling":
         return [
             ("infilling_syntax_invalid_rate", "补全语法非法率"),
+            ("infilling_internal_time_order_validity_rate", "补全内部时间顺序合法率"),
+            ("infilling_boundary_time_order_validity_rate", "补全边界时间顺序合法率"),
             ("fsm_structural_validity_rate", "FSM 结构合法率"),
             ("fsm_time_order_validity_rate", "FSM 时间顺序合法率"),
             ("fsm_illegal_top1_rate", "FSM 非法 top1 率"),
@@ -1416,6 +1441,8 @@ def _diagnostic_metric_specs(task_scope: str) -> list[tuple[str, str]]:
         ("continuation_missing_eos_rate", "续写缺失 EOS 率"),
         ("continuation_syntax_invalid_rate", "续写语法非法率"),
         ("infilling_syntax_invalid_rate", "补全语法非法率"),
+        ("infilling_internal_time_order_validity_rate", "补全内部时间顺序合法率"),
+        ("infilling_boundary_time_order_validity_rate", "补全边界时间顺序合法率"),
         *common,
     ]
 
@@ -1744,6 +1771,8 @@ _PERCENT_METRICS_V2 = {
     "continuation_syntax_invalid_rate",
     "infilling_structural_validity_rate",
     "infilling_time_order_validity_rate",
+    "infilling_internal_time_order_validity_rate",
+    "infilling_boundary_time_order_validity_rate",
     "infilling_syntax_invalid_rate",
     "append_eos_recoverable_rate",
     "low_density_bar_rate",
@@ -1816,6 +1845,8 @@ _METRIC_LABELS_V2 = {
     "continuation_syntax_invalid_rate": "续写语法非法率",
     "infilling_structural_validity_rate": "补全结构合法率",
     "infilling_time_order_validity_rate": "补全时间顺序合法率",
+    "infilling_internal_time_order_validity_rate": "补全内部时间顺序合法率",
+    "infilling_boundary_time_order_validity_rate": "补全边界时间顺序合法率",
     "infilling_syntax_invalid_rate": "补全语法非法率",
     "continuation_first_event_hit_rate": "续写首事件命中率",
     "continuation_onset_position_l1_distance": "续写起拍位置分布 L1 距离",
@@ -2001,6 +2032,8 @@ def _diagnostic_metric_specs_v2(task_scope: str) -> list[tuple[str, str]]:
     if task_scope == "infilling":
         return [
             ("infilling_syntax_invalid_rate", "补全语法非法率"),
+            ("infilling_internal_time_order_validity_rate", "补全内部时间顺序合法率"),
+            ("infilling_boundary_time_order_validity_rate", "补全边界时间顺序合法率"),
             ("fsm_structural_validity_rate", "FSM 结构合法率"),
             ("fsm_time_order_validity_rate", "FSM 时间顺序合法率"),
             ("fsm_illegal_top1_rate", "FSM 非法 top1 率"),
@@ -2012,6 +2045,8 @@ def _diagnostic_metric_specs_v2(task_scope: str) -> list[tuple[str, str]]:
         ("continuation_missing_eos_rate", "续写缺失 EOS 率"),
         ("continuation_syntax_invalid_rate", "续写语法非法率"),
         ("infilling_syntax_invalid_rate", "补全语法非法率"),
+        ("infilling_internal_time_order_validity_rate", "补全内部时间顺序合法率"),
+        ("infilling_boundary_time_order_validity_rate", "补全边界时间顺序合法率"),
         *common,
     ]
 
@@ -2116,11 +2151,12 @@ def _plot_metric_specs_v2(task_scope: str, *, diagnostics: bool) -> list[dict[st
         if task_scope == "infilling":
             return [
                 {"key": "infilling_syntax_invalid_rate", "label": "补全语法非法率", "percent": True, "goal": "min", "color": "#dc2626"},
+                {"key": "infilling_internal_time_order_validity_rate", "label": "内部时间顺序合法率", "percent": True, "goal": "max", "color": "#2563eb"},
+                {"key": "infilling_boundary_time_order_validity_rate", "label": "边界时间顺序合法率", "percent": True, "goal": "max", "color": "#16a34a"},
                 {"key": "infilling_most_common_pitch_ratio", "label": "最高频 pitch 占比", "goal": "min", "color": "#2563eb"},
-                {"key": "infilling_rhythm_diversity_score", "label": "节奏多样性分数", "goal": "max", "color": "#16a34a"},
-                {"key": "infilling_bar_start_onset_ratio", "label": "小节起点占比", "percent": True, "goal": "min", "color": "#7c3aed"},
-                {"key": "infilling_event_ngram_repeat_ratio", "label": "事件 n-gram 重复占比", "percent": True, "goal": "min", "color": "#0891b2"},
-                {"key": "infilling_rhythm_metric_coverage", "label": "节奏指标覆盖率", "percent": True, "goal": "max", "color": "#ea580c"},
+                {"key": "infilling_rhythm_diversity_score", "label": "节奏多样性分数", "goal": "max", "color": "#7c3aed"},
+                {"key": "infilling_bar_start_onset_ratio", "label": "小节起点占比", "percent": True, "goal": "min", "color": "#0891b2"},
+                {"key": "infilling_event_ngram_repeat_ratio", "label": "事件 n-gram 重复占比", "percent": True, "goal": "min", "color": "#ea580c"},
             ]
         return [
             {"key": "continuation_missing_eos_rate", "label": "续写缺失 EOS 率", "percent": True, "goal": "min", "color": "#dc2626"},

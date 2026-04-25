@@ -23,12 +23,29 @@ from .common import (
     nearest_value,
 )
 from .velocity import VelocityConfig, bin_to_velocity, velocity_to_bin
+from ..music_analysis.key_analysis import analyze_key_timeline
 
 _DEFAULT_TICKS_PER_BEAT = 480
 _DEFAULT_BPM = 120.0
 _MIDI_CHANNEL = 0
 _FORBIDDEN_SEQUENCE_TOKENS = {"FIM_HOLE", "FIM_MID"}
 _FORBIDDEN_SEQUENCE_PREFIXES = ("TASK_",)
+_PITCH_CLASS_NAMES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
+_KEY_TOKEN_ROOTS = (
+    "C",
+    "C_SHARP",
+    "D",
+    "D_SHARP",
+    "E",
+    "F",
+    "F_SHARP",
+    "G",
+    "G_SHARP",
+    "A",
+    "A_SHARP",
+    "B",
+)
+_KEY_NAME_TO_ROOT = {name: root for name, root in zip(_PITCH_CLASS_NAMES, _KEY_TOKEN_ROOTS, strict=True)}
 _INST_PROGRAM_MAP = {
     "PIANO": 0,
     "GUITAR": 24,
@@ -148,6 +165,92 @@ def bpm_to_token(bpm: float, config: TokenizerConfig) -> str:
     return f"TEMPO_{value}"
 
 
+def is_key_token(token: str) -> bool:
+    """Return whether a token is a KEY control token."""
+    return str(token).startswith("KEY_")
+
+
+def key_name_to_token(key_name: str) -> str:
+    """Map key-analysis labels like `C:maj` to ASCII-safe `KEY_*` tokens."""
+    normalized = str(key_name).strip()
+    if normalized == "uncertain":
+        return "KEY_UNCERTAIN"
+    if ":" not in normalized:
+        raise ValueError(f"invalid key name: `{key_name}`")
+    root_name, mode_name = normalized.split(":", 1)
+    root_token = _KEY_NAME_TO_ROOT.get(root_name)
+    if root_token is None:
+        raise ValueError(f"unsupported key root: `{key_name}`")
+    if mode_name == "maj":
+        return f"KEY_{root_token}_MAJ"
+    if mode_name == "min":
+        return f"KEY_{root_token}_MIN"
+    raise ValueError(f"unsupported key mode: `{key_name}`")
+
+
+def build_key_vocab_tokens() -> List[str]:
+    """Return the full KEY token list in a stable vocabulary order."""
+    vocab: List[str] = []
+    for root_token in _KEY_TOKEN_ROOTS:
+        vocab.append(f"KEY_{root_token}_MAJ")
+    for root_token in _KEY_TOKEN_ROOTS:
+        vocab.append(f"KEY_{root_token}_MIN")
+    vocab.append("KEY_UNCERTAIN")
+    return vocab
+
+
+def strip_key_tokens(tokens: Sequence[str]) -> List[str]:
+    """Drop structural KEY tokens from a token sequence."""
+    return [str(token) for token in tokens if not is_key_token(str(token))]
+
+
+def inject_key_tokens(tokens: Sequence[str]) -> List[str]:
+    """Inject sparse KEY tokens at the head and stable modulation bars."""
+    base_tokens = strip_key_tokens(tokens)
+    if not base_tokens or base_tokens[0] != "BOS":
+        return list(base_tokens)
+
+    analysis = analyze_key_timeline(base_tokens)
+    head_key_token = key_name_to_token(analysis.initial_key)
+    modulation_by_bar = {
+        int(point.bar_index): key_name_to_token(point.to_key)
+        for point in analysis.modulation_points
+    }
+
+    injected: List[str] = ["BOS"]
+    idx = 1
+    effective_end = len(base_tokens) - 1 if base_tokens[-1] == "EOS" else len(base_tokens)
+    if idx < effective_end and str(base_tokens[idx]).startswith("TEMPO_"):
+        injected.append(str(base_tokens[idx]))
+        idx += 1
+    injected.append(head_key_token)
+
+    current_bar = -1
+    while idx < effective_end:
+        token = str(base_tokens[idx])
+        if token != "BAR":
+            injected.append(token)
+            idx += 1
+            continue
+
+        current_bar += 1
+        injected.append("BAR")
+        idx += 1
+        if idx < effective_end and str(base_tokens[idx]).startswith("TEMPO_"):
+            injected.append(str(base_tokens[idx]))
+            idx += 1
+        if current_bar in modulation_by_bar:
+            injected.append(modulation_by_bar[current_bar])
+
+        while idx < effective_end and str(base_tokens[idx]) != "BAR":
+            injected.append(str(base_tokens[idx]))
+            idx += 1
+
+    if base_tokens[-1] == "EOS":
+        injected.append("EOS")
+    return injected
+
+
 def build_vocab(config: TokenizerConfig) -> Dict[str, int]:
     """构建词表映射 token -> id。"""
     vocab: List[str] = []
@@ -162,6 +265,7 @@ def build_vocab(config: TokenizerConfig) -> Dict[str, int]:
     vocab.extend([f"VEL_{i}" for i in range(config.velocity_bins)])
     for tempo in range(config.tempo_min, config.tempo_max + 1, config.tempo_step):
         vocab.append(f"TEMPO_{tempo}")
+    vocab.extend(build_key_vocab_tokens())
 
     seen = set()
     deduped: List[str] = []
@@ -209,7 +313,7 @@ def _tokenize_note_events(
 ) -> List[str]:
     """将音符事件与节奏信息编码成 token 序列。"""
     if not notes:
-        return ["BOS", "EOS"]
+        return inject_key_tokens(["BOS", "EOS"])
 
     pos_ticks = bar_ticks / config.positions_per_bar
     velocity_config = config.velocity_config()
@@ -256,7 +360,7 @@ def _tokenize_note_events(
             tokens.append(f"VEL_{vel_bin}")
 
     tokens.append("EOS")
-    return tokens
+    return inject_key_tokens(tokens)
 
 
 def tokenize_midi(mido_file: mido.MidiFile, config: TokenizerConfig) -> List[str]:
@@ -278,12 +382,16 @@ def validate_token_order(tokens: Sequence[str], vocab: Mapping[str, int]) -> Tup
     idx = 1
     if idx < len(tokens) - 1 and tokens[idx].startswith("TEMPO_"):
         idx += 1
+    if idx < len(tokens) - 1 and is_key_token(tokens[idx]):
+        idx += 1
 
     while idx < len(tokens) - 1:
         if tokens[idx] != "BAR":
             return False, oov
         idx += 1
         if idx < len(tokens) - 1 and tokens[idx].startswith("TEMPO_"):
+            idx += 1
+        if idx < len(tokens) - 1 and is_key_token(tokens[idx]):
             idx += 1
         while idx < len(tokens) - 1 and tokens[idx].startswith("POS_"):
             if idx + 4 >= len(tokens):
@@ -413,6 +521,8 @@ def tokens_to_midi(
     if idx < len(normalized) - 1 and normalized[idx].startswith("TEMPO_"):
         initial_bpm = _tempo_from_token(normalized[idx], config)
         idx += 1
+    if idx < len(normalized) - 1 and is_key_token(normalized[idx]):
+        idx += 1
     tempo_events.append((0, initial_bpm))
 
     bar_index = -1
@@ -426,6 +536,8 @@ def tokens_to_midi(
 
         if idx < len(normalized) - 1 and normalized[idx].startswith("TEMPO_"):
             tempo_events.append((bar_start_tick, _tempo_from_token(normalized[idx], config)))
+            idx += 1
+        if idx < len(normalized) - 1 and is_key_token(normalized[idx]):
             idx += 1
 
         while idx < len(normalized) - 1 and normalized[idx].startswith("POS_"):

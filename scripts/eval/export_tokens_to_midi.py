@@ -117,6 +117,9 @@ def _build_structure_only_prefix(prompt_tokens: list[str], *, stop_at_hole: bool
     if idx < len(normalized) and normalized[idx].startswith("TEMPO_"):
         prefix.append(normalized[idx])
         idx += 1
+    if idx < len(normalized) and normalized[idx].startswith("KEY_"):
+        prefix.append(normalized[idx])
+        idx += 1
 
     while idx < len(normalized):
         token = normalized[idx]
@@ -130,6 +133,9 @@ def _build_structure_only_prefix(prompt_tokens: list[str], *, stop_at_hole: bool
             prefix.append(token)
             idx += 1
             if idx < len(normalized) and normalized[idx].startswith("TEMPO_"):
+                prefix.append(normalized[idx])
+                idx += 1
+            if idx < len(normalized) and normalized[idx].startswith("KEY_"):
                 prefix.append(normalized[idx])
                 idx += 1
             continue

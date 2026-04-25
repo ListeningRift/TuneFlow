@@ -23,12 +23,42 @@ from .midi_codec import (
     _collect_tokenizer_notes,
     _tokenize_note_events,
     _transpose_notes,
+    build_key_vocab_tokens,
     build_vocab,
+    is_key_token,
     load_config,
     validate_token_order,
     velocity_to_bucket,
 )
 from .velocity import build_velocity_table
+
+
+def _empty_key_token_stats(key_tokens: List[str]) -> Dict[str, object]:
+    return {
+        "total_key_tokens": 0,
+        "counts_by_token": {token: 0 for token in key_tokens},
+        "major_total": 0,
+        "minor_total": 0,
+        "uncertain_total": 0,
+    }
+
+
+def _accumulate_key_token_stats(stats: Dict[str, object], tokens: List[str]) -> None:
+    counts_by_token = stats.get("counts_by_token")
+    if not isinstance(counts_by_token, dict):
+        return
+    for token in tokens:
+        token_str = str(token)
+        if not is_key_token(token_str):
+            continue
+        counts_by_token[token_str] = int(counts_by_token.get(token_str, 0)) + 1
+        stats["total_key_tokens"] = int(stats.get("total_key_tokens", 0)) + 1
+        if token_str.endswith("_MAJ"):
+            stats["major_total"] = int(stats.get("major_total", 0)) + 1
+        elif token_str.endswith("_MIN"):
+            stats["minor_total"] = int(stats.get("minor_total", 0)) + 1
+        elif token_str == "KEY_UNCERTAIN":
+            stats["uncertain_total"] = int(stats.get("uncertain_total", 0)) + 1
 
 
 def print_velocity_table(config: TokenizerConfig) -> None:
@@ -60,6 +90,7 @@ def process(
 
     midi_root = Path(config.midi_root_dir)
     vocab = build_vocab(config)
+    key_vocab_tokens = build_key_vocab_tokens()
     id_to_token = [None] * len(vocab)
     for token, idx in vocab.items():
         id_to_token[idx] = token
@@ -72,6 +103,7 @@ def process(
     total_augmented_rows = 0
     total_transpose_skips = 0
     parse_errors: List[Dict[str, str]] = []
+    total_key_token_stats = _empty_key_token_stats(key_vocab_tokens)
 
     for split_name, split_file in config.split_files.items():
         rows = load_jsonl(Path(split_file))
@@ -90,6 +122,7 @@ def process(
         skipped_transpose_counts = {
             str(offset): 0 for offset in config.train_transpose_offsets
         }
+        split_key_token_stats = _empty_key_token_stats(key_vocab_tokens)
 
         for row_idx, row in enumerate(rows, 1):
             rel = str(row.get("midi_path", "")).strip()
@@ -128,6 +161,8 @@ def process(
                     if not valid:
                         invalid_count += 1
                     oov_count += line_oov
+                    _accumulate_key_token_stats(split_key_token_stats, tokens)
+                    _accumulate_key_token_stats(total_key_token_stats, tokens)
                     tok_lines.append(" ".join(tokens))
                     lengths.append(len(tokens))
             except Exception as exc:  # pylint: disable=broad-except
@@ -155,6 +190,7 @@ def process(
             "invalid_rows": invalid_count,
             "oov_count": oov_count,
             "length_stats": summarize_lengths(lengths),
+            "key_token_stats": split_key_token_stats,
             "output_file": str(out_path),
         }
 
@@ -175,6 +211,7 @@ def process(
         "total_augmented_rows": total_augmented_rows,
         "total_transpose_skips": total_transpose_skips,
         "invalid_ratio": (0.0 if total_samples == 0 else total_invalid / total_samples),
+        "key_token_stats": total_key_token_stats,
         "split_stats": split_stats,
         "parse_errors_head": parse_errors[:200],
     }

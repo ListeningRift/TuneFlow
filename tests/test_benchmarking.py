@@ -21,6 +21,7 @@ def _long_sequence() -> list[str]:
     return [
         "BOS",
         "TEMPO_120",
+        "KEY_UNCERTAIN",
         "BAR",
         "POS_0",
         "INST_PIANO",
@@ -188,6 +189,26 @@ class BenchmarkingTests(unittest.TestCase):
         payload = analyze_token_sequence(_sequence_with_pitches([60, 60, 60, 60, 60, 64, 67, 69]))
         self.assertAlmostEqual(float(payload["most_common_pitch_ratio"]), 5.0 / 8.0)
         self.assertGreater(float(payload["most_common_pitch_ratio"]), 0.6)
+
+    def test_analyze_token_sequence_ignores_key_control_tokens(self) -> None:
+        payload = analyze_token_sequence(
+            [
+                "BOS",
+                "TEMPO_120",
+                "KEY_C_MAJ",
+                "BAR",
+                "KEY_G_MAJ",
+                "POS_0",
+                "INST_PIANO",
+                "PITCH_60",
+                "DUR_4",
+                "VEL_8",
+                "EOS",
+            ]
+        )
+        self.assertEqual(payload["bar_count"], 1)
+        self.assertEqual(payload["event_count"], 1)
+        self.assertTrue(payload["time_order_valid"])
 
     def test_analyze_token_sequence_detects_long_same_pitch_run_ratio(self) -> None:
         payload = analyze_token_sequence(_sequence_with_pitches([60, 62, 64, 64, 64, 64, 64, 67]))
@@ -367,6 +388,29 @@ class BenchmarkingTests(unittest.TestCase):
             grammar_fsm.transition(prefix_state, token_to_id["POS_0"]),
             "after_pos",
         )
+
+    def test_grammar_fsm_accepts_sparse_key_control_tokens(self) -> None:
+        vocab_tokens = [
+            "BOS",
+            "EOS",
+            "BAR",
+            "TEMPO_120",
+            "KEY_C_MAJ",
+            "KEY_G_MAJ",
+            "POS_0",
+            "INST_PIANO",
+            "PITCH_60",
+            "DUR_4",
+            "VEL_8",
+        ]
+        token_to_id = {token: index for index, token in enumerate(vocab_tokens)}
+        grammar_fsm = TuneFlowGrammarFSM.from_vocab(token_to_id)
+
+        valid, reason = grammar_fsm.inspect_complete_tokens(
+            ["BOS", "TEMPO_120", "KEY_C_MAJ", "BAR", "KEY_G_MAJ", "POS_0", "INST_PIANO", "PITCH_60", "DUR_4", "VEL_8", "EOS"]
+        )
+        self.assertTrue(valid, msg=reason)
+        self.assertEqual(reason, "ok")
 
     def test_generate_middle_tokens_allows_note_prefix_that_becomes_suffix_compatible_later(self) -> None:
         if torch is None:

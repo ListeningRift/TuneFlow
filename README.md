@@ -56,6 +56,8 @@ uv run data-pipeline --clean-limit 200 --split-limit 200 --tokenize-limit-per-sp
 uv run data-pipeline --start-from tokenize --stop-after validate
 ```
 
+如果你是从不带 `KEY_*` 的旧词表/旧数据升级到当前版本，至少需要重新执行一次 `tokenize -> build -> validate`，不要复用旧的 `.tok`、`.bin`、`.idx.json` 与 `tokenizer_vocab.json`。
+
 4. 也可分步执行
 ```bash
 uv run data-clean --config configs/data/cleaning.yaml
@@ -70,9 +72,14 @@ uv run data-validate
 - `data/eval/fixed_eval.jsonl`
 - `data/tokenized/{train,valid,test,eval}.tok`
 - `data/tokenized/tokenizer_vocab.json`
+- `data/tokenized/token_stats.json`
 - `data/tokenized/{train,valid,test,eval}.bin`
 - `data/tokenized/{train,valid,test,eval}.idx.json`
 - `outputs/reports/data/validate_data_report.json`
+
+当前 tokenizer 会额外稀疏写入调式调性控制 token：`KEY_*`（24 个大小调 + `KEY_UNCERTAIN`）。这些 token 复用项目内的调性分析工具自动检测，只会出现在序列头部和稳定转调点对应的小节头；若同一位置同时存在速度和调性变化，顺序固定为 `TEMPO_*` 在前、`KEY_*` 在后。
+
+`data/tokenized/token_stats.json` 现在会包含 `key_token_stats`，`outputs/reports/data/validate_data_report.json` 也会回显这部分摘要。统计口径以最终写入 `.tok` 的样本为准，包含 train split 的转调增强，至少会给出每种 `KEY_*` 的数量，以及 `major_total`、`minor_total`、`uncertain_total`。
 
 ## 配置化训练
 训练参数统一放到 YAML，并拆成两档：
@@ -151,6 +158,8 @@ uv run train-regression-check --device cpu --precision fp32 --seq-len 64 --batch
 uv run eval-export-midi --input-json outputs/benchmark/base_full/samples/final_top3/step_100000/continuation.json --output outputs/debug/sample_case_all
 ```
 
+导出 MIDI 时会接受带 `KEY_*` 的 token 序列，但这些 token 只作为控制信息参与解析，不会被反编译成额外的 MIDI 事件。
+
 不传 `--case-index` 时，会把 JSON 里的所有 case 都导出到目标目录下：
 - continuation 样本会生成 `0_full.mid`、`0_continuation.mid`
 - infilling 样本会生成 `0_full.mid`、`0_infilling.mid`
@@ -199,6 +208,10 @@ uv run tools-archive --preset small --dry-run
 - `fim_ratio`：每个 batch 中 FIM 样本比例（0~1）
 - `fim_min_span`：FIM 挖洞最小 token 长度
 - `fim_max_span`：FIM 挖洞最大 token 长度
+- `fim_eos_ratio`：FIM 样本中显式监督 EOS 的比例
+- `single_phrase_sample_ratio` / `cross_phrase_sample_ratio` / `long_context_sample_ratio`：phrase window 三类采样分布
+
+说明：旧的 `bos_sample_ratio` / `eos_sample_ratio` NEXT 锚点采样已从训练代码中移除，避免继续鼓励模型偏向序列头尾位置。
 
 ## TODO 模块
 

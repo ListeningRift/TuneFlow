@@ -20,14 +20,22 @@ def _build_bar_span_window(
 
     window_tokens: list[str] = ["BOS"]
     leading_tempo = analysis.bars[start_bar].effective_tempo_token
+    leading_key = analysis.bars[start_bar].effective_key_token
     if leading_tempo is not None:
         window_tokens.append(leading_tempo)
+    if leading_key is not None:
+        window_tokens.append(leading_key)
 
     for bar_index in range(start_bar, end_bar):
         bar = analysis.bars[bar_index]
         raw_bar_tokens = [str(token) for token in source_tokens[bar.start_token : bar.end_token]]
-        if len(raw_bar_tokens) >= 2 and raw_bar_tokens[0] == "BAR" and raw_bar_tokens[1].startswith("TEMPO_"):
-            raw_bar_tokens = ["BAR", *raw_bar_tokens[2:]]
+        if raw_bar_tokens and raw_bar_tokens[0] == "BAR":
+            idx = 1
+            if idx < len(raw_bar_tokens) and raw_bar_tokens[idx].startswith("TEMPO_"):
+                idx += 1
+            if idx < len(raw_bar_tokens) and raw_bar_tokens[idx].startswith("KEY_"):
+                idx += 1
+            raw_bar_tokens = ["BAR", *raw_bar_tokens[idx:]]
         window_tokens.extend(raw_bar_tokens)
 
     window_tokens.append("EOS")

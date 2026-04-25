@@ -165,6 +165,8 @@ def _parse_token_events(tokens: Sequence[str], config: KeyAnalysisConfig) -> _Pa
     idx = 1
     if idx < effective_end and values[idx].startswith("TEMPO_"):
         idx += 1
+    if idx < effective_end and values[idx].startswith("KEY_"):
+        idx += 1
 
     current_bar = -1
     bar_count = 0
@@ -178,6 +180,8 @@ def _parse_token_events(tokens: Sequence[str], config: KeyAnalysisConfig) -> _Pa
             bar_count = max(bar_count, current_bar + 1)
             idx += 1
             if idx < effective_end and values[idx].startswith("TEMPO_"):
+                idx += 1
+            if idx < effective_end and values[idx].startswith("KEY_"):
                 idx += 1
             continue
         if token.startswith("POS_") and current_bar >= 0:

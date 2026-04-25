@@ -68,7 +68,8 @@ def main() -> None:
     ]
     eval_cmd = [
         args.python_exec,
-        "scripts/eval/eval_all.py",
+        "-m",
+        "scripts.eval.eval_all",
         "--preset",
         args.preset,
     ]

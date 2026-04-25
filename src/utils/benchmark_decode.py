@@ -100,18 +100,21 @@ def continuation_eos_bias(*, generated_len: int, max_can_generate: int, fsm_stat
     progress = float(generated_len) / float(max_can_generate)
     remaining_budget = max_can_generate - generated_len
     bias = 0.0
-    if progress >= 0.50:
-        bias += 0.35
-    if progress >= 0.70:
-        bias += 0.75
-    if progress >= 0.85:
-        bias += 1.50
-    if remaining_budget <= 8:
-        bias += 0.75
-    if remaining_budget <= 4:
-        bias += 1.00
-    if fsm_state in _SAFE_CLOSE_STATES and generated_len >= 8:
-        bias += 0.50
+    if progress >= 0.60:
+        bias += 0.20
+    if progress >= 0.78:
+        bias += 0.60
+    if progress >= 0.90:
+        bias += 1.35
+    if remaining_budget <= 6:
+        bias += 0.65
+    if remaining_budget <= 3:
+        bias += 1.10
+    if (
+        fsm_state in _SAFE_CLOSE_STATES
+        and generated_len >= max(16, min(32, max_can_generate // 3))
+    ):
+        bias += 0.40
     return bias
 
 
@@ -122,9 +125,9 @@ def should_force_safe_boundary_stop(*, generated_len: int, max_can_generate: int
     if generated_len <= 0 or max_can_generate <= 0:
         return False
     remaining_budget = max_can_generate - generated_len
-    if remaining_budget > max(4, min(8, max_can_generate // 8)):
+    if remaining_budget > max(3, min(5, max_can_generate // 10)):
         return False
-    return generated_len >= max(8, min(24, max_can_generate // 4))
+    return generated_len >= max(16, min(28, max_can_generate // 3))
 
 
 def _forward_decode_step(

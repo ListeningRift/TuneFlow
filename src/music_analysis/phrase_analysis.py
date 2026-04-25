@@ -1,4 +1,4 @@
-"""Phrase-oriented analysis and sampling for TuneFlow token sequences."""
+"""TuneFlow token 序列的乐句分析与采样工具。"""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from typing import Sequence
 
 @dataclass(frozen=True)
 class PhraseAnalysisConfig:
-    """Heuristic config for phrase boundary analysis."""
+    """乐句边界分析的启发式配置。"""
 
     positions_per_bar: int = 32
     min_phrase_bars: int = 2
@@ -26,7 +26,7 @@ class PhraseAnalysisConfig:
 
 @dataclass(frozen=True)
 class BarInfo:
-    """Statistics for one bar in a token sequence."""
+    """token 序列中单个小节的统计信息。"""
 
     start_token: int
     end_token: int
@@ -36,11 +36,12 @@ class BarInfo:
     pitch_span: int
     mean_duration: float
     effective_tempo_token: str | None
+    effective_key_token: str | None
 
 
 @dataclass(frozen=True)
 class BoundaryScore:
-    """Boundary score attached to the boundary before `bar_index`."""
+    """附着在 `bar_index` 之前边界上的得分。"""
 
     bar_index: int
     score: float
@@ -49,20 +50,21 @@ class BoundaryScore:
 
 @dataclass(frozen=True)
 class PhraseSpan:
-    """A phrase-like bar span with normalized phrase-view tokens."""
+    """带标准化乐句视图 token 的类乐句小节区间。"""
 
     start_bar: int
     end_bar: int
     start_token: int
     end_token: int
     tempo_token: str | None
+    key_token: str | None
     tokens: tuple[str, ...]
     source_kind: str
 
 
 @dataclass(frozen=True)
 class PhraseAnalysis:
-    """Result of phrase analysis for a token sequence."""
+    """单条 token 序列的乐句分析结果。"""
 
     bars: tuple[BarInfo, ...]
     boundary_scores: tuple[BoundaryScore, ...]
@@ -71,7 +73,7 @@ class PhraseAnalysis:
 
 @dataclass(frozen=True)
 class PhraseWindowPolicy:
-    """Sampling policy for phrase-aware windows."""
+    """面向乐句窗口的采样策略。"""
 
     kind: str
     min_bars: int
@@ -81,13 +83,14 @@ class PhraseWindowPolicy:
 
 @dataclass(frozen=True)
 class SampledWindow:
-    """A normalized sampled window ready for training or eval."""
+    """可直接用于训练或评测的标准化采样窗口。"""
 
     tokens: tuple[str, ...]
     source_kind: str
     start_bar: int
     end_bar: int
     tempo_token: str | None
+    key_token: str | None
     boundary_count: int
 
 
@@ -96,18 +99,24 @@ def _safe_ratio(delta: float, left: float, right: float) -> float:
     return min(1.0, max(0.0, float(delta) / denom))
 
 
-def _iter_bar_slices(tokens: Sequence[str]) -> tuple[list[tuple[int, int, str | None]], str | None] | None:
+def _iter_bar_slices(
+    tokens: Sequence[str],
+) -> tuple[list[tuple[int, int, str | None, str | None]], str | None, str | None] | None:
     if not tokens or tokens[0] != "BOS":
         return None
 
     effective_end = len(tokens) - 1 if tokens[-1] == "EOS" else len(tokens)
     current_tempo: str | None = None
+    current_key: str | None = None
     idx = 1
     if idx < effective_end and str(tokens[idx]).startswith("TEMPO_"):
         current_tempo = str(tokens[idx])
         idx += 1
+    if idx < effective_end and str(tokens[idx]).startswith("KEY_"):
+        current_key = str(tokens[idx])
+        idx += 1
 
-    bars: list[tuple[int, int, str | None]] = []
+    bars: list[tuple[int, int, str | None, str | None]] = []
     while idx < effective_end:
         if tokens[idx] != "BAR":
             return None
@@ -116,22 +125,27 @@ def _iter_bar_slices(tokens: Sequence[str]) -> tuple[list[tuple[int, int, str | 
         if idx < effective_end and str(tokens[idx]).startswith("TEMPO_"):
             current_tempo = str(tokens[idx])
             idx += 1
+        if idx < effective_end and str(tokens[idx]).startswith("KEY_"):
+            current_key = str(tokens[idx])
+            idx += 1
         while idx < effective_end and tokens[idx] != "BAR":
             idx += 1
-        bars.append((bar_start, idx, current_tempo))
-    return bars, current_tempo
+        bars.append((bar_start, idx, current_tempo, current_key))
+    return bars, current_tempo, current_key
 
 
 def _build_bar_info(tokens: Sequence[str], config: PhraseAnalysisConfig) -> tuple[BarInfo, ...]:
     parsed = _iter_bar_slices(tokens)
     if parsed is None:
         return tuple()
-    raw_bars, _ = parsed
+    raw_bars, _, _ = parsed
 
     bars: list[BarInfo] = []
-    for start_token, end_token, effective_tempo in raw_bars:
+    for start_token, end_token, effective_tempo, effective_key in raw_bars:
         idx = start_token + 1
         if idx < end_token and str(tokens[idx]).startswith("TEMPO_"):
+            idx += 1
+        if idx < end_token and str(tokens[idx]).startswith("KEY_"):
             idx += 1
 
         note_count = 0
@@ -191,6 +205,7 @@ def _build_bar_info(tokens: Sequence[str], config: PhraseAnalysisConfig) -> tupl
                 pitch_span=pitch_span,
                 mean_duration=mean_duration,
                 effective_tempo_token=effective_tempo,
+                effective_key_token=effective_key,
             )
         )
     return tuple(bars)
@@ -350,8 +365,13 @@ def _build_phrase_spans(
 
 def _normalized_bar_tokens(tokens: Sequence[str], bar: BarInfo) -> list[str]:
     raw_tokens = [str(token) for token in tokens[bar.start_token : bar.end_token]]
-    if len(raw_tokens) >= 2 and raw_tokens[0] == "BAR" and raw_tokens[1].startswith("TEMPO_"):
-        return ["BAR", *raw_tokens[2:]]
+    if raw_tokens and raw_tokens[0] == "BAR":
+        idx = 1
+        if idx < len(raw_tokens) and raw_tokens[idx].startswith("TEMPO_"):
+            idx += 1
+        if idx < len(raw_tokens) and raw_tokens[idx].startswith("KEY_"):
+            idx += 1
+        return ["BAR", *raw_tokens[idx:]]
     return raw_tokens
 
 
@@ -365,8 +385,11 @@ def _build_phrase_view_tokens(
         raise IndexError("invalid bar span")
     phrase_tokens: list[str] = ["BOS"]
     tempo_token = bars[start_bar].effective_tempo_token
+    key_token = bars[start_bar].effective_key_token
     if tempo_token is not None:
         phrase_tokens.append(tempo_token)
+    if key_token is not None:
+        phrase_tokens.append(key_token)
     for bar_index in range(start_bar, end_bar):
         phrase_tokens.extend(_normalized_bar_tokens(tokens, bars[bar_index]))
     phrase_tokens.append("EOS")
@@ -383,12 +406,14 @@ def _build_phrase_span(
     start_token = bars[start_bar].start_token
     end_token = bars[end_bar - 1].end_token
     tempo_token = bars[start_bar].effective_tempo_token
+    key_token = bars[start_bar].effective_key_token
     return PhraseSpan(
         start_bar=start_bar,
         end_bar=end_bar,
         start_token=start_token,
         end_token=end_token,
         tempo_token=tempo_token,
+        key_token=key_token,
         tokens=_build_phrase_view_tokens(tokens, bars, start_bar, end_bar),
         source_kind=source_kind,
     )
@@ -398,7 +423,7 @@ def analyze_phrase_candidates(
     tokens: Sequence[str],
     config: PhraseAnalysisConfig | None = None,
 ) -> PhraseAnalysis:
-    """Analyze phrase candidates from one token sequence."""
+    """从单条 token 序列中分析乐句候选区间。"""
     config = PhraseAnalysisConfig() if config is None else config
     bars = _build_bar_info(tokens, config)
     boundary_scores = _build_boundary_scores(bars, config)
@@ -416,7 +441,7 @@ def extract_phrase(
     phrase_index: int,
     tempo_mode: str = "phrase_start",
 ) -> PhraseSpan:
-    """Extract one analyzed phrase span."""
+    """提取一个已经分析出的乐句区间。"""
     if tempo_mode != "phrase_start":
         raise ValueError(f"Unsupported tempo_mode: {tempo_mode!r}")
     if phrase_index < 0 or phrase_index >= len(analysis.phrase_spans):
@@ -429,6 +454,7 @@ def extract_phrase(
         start_token=span.start_token,
         end_token=span.end_token,
         tempo_token=span.tempo_token,
+        key_token=span.key_token,
         tokens=rebuilt_tokens,
         source_kind=span.source_kind,
     )
@@ -460,6 +486,7 @@ def _choose_single_phrase_window(
                     start_bar=span.start_bar,
                     end_bar=span.end_bar,
                     tempo_token=span.tempo_token,
+                    key_token=span.key_token,
                     boundary_count=0,
                 )
             )
@@ -482,6 +509,7 @@ def _choose_single_phrase_window(
                         start_bar=start_bar,
                         end_bar=end_bar,
                         tempo_token=analysis.bars[start_bar].effective_tempo_token,
+                        key_token=analysis.bars[start_bar].effective_key_token,
                         boundary_count=0,
                     )
                 )
@@ -521,6 +549,7 @@ def _choose_cross_boundary_window(
                         start_bar=start_bar,
                         end_bar=end_bar,
                         tempo_token=analysis.bars[start_bar].effective_tempo_token,
+                        key_token=analysis.bars[start_bar].effective_key_token,
                         boundary_count=1,
                     )
                 )
@@ -561,6 +590,7 @@ def _choose_long_context_window(
                     start_bar=start_bar,
                     end_bar=end_bar,
                     tempo_token=analysis.bars[start_bar].effective_tempo_token,
+                    key_token=analysis.bars[start_bar].effective_key_token,
                     boundary_count=boundary_count,
                 )
             )
@@ -575,7 +605,7 @@ def sample_phrase_window(
     policy: PhraseWindowPolicy,
     rng: random.Random,
 ) -> SampledWindow | None:
-    """Sample one phrase-aware window from a token sequence."""
+    """从 token 序列中采样一个带乐句感知的窗口。"""
     if policy.kind == "single_phrase":
         return _choose_single_phrase_window(tokens, analysis, policy, rng)
     if policy.kind == "cross_boundary":

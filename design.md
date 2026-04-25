@@ -1,4 +1,4 @@
-# MIDI Infilling Transformer 设计文档（v1.3）
+# MIDI Infilling Transformer 设计文档（v1.4）
 
 ## 1. 项目目标
 - 构建基于 Transformer 的 Symbolic MIDI 生成模型。
@@ -56,10 +56,15 @@ MIDI Dataset
   - `VEL_0..15`（16 档，非线性分桶：中间更细、两端更稀）
 - 控制 token：
   - `TEMPO_x`（特殊控制 token）
+  - `KEY_{C|C_SHARP|D|D_SHARP|E|F|F_SHARP|G|G_SHARP|A|A_SHARP|B}_{MAJ|MIN}`
+  - `KEY_UNCERTAIN`
 - 特殊 token（阶段1）：`BOS` `EOS` `FIM_HOLE` `FIM_MID`
 
 阶段1Token 约束：
 - `TEMPO_x` 只允许在两种位置出现：`BOS` 后的开头位置，或 `BAR` 后（仅当发生速度变化时）。
+- `KEY_*` 只允许在两种位置出现：`BOS` 后的开头位置，或 `BAR` 后的小节头位置；若同一位置同时存在 `TEMPO_*` 与 `KEY_*`，顺序固定为 `TEMPO_*` 在前、`KEY_*` 在后。
+- `KEY_*` 采用 ASCII 规范化命名，词表在现有 vocab 末尾追加 25 个新 token，保持历史 token id 不漂移。固定映射示例：`C:maj -> KEY_C_MAJ`、`C#:min -> KEY_C_SHARP_MIN`、`uncertain -> KEY_UNCERTAIN`。
+- 调性 token 采用稀疏发布策略：只标注序列起始处的初始稳定调性，以及稳定转调起点对应的小节头；中间不发布不稳定帧标记。若整首曲子没有稳定初始调性，则仅在头部发布一次 `KEY_UNCERTAIN`。
 - 音符事件统一为四元组顺序：`INST_x PITCH_x DUR_x VEL_x`。
 - `INST_x` 首版仅启用 6 类：`PIANO` `GUITAR` `BASS` `STRINGS` `LEAD` `PAD`。
 - `STYLE_x` 暂不启用；阶段2后按数据集可用性引入，并作为 `BOS` 后的可选单次控制 token。
@@ -81,13 +86,19 @@ MIDI Dataset
 
 ### 4.2 序列格式
 ```
-BOS TEMPO_120
+BOS TEMPO_120 KEY_C_MAJ
 BAR POS_0 INST_PIANO PITCH_60 DUR_4 VEL_10
 POS_4 INST_PIANO PITCH_62 DUR_3 VEL_9
-BAR TEMPO_128
+BAR TEMPO_128 KEY_G_MAJ
 POS_0 INST_LEAD PITCH_67 DUR_8 VEL_11
 EOS
 ```
+
+头部与小节头结构统一约定为：
+- `BOS [TEMPO_*] [KEY_*] BAR ... EOS`
+- `BAR [TEMPO_*] [KEY_*] ...`
+
+调性注入流程为：先生成当前版本的音符/tempo token 序列，再在完整 token 序列上运行 `analyze_key_timeline`，把初始稳定调性与 `modulation_points.to_key` 稀疏注回 token 序列。对 train split 的转调增强样本，必须在转调后的音高序列上重新分析与注入，不能复用原调结果。
 
 ### 4.3 工程化定义（输入/输出/验收）
 - 输入：
@@ -96,11 +107,15 @@ EOS
 - 输出：
   - `*.tok`（token 序列）
   - `tokenizer_vocab.json`
-  - `token_stats.json`（长度分布、OOV=0）
+  - `token_stats.json`（长度分布、OOV=0、`key_token_stats`）
 - 验收标准：
   - 100% 样本可编码；解码回 MIDI 不报错
   - 词表规模在 `200~320`
   - token 非法顺序率 `< 1%`
+  - `validate_token_order`、完整序列校验与 `TuneFlowGrammarFSM` 需接受 `BOS -> KEY_*`、`BOS -> TEMPO_* -> KEY_*`、`BAR -> KEY_*`、`BAR -> TEMPO_* -> KEY_*` 等合法路径，并拒绝其他位置的 `KEY_*`
+  - `token_stats.json` 按最终写入 `.tok` 的样本分布统计 `KEY_*`，包含 train augmentation，并至少输出 `total_key_tokens`、`counts_by_token`、`major_total`、`minor_total`、`uncertain_total`
+  - `validate_data_report.json` 需回显上述 `key_token_stats` 摘要，便于处理完成后直接检查每种调性的数量
+  - `tokens_to_midi`、benchmark sample 导出与其他反编译链路必须接受 `KEY_*`，但将其视为可忽略控制信息，不反编译成 MIDI 事件
 
 ### 4.4 乐器 Token 引入顺序（先于 Style）
 - `INST_x` 的构建放在 style 处理之前，先保证“乐器语义正确”，再做 `STYLE_x`。
@@ -157,7 +172,7 @@ raw MIDI
 | ---- | ------------------------ | --------------------------- | ------------------------------------------- | ---------------------------- |
 | 1    | `clean_dataset.py`       | `data/raw`                  | `data/clean` + `clean_report.json`          | 可用样本率、过滤原因统计完整 |
 | 2    | `split_dataset.py`       | `data/clean`                | `data/base/style/eval` 切分清单             | 无跨集合泄漏                 |
-| 3    | `tokenize_dataset.py`    | 切分清单 + `tokenizer.yaml` | `data/tokenized/*.tok` + `token_stats.json` | OOV=0，非法顺序率达标        |
+| 3    | `tokenize_dataset.py`    | 切分清单 + `tokenizer.yaml` | `data/tokenized/*.tok` + `token_stats.json` | OOV=0，非法顺序率达标，含 `KEY_*` 稀疏注入与调性统计 |
 | 4    | `build_training_data.py` | `data/tokenized/*.tok`      | `data/tokenized/train.bin/.idx` 等          | 可被训练脚本直接加载         |
 
 ### 6.3 失败处理
@@ -184,29 +199,33 @@ raw MIDI
 训练样本格式（阶段1）：
 NEXT：
 ```
-BOS [TEMPO_120] <SEQUENCE> EOS
+BOS [TEMPO_120] [KEY_C_MAJ] <SEQUENCE> EOS
 ```
 
 FIM：
 ```
-BOS [TEMPO_120] <PREFIX> FIM_HOLE <SUFFIX> FIM_MID <MIDDLE> EOS
+BOS [TEMPO_120] [KEY_C_MAJ] <PREFIX> FIM_HOLE <SUFFIX> FIM_MID <MIDDLE> EOS
 ```
+
+窗口归一化与切分约束：
+- continuation / infilling 切分、FIM maskable unit 边界、训练窗口 cut positions、benchmark 诊断与 sample export 前缀重建，均将 `KEY_*` 视为与 `TEMPO_*` 等价的控制边界。
+- phrase window 与 eval window 只保留窗口起点有效的一个头部 `KEY_*`；窗口内部的小节级 `KEY_*` 在归一化视图里去掉，避免泄漏未来转调信息。
 
 ### 7.2 阶段2（后续）：扩展 Free Generation / 条件控制
 - Continuation 行为仍由阶段1的 NEXT 统一承担，不单独新增 `TASK_CONT` 训练任务。
 - Free Generation：
-  - 输入：`BOS`（可选 `STYLE_x`，可选 `TEMPO_x`）
+  - 输入：`BOS`（可选 `STYLE_x`，可选 `TEMPO_x`，可选 `KEY_*`）
   - 输出：`<FULL_SEQUENCE_TO_EOS>`
 
 训练样本格式（阶段2，建议，当前未启用）：
 Infilling：
 ```
-TASK_INFILL BOS [STYLE_x] [TEMPO_x] <PREFIX> FIM_HOLE <SUFFIX> FIM_MID <MIDDLE> EOS
+TASK_INFILL BOS [STYLE_x] [TEMPO_x] [KEY_*] <PREFIX> FIM_HOLE <SUFFIX> FIM_MID <MIDDLE> EOS
 ```
 
 Free Generation：
 ```
-TASK_GEN BOS [STYLE_x] [TEMPO_x] <FULL_SEQUENCE_TO_EOS> EOS
+TASK_GEN BOS [STYLE_x] [TEMPO_x] [KEY_*] <FULL_SEQUENCE_TO_EOS> EOS
 ```
 
 ### 7.3 工程化定义（输入/输出/验收）

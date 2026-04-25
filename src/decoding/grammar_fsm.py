@@ -9,8 +9,12 @@ from typing import Mapping, Sequence
 EXPECT_BOS = "expect_bos"
 AFTER_BOS = "after_bos"
 AFTER_HEAD_TEMPO = "after_head_tempo"
+AFTER_HEAD_KEY = "after_head_key"
+AFTER_HEAD_TEMPO_KEY = "after_head_tempo_key"
 AFTER_BAR = "after_bar"
 AFTER_BAR_TEMPO = "after_bar_tempo"
+AFTER_BAR_KEY = "after_bar_key"
+AFTER_BAR_TEMPO_KEY = "after_bar_tempo_key"
 AFTER_POS = "after_pos"
 AFTER_INST = "after_inst"
 AFTER_PITCH = "after_pitch"
@@ -36,8 +40,12 @@ class TuneFlowGrammarFSM:
         EXPECT_BOS,
         AFTER_BOS,
         AFTER_HEAD_TEMPO,
+        AFTER_HEAD_KEY,
+        AFTER_HEAD_TEMPO_KEY,
         AFTER_BAR,
         AFTER_BAR_TEMPO,
+        AFTER_BAR_KEY,
+        AFTER_BAR_TEMPO_KEY,
         AFTER_POS,
         AFTER_INST,
         AFTER_PITCH,
@@ -56,6 +64,7 @@ class TuneFlowGrammarFSM:
             raise ValueError("TuneFlow grammar requires BOS, EOS, and BAR tokens in the vocab.")
 
         self._tempo_ids: tuple[int, ...] = self._collect_prefix_ids("TEMPO_")
+        self._key_ids: tuple[int, ...] = self._collect_prefix_ids("KEY_")
         self._pos_ids: tuple[int, ...] = self._collect_prefix_ids("POS_")
         self._inst_ids: tuple[int, ...] = self._collect_prefix_ids("INST_")
         self._pitch_ids: tuple[int, ...] = self._collect_prefix_ids("PITCH_")
@@ -67,6 +76,7 @@ class TuneFlowGrammarFSM:
         self._register_ids((self.eos_id,), "EOS")
         self._register_ids((self.bar_id,), "BAR")
         self._register_ids(self._tempo_ids, "TEMPO")
+        self._register_ids(self._key_ids, "KEY")
         self._register_ids(self._pos_ids, "POS")
         self._register_ids(self._inst_ids, "INST")
         self._register_ids(self._pitch_ids, "PITCH")
@@ -75,10 +85,14 @@ class TuneFlowGrammarFSM:
 
         self._allowed_ids_by_state: dict[str, tuple[int, ...]] = {
             EXPECT_BOS: (self.bos_id,),
-            AFTER_BOS: (*self._tempo_ids, self.bar_id, self.eos_id),
-            AFTER_HEAD_TEMPO: (self.bar_id, self.eos_id),
-            AFTER_BAR: (*self._tempo_ids, *self._pos_ids, self.bar_id, self.eos_id),
-            AFTER_BAR_TEMPO: (*self._pos_ids, self.bar_id, self.eos_id),
+            AFTER_BOS: (*self._tempo_ids, *self._key_ids, self.bar_id, self.eos_id),
+            AFTER_HEAD_TEMPO: (*self._key_ids, self.bar_id, self.eos_id),
+            AFTER_HEAD_KEY: (self.bar_id, self.eos_id),
+            AFTER_HEAD_TEMPO_KEY: (self.bar_id, self.eos_id),
+            AFTER_BAR: (*self._tempo_ids, *self._key_ids, *self._pos_ids, self.bar_id, self.eos_id),
+            AFTER_BAR_TEMPO: (*self._key_ids, *self._pos_ids, self.bar_id, self.eos_id),
+            AFTER_BAR_KEY: (*self._pos_ids, self.bar_id, self.eos_id),
+            AFTER_BAR_TEMPO_KEY: (*self._pos_ids, self.bar_id, self.eos_id),
             AFTER_POS: self._inst_ids,
             AFTER_INST: self._pitch_ids,
             AFTER_PITCH: self._dur_ids,
@@ -121,12 +135,28 @@ class TuneFlowGrammarFSM:
         if state == AFTER_BOS:
             if category == "TEMPO":
                 return AFTER_HEAD_TEMPO
+            if category == "KEY":
+                return AFTER_HEAD_KEY
             if category == "BAR":
                 return AFTER_BAR
             if category == "EOS":
                 return TERMINAL
             return None
         if state == AFTER_HEAD_TEMPO:
+            if category == "KEY":
+                return AFTER_HEAD_TEMPO_KEY
+            if category == "BAR":
+                return AFTER_BAR
+            if category == "EOS":
+                return TERMINAL
+            return None
+        if state == AFTER_HEAD_KEY:
+            if category == "BAR":
+                return AFTER_BAR
+            if category == "EOS":
+                return TERMINAL
+            return None
+        if state == AFTER_HEAD_TEMPO_KEY:
             if category == "BAR":
                 return AFTER_BAR
             if category == "EOS":
@@ -135,6 +165,8 @@ class TuneFlowGrammarFSM:
         if state == AFTER_BAR:
             if category == "TEMPO":
                 return AFTER_BAR_TEMPO
+            if category == "KEY":
+                return AFTER_BAR_KEY
             if category == "POS":
                 return AFTER_POS
             if category == "BAR":
@@ -143,6 +175,24 @@ class TuneFlowGrammarFSM:
                 return TERMINAL
             return None
         if state == AFTER_BAR_TEMPO:
+            if category == "KEY":
+                return AFTER_BAR_TEMPO_KEY
+            if category == "POS":
+                return AFTER_POS
+            if category == "BAR":
+                return AFTER_BAR
+            if category == "EOS":
+                return TERMINAL
+            return None
+        if state == AFTER_BAR_KEY:
+            if category == "POS":
+                return AFTER_POS
+            if category == "BAR":
+                return AFTER_BAR
+            if category == "EOS":
+                return TERMINAL
+            return None
+        if state == AFTER_BAR_TEMPO_KEY:
             if category == "POS":
                 return AFTER_POS
             if category == "BAR":
@@ -273,12 +323,20 @@ class TuneFlowGrammarFSM:
         if state == EXPECT_BOS:
             return f"expected_bos@{index}:{token}"
         if state == AFTER_BOS:
-            return f"expected_tempo_bar_or_eos@{index}:{token}"
+            return f"expected_tempo_key_bar_or_eos@{index}:{token}"
         if state == AFTER_HEAD_TEMPO:
+            return f"expected_key_bar_or_eos@{index}:{token}"
+        if state == AFTER_HEAD_KEY:
+            return f"expected_bar_or_eos@{index}:{token}"
+        if state == AFTER_HEAD_TEMPO_KEY:
             return f"expected_bar_or_eos@{index}:{token}"
         if state == AFTER_BAR:
-            return f"expected_tempo_pos_bar_or_eos@{index}:{token}"
+            return f"expected_tempo_key_pos_bar_or_eos@{index}:{token}"
         if state == AFTER_BAR_TEMPO:
+            return f"expected_key_pos_bar_or_eos@{index}:{token}"
+        if state == AFTER_BAR_KEY:
+            return f"expected_pos_bar_or_eos@{index}:{token}"
+        if state == AFTER_BAR_TEMPO_KEY:
             return f"expected_pos_bar_or_eos@{index}:{token}"
         if state == AFTER_POS:
             return f"expected_inst@{index}:{token}"
@@ -297,7 +355,17 @@ class TuneFlowGrammarFSM:
     def _unfinished_reason(self, *, state: str) -> str:
         if state == EXPECT_BOS:
             return "empty_sequence"
-        if state in {AFTER_BOS, AFTER_HEAD_TEMPO, AFTER_BAR, AFTER_BAR_TEMPO, AFTER_VEL}:
+        if state in {
+            AFTER_BOS,
+            AFTER_HEAD_TEMPO,
+            AFTER_HEAD_KEY,
+            AFTER_HEAD_TEMPO_KEY,
+            AFTER_BAR,
+            AFTER_BAR_TEMPO,
+            AFTER_BAR_KEY,
+            AFTER_BAR_TEMPO_KEY,
+            AFTER_VEL,
+        }:
             return "missing_eos"
         if state == AFTER_POS:
             return "incomplete_note_tuple_expected_inst"

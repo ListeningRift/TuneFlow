@@ -56,6 +56,14 @@ def check_token_stats(stats: Dict[str, object], failures: List[str]) -> None:
         failures.append(f"token_stats.oov_count 应为 0，实际为 {oov_count}")
     if invalid_rows != 0:
         failures.append(f"token_stats.invalid_rows 应为 0，实际为 {invalid_rows}")
+    key_token_stats = stats.get("key_token_stats")
+    if not isinstance(key_token_stats, dict):
+        failures.append("token_stats.key_token_stats 缺失或格式错误")
+        return
+    required_fields = {"total_key_tokens", "counts_by_token", "major_total", "minor_total", "uncertain_total"}
+    missing = sorted(required_fields.difference(key_token_stats))
+    if missing:
+        failures.append(f"token_stats.key_token_stats 缺少字段: {', '.join(missing)}")
 
 
 def validate_idx_payload(
@@ -147,6 +155,15 @@ def run_checks(cfg: ValidateConfig) -> Tuple[List[str], Dict[str, object]]:
             "total_rows": token_stats.get("total_rows"),
             "vocab_size": token_stats.get("vocab_size"),
         }
+        key_token_stats = token_stats.get("key_token_stats", {})
+        if isinstance(key_token_stats, dict):
+            details["key_token_stats_head"] = {
+                "total_key_tokens": key_token_stats.get("total_key_tokens"),
+                "major_total": key_token_stats.get("major_total"),
+                "minor_total": key_token_stats.get("minor_total"),
+                "uncertain_total": key_token_stats.get("uncertain_total"),
+                "counts_by_token": key_token_stats.get("counts_by_token"),
+            }
 
     build_report: Dict[str, object] = {}
     split_reports: Dict[str, object] = {}

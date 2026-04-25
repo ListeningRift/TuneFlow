@@ -152,6 +152,8 @@ _COMMON_SUMMARY_KEYS = (
     "fsm_first_token_accuracy",
     "infilling_structural_validity_rate",
     "infilling_time_order_validity_rate",
+    "infilling_internal_time_order_validity_rate",
+    "infilling_boundary_time_order_validity_rate",
     "continuation_structural_validity_rate",
     "continuation_stop_success_rate",
     "continuation_budget_stop_rate",

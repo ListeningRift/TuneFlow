@@ -12,6 +12,7 @@ from src.music_analysis import (
     extract_phrase,
     sample_phrase_window,
 )
+from src.tokenizer.midi_codec import inject_key_tokens
 from src.training.train_base import PhraseSamplingConfig, TokenBinDataset
 from src.utils.eval_windows import sample_bar_aligned_subsequence
 
@@ -156,6 +157,16 @@ class MusicAnalysisTests(unittest.TestCase):
         self.assertEqual(phrase.tokens[1], "TEMPO_132")
         self.assertEqual(sum(1 for token in phrase.tokens if token.startswith("TEMPO_")), 1)
 
+    def test_extract_phrase_keeps_only_window_start_key_token(self) -> None:
+        tokens = inject_key_tokens(_c_to_g_major_tokens())
+        analysis = analyze_phrase_candidates(tokens)
+        phrase = extract_phrase(tokens, analysis, 1)
+        self.assertEqual(phrase.key_token, "KEY_G_MAJ")
+        self.assertEqual(phrase.tokens[0], "BOS")
+        self.assertEqual(phrase.tokens[1], "TEMPO_120")
+        self.assertEqual(phrase.tokens[2], "KEY_G_MAJ")
+        self.assertEqual(sum(1 for token in phrase.tokens if token.startswith("KEY_")), 1)
+
     def test_analyze_phrase_candidates_accepts_missing_terminal_eos(self) -> None:
         tokens = _phrase_source_tokens()[:-1]
         analysis = analyze_phrase_candidates(tokens)
@@ -199,8 +210,19 @@ class MusicAnalysisTests(unittest.TestCase):
         self.assertEqual(window[-1], "EOS")
         self.assertLessEqual(sum(1 for token in window if token.startswith("TEMPO_")), 1)
 
+    def test_eval_window_keeps_only_window_start_key(self) -> None:
+        tokens = inject_key_tokens(_c_to_g_major_tokens())
+        rng = random.Random(7)
+        window = sample_bar_aligned_subsequence(tokens, max_core_tokens=80, min_core_tokens=24, rng=rng)
+        self.assertIsNotNone(window)
+        assert window is not None
+        self.assertEqual(window[0], "BOS")
+        self.assertEqual(window[-1], "EOS")
+        self.assertLessEqual(sum(1 for token in window if token.startswith("KEY_")), 1)
+
+
     def test_phrase_fim_builder_falls_back_to_generic_structure(self) -> None:
-        base_tokens_text = ["BOS", "TEMPO_120", "BAR", "POS_0", "INST_PIANO", "PITCH_60", "DUR_1", "VEL_8", "BAR", "EOS"]
+        base_tokens_text = ["BOS", "TEMPO_120", "KEY_UNCERTAIN", "BAR", "POS_0", "INST_PIANO", "PITCH_60", "DUR_1", "VEL_8", "BAR", "EOS"]
         vocab_tokens = [
             "BOS",
             "EOS",
@@ -213,6 +235,7 @@ class MusicAnalysisTests(unittest.TestCase):
             "DUR_1",
             "VEL_8",
             "TEMPO_120",
+            "KEY_UNCERTAIN",
         ]
         token_to_id = {token: idx for idx, token in enumerate(vocab_tokens)}
         id_to_token = list(vocab_tokens)
@@ -332,6 +355,11 @@ class MusicAnalysisTests(unittest.TestCase):
         self.assertEqual(analysis.segments[0].start_pos, 0)
         self.assertEqual(analysis.segments[0].end_bar, 4)
         self.assertEqual(analysis.segments[0].end_pos, 0)
+
+    def test_key_timeline_ignores_existing_key_tokens(self) -> None:
+        analysis = analyze_key_timeline(inject_key_tokens(_c_to_g_major_tokens()))
+        self.assertEqual(analysis.initial_key, "C:maj")
+        self.assertEqual([segment.key for segment in analysis.segments], ["C:maj", "G:maj"])
 
 
 if __name__ == "__main__":

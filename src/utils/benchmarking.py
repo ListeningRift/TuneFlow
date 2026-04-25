@@ -54,6 +54,9 @@ def _collect_continuation_split_positions(core: list[str]) -> list[int]:
     if idx < len(core) and core[idx].startswith("TEMPO_"):
         idx += 1
         positions.add(idx)
+    if idx < len(core) and core[idx].startswith("KEY_"):
+        idx += 1
+        positions.add(idx)
 
     while idx < len(core):
         if core[idx] != "BAR":
@@ -61,6 +64,8 @@ def _collect_continuation_split_positions(core: list[str]) -> list[int]:
         positions.add(idx)
         idx += 1
         if idx < len(core) and core[idx].startswith("TEMPO_"):
+            idx += 1
+        if idx < len(core) and core[idx].startswith("KEY_"):
             idx += 1
 
         while idx < len(core) and core[idx].startswith("POS_"):
@@ -93,6 +98,9 @@ def _collect_infill_maskable_units(core: list[str]) -> list[tuple[int, int, str,
     if idx < len(core) and core[idx].startswith("TEMPO_"):
         idx += 1
         group_id += 1
+    if idx < len(core) and core[idx].startswith("KEY_"):
+        idx += 1
+        group_id += 1
 
     while idx < len(core):
         if core[idx] != "BAR":
@@ -101,6 +109,9 @@ def _collect_infill_maskable_units(core: list[str]) -> list[tuple[int, int, str,
         idx += 1
 
         if idx < len(core) and core[idx].startswith("TEMPO_"):
+            idx += 1
+            group_id += 1
+        if idx < len(core) and core[idx].startswith("KEY_"):
             idx += 1
             group_id += 1
 
@@ -421,7 +432,7 @@ def build_benchmark_manifest(
 def _extract_first_unit(tokens: Sequence[str]) -> tuple[str, ...] | None:
     filtered = [token for token in tokens if token not in {"BOS", "EOS", "FIM_HOLE", "FIM_MID"}]
     idx = 0
-    while idx < len(filtered) and filtered[idx].startswith("TEMPO_"):
+    while idx < len(filtered) and (filtered[idx].startswith("TEMPO_") or filtered[idx].startswith("KEY_")):
         idx += 1
     if idx >= len(filtered):
         return None
@@ -724,7 +735,7 @@ def analyze_token_sequence(tokens: Sequence[str]) -> dict[str, Any]:
         if token == "EOS":
             close_bar()
             break
-        if token.startswith("TEMPO_"):
+        if token.startswith("TEMPO_") or token.startswith("KEY_"):
             idx += 1
             continue
         if token == "BAR":
@@ -823,6 +834,95 @@ def analyze_token_sequence(tokens: Sequence[str]) -> dict[str, Any]:
     }
 
 
+def _last_pos_in_active_bar(tokens: Sequence[str]) -> int | None:
+    values = list(tokens)
+    idx = 0
+    current_bar_last_pos: int | None = None
+
+    while idx < len(values):
+        token = str(values[idx])
+        if token in {"BOS", "EOS", "FIM_HOLE", "FIM_MID"}:
+            idx += 1
+            continue
+        if token.startswith("TEMPO_") or token.startswith("KEY_"):
+            idx += 1
+            continue
+        if token == "BAR":
+            current_bar_last_pos = None
+            idx += 1
+            continue
+        if token.startswith("POS_"):
+            pos_value = _parse_prefixed_int(token, "POS_")
+            if pos_value is not None:
+                current_bar_last_pos = pos_value
+            if idx + 4 >= len(values):
+                break
+            inst_token, pitch_token, dur_token, vel_token = [str(item) for item in values[idx + 1 : idx + 5]]
+            if (
+                not inst_token.startswith("INST_")
+                or not pitch_token.startswith("PITCH_")
+                or not dur_token.startswith("DUR_")
+                or not vel_token.startswith("VEL_")
+            ):
+                break
+            idx += 5
+            continue
+        break
+
+    return current_bar_last_pos
+
+
+def _first_pos_before_bar(tokens: Sequence[str]) -> int | None:
+    values = list(tokens)
+    idx = 0
+
+    while idx < len(values):
+        token = str(values[idx])
+        if token in {"BOS", "EOS", "FIM_HOLE", "FIM_MID"}:
+            idx += 1
+            continue
+        if token.startswith("TEMPO_") or token.startswith("KEY_"):
+            idx += 1
+            continue
+        if token == "BAR":
+            return None
+        if token.startswith("POS_"):
+            return _parse_prefixed_int(token, "POS_")
+        break
+
+    return None
+
+
+def _infilling_boundary_time_order_stats(
+    prefix_tokens: Sequence[str],
+    generated_middle_tokens: Sequence[str],
+    suffix_tokens: Sequence[str],
+) -> dict[str, int]:
+    prefix_last_pos = _last_pos_in_active_bar(prefix_tokens)
+    middle_first_pos = _first_pos_before_bar(generated_middle_tokens)
+    middle_last_pos = _last_pos_in_active_bar(generated_middle_tokens)
+    suffix_first_pos = _first_pos_before_bar(suffix_tokens)
+
+    prefix_to_middle_violation_count = int(
+        prefix_last_pos is not None
+        and middle_first_pos is not None
+        and middle_first_pos < prefix_last_pos
+    )
+    middle_to_suffix_violation_count = int(
+        middle_last_pos is not None
+        and suffix_first_pos is not None
+        and suffix_first_pos < middle_last_pos
+    )
+
+    return {
+        "prefix_to_middle_violation_count": prefix_to_middle_violation_count,
+        "middle_to_suffix_violation_count": middle_to_suffix_violation_count,
+        "boundary_violation_count": (
+            prefix_to_middle_violation_count + middle_to_suffix_violation_count
+        ),
+    }
+
+
 def enrich_continuation_record(record: dict[str, Any], *, target_tokens: Sequence[str]) -> dict[str, Any]:
     """为 continuation decode 轨迹补充面向音乐的诊断字段。"""
     generated_analysis = analyze_token_sequence(record.get("generated_tokens", []))
@@ -885,14 +985,34 @@ def enrich_continuation_record(record: dict[str, Any], *, target_tokens: Sequenc
 
 def enrich_infilling_record(record: dict[str, Any], *, target_hole_tokens: Sequence[str]) -> dict[str, Any]:
     """为 infilling decode 轨迹补充面向音乐的诊断字段。"""
+    prefix_tokens = list(record.get("prefix_tokens", []))
+    generated_middle_tokens = list(record.get("generated_middle_tokens", []))
+    suffix_tokens = list(record.get("suffix_tokens", []))
     generated_analysis = analyze_token_sequence(record.get("generated_middle_tokens", []))
     target_analysis = analyze_token_sequence(target_hole_tokens)
     reconstructed_analysis = analyze_token_sequence(record.get("reconstructed_tokens", []))
+    boundary_order_stats = _infilling_boundary_time_order_stats(
+        prefix_tokens,
+        generated_middle_tokens,
+        suffix_tokens,
+    )
+    internal_time_order_violation_count = int(generated_analysis["time_order_violation_count"])
+    boundary_time_order_violation_count = int(boundary_order_stats["boundary_violation_count"])
     enriched = dict(record)
     enriched.update(
         {
             "time_order_valid": bool(reconstructed_analysis["time_order_valid"]),
             "time_order_violation_count": int(reconstructed_analysis["time_order_violation_count"]),
+            "internal_time_order_valid": (internal_time_order_violation_count == 0),
+            "internal_time_order_violation_count": internal_time_order_violation_count,
+            "boundary_time_order_valid": (boundary_time_order_violation_count == 0),
+            "boundary_time_order_violation_count": boundary_time_order_violation_count,
+            "prefix_to_middle_time_order_violation_count": int(
+                boundary_order_stats["prefix_to_middle_violation_count"]
+            ),
+            "middle_to_suffix_time_order_violation_count": int(
+                boundary_order_stats["middle_to_suffix_violation_count"]
+            ),
             "generated_bar_count": int(generated_analysis["bar_count"]),
             "generated_event_count": int(generated_analysis["event_count"]),
             "generated_pitch_span": int(generated_analysis["pitch_span"]),

@@ -9,12 +9,14 @@ from pathlib import Path
 
 import mido
 
-from src.tokenizer import TokenizerConfig, tokenize_midi, tokens_to_midi
+from src.tokenizer import TokenizerConfig, build_vocab, tokenize_midi, tokens_to_midi
 from src.tokenizer.common import collect_tempo_changes
+from src.tokenizer.midi_codec import inject_key_tokens
+from src.tokenizer.tokenize_dataset import process as tokenize_dataset_process
 
 
 def _roundtrip_tokens() -> list[str]:
-    return [
+    return inject_key_tokens([
         "BOS",
         "TEMPO_120",
         "BAR",
@@ -36,12 +38,13 @@ def _roundtrip_tokens() -> list[str]:
         "DUR_8",
         "VEL_10",
         "EOS",
-    ]
+    ])
 
 
 def _default_tempo_tokens() -> list[str]:
     return [
         "BOS",
+        "KEY_UNCERTAIN",
         "BAR",
         "POS_0",
         "INST_PIANO",
@@ -53,7 +56,7 @@ def _default_tempo_tokens() -> list[str]:
 
 
 def _continuation_full_tokens() -> list[str]:
-    return [
+    return inject_key_tokens([
         "BOS",
         "TEMPO_120",
         "BAR",
@@ -69,13 +72,14 @@ def _continuation_full_tokens() -> list[str]:
         "DUR_4",
         "VEL_8",
         "EOS",
-    ]
+    ])
 
 
 def _continuation_prompt_tokens() -> list[str]:
     return [
         "BOS",
         "TEMPO_120",
+        "KEY_UNCERTAIN",
         "BAR",
         "POS_0",
         "INST_PIANO",
@@ -100,6 +104,7 @@ def _continuation_partial_expected_tokens() -> list[str]:
     return [
         "BOS",
         "TEMPO_120",
+        "KEY_UNCERTAIN",
         "BAR",
         "BAR",
         "POS_4",
@@ -125,6 +130,7 @@ def _continuation_target_expected_tokens() -> list[str]:
     return [
         "BOS",
         "TEMPO_120",
+        "KEY_UNCERTAIN",
         "BAR",
         "BAR",
         "POS_8",
@@ -137,7 +143,7 @@ def _continuation_target_expected_tokens() -> list[str]:
 
 
 def _continuation_reference_full_tokens() -> list[str]:
-    return [
+    return inject_key_tokens([
         "BOS",
         "TEMPO_120",
         "BAR",
@@ -153,11 +159,11 @@ def _continuation_reference_full_tokens() -> list[str]:
         "DUR_4",
         "VEL_8",
         "EOS",
-    ]
+    ])
 
 
 def _infilling_full_tokens() -> list[str]:
-    return [
+    return inject_key_tokens([
         "BOS",
         "TEMPO_120",
         "BAR",
@@ -177,13 +183,14 @@ def _infilling_full_tokens() -> list[str]:
         "DUR_4",
         "VEL_8",
         "EOS",
-    ]
+    ])
 
 
 def _infilling_prompt_tokens() -> list[str]:
     return [
         "BOS",
         "TEMPO_120",
+        "KEY_UNCERTAIN",
         "BAR",
         "POS_0",
         "INST_PIANO",
@@ -214,6 +221,7 @@ def _infilling_partial_expected_tokens() -> list[str]:
     return [
         "BOS",
         "TEMPO_120",
+        "KEY_UNCERTAIN",
         "BAR",
         "POS_4",
         "INST_PIANO",
@@ -238,6 +246,7 @@ def _infilling_target_expected_tokens() -> list[str]:
     return [
         "BOS",
         "TEMPO_120",
+        "KEY_UNCERTAIN",
         "BAR",
         "POS_8",
         "INST_PIANO",
@@ -249,7 +258,7 @@ def _infilling_target_expected_tokens() -> list[str]:
 
 
 def _infilling_reference_full_tokens() -> list[str]:
-    return [
+    return inject_key_tokens([
         "BOS",
         "TEMPO_120",
         "BAR",
@@ -269,10 +278,230 @@ def _infilling_reference_full_tokens() -> list[str]:
         "DUR_4",
         "VEL_8",
         "EOS",
+    ])
+
+
+def _c_major_roundtrip_tokens() -> list[str]:
+    return [
+        "BOS",
+        "TEMPO_120",
+        "KEY_C_MAJ",
+        "BAR",
+        "POS_0",
+        "INST_PIANO",
+        "PITCH_60",
+        "DUR_12",
+        "VEL_8",
+        "POS_8",
+        "INST_PIANO",
+        "PITCH_64",
+        "DUR_8",
+        "VEL_8",
+        "POS_16",
+        "INST_PIANO",
+        "PITCH_67",
+        "DUR_12",
+        "VEL_8",
+        "BAR",
+        "POS_0",
+        "INST_PIANO",
+        "PITCH_57",
+        "DUR_12",
+        "VEL_8",
+        "POS_8",
+        "INST_PIANO",
+        "PITCH_60",
+        "DUR_8",
+        "VEL_8",
+        "POS_16",
+        "INST_PIANO",
+        "PITCH_64",
+        "DUR_12",
+        "VEL_8",
+        "BAR",
+        "POS_0",
+        "INST_PIANO",
+        "PITCH_65",
+        "DUR_12",
+        "VEL_8",
+        "POS_8",
+        "INST_PIANO",
+        "PITCH_69",
+        "DUR_8",
+        "VEL_8",
+        "POS_16",
+        "INST_PIANO",
+        "PITCH_72",
+        "DUR_12",
+        "VEL_8",
+        "BAR",
+        "POS_0",
+        "INST_PIANO",
+        "PITCH_60",
+        "DUR_12",
+        "VEL_8",
+        "POS_8",
+        "INST_PIANO",
+        "PITCH_64",
+        "DUR_8",
+        "VEL_8",
+        "POS_16",
+        "INST_PIANO",
+        "PITCH_67",
+        "DUR_12",
+        "VEL_8",
+        "EOS",
+    ]
+
+
+def _c_to_g_major_roundtrip_tokens() -> list[str]:
+    return [
+        "BOS",
+        "TEMPO_120",
+        "KEY_C_MAJ",
+        "BAR",
+        "POS_0",
+        "INST_PIANO",
+        "PITCH_60",
+        "DUR_12",
+        "VEL_8",
+        "POS_8",
+        "INST_PIANO",
+        "PITCH_64",
+        "DUR_8",
+        "VEL_8",
+        "POS_16",
+        "INST_PIANO",
+        "PITCH_67",
+        "DUR_12",
+        "VEL_8",
+        "BAR",
+        "POS_0",
+        "INST_PIANO",
+        "PITCH_57",
+        "DUR_12",
+        "VEL_8",
+        "POS_8",
+        "INST_PIANO",
+        "PITCH_60",
+        "DUR_8",
+        "VEL_8",
+        "POS_16",
+        "INST_PIANO",
+        "PITCH_64",
+        "DUR_12",
+        "VEL_8",
+        "BAR",
+        "POS_0",
+        "INST_PIANO",
+        "PITCH_65",
+        "DUR_12",
+        "VEL_8",
+        "POS_8",
+        "INST_PIANO",
+        "PITCH_69",
+        "DUR_8",
+        "VEL_8",
+        "POS_16",
+        "INST_PIANO",
+        "PITCH_72",
+        "DUR_12",
+        "VEL_8",
+        "BAR",
+        "KEY_G_MAJ",
+        "POS_0",
+        "INST_PIANO",
+        "PITCH_60",
+        "DUR_12",
+        "VEL_8",
+        "POS_8",
+        "INST_PIANO",
+        "PITCH_64",
+        "DUR_8",
+        "VEL_8",
+        "POS_16",
+        "INST_PIANO",
+        "PITCH_67",
+        "DUR_12",
+        "VEL_8",
+        "BAR",
+        "POS_0",
+        "INST_PIANO",
+        "PITCH_67",
+        "DUR_12",
+        "VEL_8",
+        "POS_8",
+        "INST_PIANO",
+        "PITCH_71",
+        "DUR_8",
+        "VEL_8",
+        "POS_16",
+        "INST_PIANO",
+        "PITCH_74",
+        "DUR_12",
+        "VEL_8",
+        "BAR",
+        "POS_0",
+        "INST_PIANO",
+        "PITCH_64",
+        "DUR_12",
+        "VEL_8",
+        "POS_8",
+        "INST_PIANO",
+        "PITCH_67",
+        "DUR_8",
+        "VEL_8",
+        "POS_16",
+        "INST_PIANO",
+        "PITCH_71",
+        "DUR_12",
+        "VEL_8",
+        "BAR",
+        "POS_0",
+        "INST_PIANO",
+        "PITCH_60",
+        "DUR_12",
+        "VEL_8",
+        "POS_8",
+        "INST_PIANO",
+        "PITCH_67",
+        "DUR_8",
+        "VEL_8",
+        "POS_16",
+        "INST_PIANO",
+        "PITCH_71",
+        "DUR_12",
+        "VEL_8",
+        "BAR",
+        "POS_0",
+        "INST_PIANO",
+        "PITCH_67",
+        "DUR_12",
+        "VEL_8",
+        "POS_8",
+        "INST_PIANO",
+        "PITCH_71",
+        "DUR_8",
+        "VEL_8",
+        "POS_16",
+        "INST_PIANO",
+        "PITCH_74",
+        "DUR_12",
+        "VEL_8",
+        "EOS",
     ]
 
 
 class TokenizerMidiCodecTests(unittest.TestCase):
+    def test_build_vocab_appends_key_tokens_without_shifting_existing_ids(self) -> None:
+        vocab = build_vocab(TokenizerConfig())
+        self.assertEqual(vocab["BAR"], 4)
+        self.assertEqual(vocab["TEMPO_40"], 152)
+        self.assertEqual(vocab["TEMPO_220"], 242)
+        self.assertEqual(vocab["KEY_C_MAJ"], 243)
+        self.assertEqual(vocab["KEY_B_MIN"], 266)
+        self.assertEqual(vocab["KEY_UNCERTAIN"], 267)
+
     def test_tokens_to_midi_roundtrip_preserves_quantized_tokens(self) -> None:
         config = TokenizerConfig()
         midi = tokens_to_midi(_roundtrip_tokens(), config, ticks_per_beat=480)
@@ -286,7 +515,55 @@ class TokenizerMidiCodecTests(unittest.TestCase):
         reencoded = tokenize_midi(midi, config)
 
         self.assertAlmostEqual(float(tempo_events[0][1]), 120.0, places=4)
-        self.assertEqual(reencoded[:3], ["BOS", "TEMPO_120", "BAR"])
+        self.assertEqual(reencoded[:4], ["BOS", "TEMPO_120", "KEY_UNCERTAIN", "BAR"])
+
+    def test_tokens_to_midi_roundtrip_preserves_major_key_token(self) -> None:
+        config = TokenizerConfig()
+        midi = tokens_to_midi(_c_major_roundtrip_tokens(), config, ticks_per_beat=480)
+
+        self.assertEqual(tokenize_midi(midi, config), _c_major_roundtrip_tokens())
+
+    def test_tokens_to_midi_roundtrip_preserves_sparse_modulation_key_tokens(self) -> None:
+        config = TokenizerConfig()
+        midi = tokens_to_midi(_c_to_g_major_roundtrip_tokens(), config, ticks_per_beat=480)
+
+        self.assertEqual(tokenize_midi(midi, config), _c_to_g_major_roundtrip_tokens())
+
+    def test_tokenize_dataset_reports_key_token_stats(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            midi_root = tmp_path / "midi"
+            midi_root.mkdir(parents=True, exist_ok=True)
+            output_dir = tmp_path / "tokenized"
+            vocab_path = output_dir / "tokenizer_vocab.json"
+            stats_path = output_dir / "token_stats.json"
+            split_path = tmp_path / "train.jsonl"
+            midi_path = midi_root / "sample.mid"
+
+            midi = tokens_to_midi(_c_major_roundtrip_tokens(), TokenizerConfig(), ticks_per_beat=480)
+            midi.save(str(midi_path))
+            split_path.write_text(json.dumps({"midi_path": "sample.mid"}, ensure_ascii=False) + "\n", encoding="utf-8")
+
+            config = TokenizerConfig(
+                midi_root_dir=str(midi_root),
+                train_transpose_offsets=[],
+                split_files={"train": str(split_path)},
+            )
+            tokenize_dataset_process(
+                config=config,
+                output_dir=output_dir,
+                vocab_path=vocab_path,
+                stats_path=stats_path,
+                limit_per_split=None,
+            )
+
+            stats = json.loads(stats_path.read_text(encoding="utf-8"))
+            key_token_stats = stats["key_token_stats"]
+            split_key_token_stats = stats["split_stats"]["train"]["key_token_stats"]
+            self.assertGreater(int(key_token_stats["total_key_tokens"]), 0)
+            self.assertEqual(int(key_token_stats["major_total"]), int(key_token_stats["total_key_tokens"]))
+            self.assertEqual(int(key_token_stats["counts_by_token"]["KEY_C_MAJ"]), 1)
+            self.assertEqual(int(split_key_token_stats["counts_by_token"]["KEY_C_MAJ"]), 1)
 
     def test_tokens_to_midi_rejects_invalid_or_incomplete_sequences(self) -> None:
         config = TokenizerConfig()

@@ -263,7 +263,12 @@ class TokenBinDataset:
                 return []
 
             token = id_to_token[token_id]
-            if token in {"BOS", "EOS", "FIM_HOLE", "FIM_MID"} or token.startswith("TEMPO_") or token == "BAR":
+            if (
+                token in {"BOS", "EOS", "FIM_HOLE", "FIM_MID"}
+                or token.startswith("TEMPO_")
+                or token.startswith("KEY_")
+                or token == "BAR"
+            ):
                 idx += 1
                 positions.append(idx)
                 continue
@@ -405,7 +410,11 @@ class TokenBinDataset:
                 continue
 
             token = id_to_token[token_id]
-            if token in {"BOS", "EOS", "FIM_HOLE", "FIM_MID"} or token.startswith("TEMPO_"):
+            if (
+                token in {"BOS", "EOS", "FIM_HOLE", "FIM_MID"}
+                or token.startswith("TEMPO_")
+                or token.startswith("KEY_")
+            ):
                 idx += 1
                 group_id += 1
                 continue
@@ -718,8 +727,6 @@ class TokenBinDataset:
         token_to_id: dict[str, int] | None = None,
         eos_token_id: int | None = None,
         phrase_sampling: PhraseSamplingConfig | None = None,
-        bos_sample_ratio: float = 0.0,
-        eos_sample_ratio: float = 0.0,
     ):
         """采样 NEXT batch（labels 与 input_ids 对齐，由模型内部完成 shift）。"""
         input_rows: list[list[int]] = []
@@ -738,18 +745,11 @@ class TokenBinDataset:
                 input_rows.append(encoded)
                 label_rows.append(encoded.copy())
             else:
-                pick = rng.random()
-                if pick < bos_sample_ratio:
-                    anchor = "start"
-                elif pick < bos_sample_ratio + eos_sample_ratio:
-                    anchor = "end"
-                else:
-                    anchor = "random"
                 window = self._sample_aligned_window(
                     rng=rng,
                     window_len=seq_len,
                     id_to_token=id_to_token,
-                    anchor=anchor,
+                    anchor="random",
                 )
                 input_rows.append(window)
                 label_rows.append(window.copy())
@@ -780,8 +780,6 @@ class TokenBinDataset:
         fim_mid_token_id: int | None,
         fim_min_span: int,
         fim_max_span: int,
-        bos_sample_ratio: float,
-        eos_sample_ratio: float,
         fim_eos_ratio: float,
         eos_token_id: int | None,
         phrase_sampling: PhraseSamplingConfig | None = None,
@@ -904,18 +902,11 @@ class TokenBinDataset:
                     label_rows.append(encoded.copy())
                     sample_stats[f"{window_kind}_examples"] += 1
                 else:
-                    pick = rng.random()
-                    if pick < bos_sample_ratio:
-                        anchor = "start"
-                    elif pick < bos_sample_ratio + eos_sample_ratio:
-                        anchor = "end"
-                    else:
-                        anchor = "random"
                     window = self._sample_aligned_window(
                         rng=rng,
                         window_len=seq_len,
                         id_to_token=id_to_token,
-                        anchor=anchor,
+                        anchor="random",
                     )
                     input_rows.append(window)
                     label_rows.append(window.copy())
@@ -1024,18 +1015,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=64,
         help="Maximum FIM hole length in tokens.",
-    )
-    parser.add_argument(
-        "--bos-sample-ratio",
-        type=float,
-        default=0.1,
-        help="Fraction of NEXT samples anchored at sequence start to strengthen BOS-prefix continuation.",
-    )
-    parser.add_argument(
-        "--eos-sample-ratio",
-        type=float,
-        default=0.1,
-        help="Fraction of NEXT samples anchored at sequence end to strengthen EOS prediction.",
     )
     parser.add_argument(
         "--fim-eos-ratio",
@@ -1352,12 +1331,6 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit("--steps must be > 0.")
     if not (0.0 <= args.fim_ratio <= 1.0):
         raise SystemExit("--fim-ratio must be within [0, 1].")
-    if not (0.0 <= args.bos_sample_ratio <= 1.0):
-        raise SystemExit("--bos-sample-ratio must be within [0, 1].")
-    if not (0.0 <= args.eos_sample_ratio <= 1.0):
-        raise SystemExit("--eos-sample-ratio must be within [0, 1].")
-    if args.bos_sample_ratio + args.eos_sample_ratio > 1.0:
-        raise SystemExit("--bos-sample-ratio + --eos-sample-ratio must be <= 1.")
     if not (0.0 <= args.fim_eos_ratio <= 1.0):
         raise SystemExit("--fim-eos-ratio must be within [0, 1].")
     if args.fim_min_span <= 0:
@@ -1495,7 +1468,7 @@ def main(argv: list[str] | None = None) -> None:
         f"[train_base] params={total_params:,} device={device} precision={precision_name} "
         f"steps={args.steps} batch={args.batch_size} grad_accum={args.grad_accum_steps} "
         f"effective_batch={effective_batch} seq_len={args.seq_len} fim_ratio={args.fim_ratio:.2f} "
-        f"bos_ratio={args.bos_sample_ratio:.2f} eos_ratio={args.eos_sample_ratio:.2f} fim_eos_ratio={args.fim_eos_ratio:.2f}"
+        f"fim_eos_ratio={args.fim_eos_ratio:.2f}"
     )
     if phrase_sampling.enabled:
         print(
@@ -1548,8 +1521,6 @@ def main(argv: list[str] | None = None) -> None:
             "approx_total_data_passes": approx_total_data_passes,
             "approx_remaining_data_passes": approx_remaining_data_passes,
             "fim_ratio": args.fim_ratio,
-            "bos_sample_ratio": args.bos_sample_ratio,
-            "eos_sample_ratio": args.eos_sample_ratio,
             "fim_eos_ratio": args.fim_eos_ratio,
             "fim_min_span": args.fim_min_span,
             "fim_max_span": args.fim_max_span,
@@ -1594,8 +1565,6 @@ def main(argv: list[str] | None = None) -> None:
                     fim_mid_token_id=fim_mid_token_id,
                     fim_min_span=args.fim_min_span,
                     fim_max_span=args.fim_max_span,
-                    bos_sample_ratio=args.bos_sample_ratio,
-                    eos_sample_ratio=args.eos_sample_ratio,
                     fim_eos_ratio=args.fim_eos_ratio,
                     eos_token_id=eos_token_id,
                     phrase_sampling=phrase_sampling,
