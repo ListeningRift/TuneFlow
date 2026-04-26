@@ -248,11 +248,11 @@ def _parse_args(*, task_scope: str, argv: list[str] | None = None) -> argparse.N
     parser.add_argument(
         "--max-new-tokens",
         type=int,
-        default=128,
+        default=512,
         help=(
             "单条样本最多允许生成多少个新 token。作用：限制续写/补全长度，防止无限生成。\n"
             "值越大越慢，但也更不容易被截断。\n"
-            "例子：--max-new-tokens 96"
+            "例子：--max-new-tokens 384"
         ),
     )
     parser.add_argument(
@@ -2234,10 +2234,15 @@ def _build_summary_markdown_v2(
     exported_samples: dict[str, dict[str, dict[str, list[dict[str, Any]]]]],
     manifest_stats: dict[str, Any],
     checkpoint_prefilter: dict[str, Any],
+    evaluation_context: dict[str, Any],
 ) -> str:
     final_sample_artifacts = dict(sample_artifacts.get("final_top3", {}))
     final_exported_samples = dict(exported_samples.get("final_top3", {}))
     formal_candidate_artifacts = dict(sample_artifacts.get("formal_candidates", {}))
+    decoding = dict(evaluation_context.get("decoding", {}))
+    benchmark_configs = dict(evaluation_context.get("benchmark_configs", {}))
+    config_paths = dict(evaluation_context.get("config_paths", {}))
+    train_run = dict(training_summary.get("run", {})) if isinstance(training_summary.get("run"), dict) else {}
     lines = [f"# {_TASK_TITLES[task_scope]}: {run_id}", ""]
     lines.extend(
         [
@@ -2265,6 +2270,71 @@ def _build_summary_markdown_v2(
                 "",
             ]
         )
+
+    eval_context_rows = [
+        ["task_scope", str(task_scope)],
+        ["train_config", str(config_paths.get("train_config", ""))],
+        ["fast_config", str(config_paths.get("fast_config", ""))],
+        ["formal_config", str(config_paths.get("formal_config", ""))],
+        ["vocab_path", str(config_paths.get("vocab_path", ""))],
+    ]
+    decoding_rows = [
+        ["max_new_tokens", _format_metric_value_v2(decoding.get("max_new_tokens"))],
+        ["temperature", _format_metric_value_v2(decoding.get("temperature"))],
+        ["top_p", _format_metric_value_v2(decoding.get("top_p"))],
+    ]
+    benchmark_param_rows = [
+        [
+            "fast",
+            _format_metric_value_v2(benchmark_configs.get("fast", {}).get("sample_count")),
+            _format_metric_value_v2(benchmark_configs.get("fast", {}).get("per_bucket_limit")),
+            _format_metric_value_v2(benchmark_configs.get("fast", {}).get("min_prefix_tokens")),
+            (
+                f"{_format_metric_value_v2(benchmark_configs.get('fast', {}).get('continuation_prefix_ratio_min'))} - "
+                f"{_format_metric_value_v2(benchmark_configs.get('fast', {}).get('continuation_prefix_ratio_max'))}"
+            ),
+            (
+                f"{_format_metric_value_v2(benchmark_configs.get('fast', {}).get('infilling_hole_ratio_min'))} - "
+                f"{_format_metric_value_v2(benchmark_configs.get('fast', {}).get('infilling_hole_ratio_max'))}"
+            ),
+        ],
+        [
+            "formal",
+            _format_metric_value_v2(benchmark_configs.get("formal", {}).get("sample_count")),
+            _format_metric_value_v2(benchmark_configs.get("formal", {}).get("per_bucket_limit")),
+            _format_metric_value_v2(benchmark_configs.get("formal", {}).get("min_prefix_tokens")),
+            (
+                f"{_format_metric_value_v2(benchmark_configs.get('formal', {}).get('continuation_prefix_ratio_min'))} - "
+                f"{_format_metric_value_v2(benchmark_configs.get('formal', {}).get('continuation_prefix_ratio_max'))}"
+            ),
+            (
+                f"{_format_metric_value_v2(benchmark_configs.get('formal', {}).get('infilling_hole_ratio_min'))} - "
+                f"{_format_metric_value_v2(benchmark_configs.get('formal', {}).get('infilling_hole_ratio_max'))}"
+            ),
+        ],
+    ]
+    train_sampling_rows = [
+        ["seq_len", _format_metric_value_v2(train_run.get("seq_len"), key="seq_len")],
+        ["fim_ratio", _format_metric_value_v2(train_run.get("fim_ratio"))],
+        ["fim_eos_ratio", _format_metric_value_v2(train_run.get("fim_eos_ratio"))],
+        ["single_phrase_sample_ratio", _format_metric_value_v2(train_run.get("single_phrase_sample_ratio"))],
+        ["cross_phrase_sample_ratio", _format_metric_value_v2(train_run.get("cross_phrase_sample_ratio"))],
+        ["long_context_sample_ratio", _format_metric_value_v2(train_run.get("long_context_sample_ratio"))],
+    ]
+    lines.extend(["## 测评参数", ""])
+    lines.extend(["### 运行与配置路径", ""])
+    lines.extend(_markdown_table_v2(["参数", "值"], eval_context_rows))
+    lines.extend(["### 解码参数", ""])
+    lines.extend(_markdown_table_v2(["参数", "值"], decoding_rows))
+    lines.extend(["### Benchmark 切分参数", ""])
+    lines.extend(
+        _markdown_table_v2(
+            ["阶段", "sample_count", "per_bucket_limit", "min_prefix_tokens", "continuation_prefix_ratio", "infilling_hole_ratio"],
+            benchmark_param_rows,
+        )
+    )
+    lines.extend(["### 训练可比性提示", ""])
+    lines.extend(_markdown_table_v2(["参数", "值"], train_sampling_rows))
 
     prefilter_line = (
         f"已启用，保留 {checkpoint_prefilter.get('selected_count', 0)} / {checkpoint_prefilter.get('original_count', 0)} "
@@ -2789,21 +2859,29 @@ def main(*, task_scope: str = "all", argv: list[str] | None = None) -> None:
             run_id=run_id,
         )
         plot_artifacts["训练健康度"] = str(training_plot_path)
+    config_paths_payload = {
+        "train_config": None if config_path is None else str(config_path),
+        "fast_config": str(fast_config_path.resolve()),
+        "formal_config": str(formal_config_path.resolve()),
+        "vocab_path": str(vocab_path.resolve()),
+    }
+    decoding_payload = {
+        "max_new_tokens": int(args.max_new_tokens),
+        "temperature": float(args.temperature),
+        "top_p": float(args.top_p),
+    }
     report = {
         "run_id": run_id,
         "task_scope": task_scope,
         "created_at": time.time(),
         "checkpoint_dir": str(checkpoint_dir),
         "metrics_path": None if metrics_path is None else str(metrics_path),
+        "config_paths": config_paths_payload,
         "benchmark_configs": {
             "fast": fast_config,
             "formal": formal_config,
         },
-        "decoding": {
-            "max_new_tokens": int(args.max_new_tokens),
-            "temperature": float(args.temperature),
-            "top_p": float(args.top_p),
-        },
+        "decoding": decoding_payload,
         "manifests": {
             "fast_path": str(fast_manifest_path),
             "formal_path": str(formal_manifest_path),
@@ -2854,6 +2932,14 @@ def main(*, task_scope: str = "all", argv: list[str] | None = None) -> None:
             "candidate_count": len(candidate_paths),
         },
         checkpoint_prefilter=checkpoint_prefilter,
+        evaluation_context={
+            "config_paths": config_paths_payload,
+            "benchmark_configs": {
+                "fast": fast_config,
+                "formal": formal_config,
+            },
+            "decoding": decoding_payload,
+        },
     )
     summary_path.write_text(summary_text, encoding="utf-8")
 

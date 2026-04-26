@@ -29,9 +29,9 @@ train:
   # FIM 这里保持全量 EOS 监督，避免补全样本在尾部闭合与语法合法性上明显退化。
   fim_eos_ratio: 1.0
   use_phrase_window_sampling: true
-  single_phrase_sample_ratio: 0.50
+  single_phrase_sample_ratio: 0.35
   cross_phrase_sample_ratio: 0.35
-  long_context_sample_ratio: 0.15
+  long_context_sample_ratio: 0.30
   phrase_min_bars: 2
   phrase_max_bars: 8
   single_phrase_bar_min: 2
