@@ -464,6 +464,7 @@ def _to_jsonable_result(result: dict[str, Any]) -> dict[str, Any]:
         "continuation_most_common_pitch_ratio": result.get("continuation_most_common_pitch_ratio"),
         "continuation_longest_same_pitch_run_ratio": result.get("continuation_longest_same_pitch_run_ratio"),
         "continuation_pitch_diversity_score": result.get("continuation_pitch_diversity_score"),
+        "continuation_same_pitch_overlap_rate": result.get("continuation_same_pitch_overlap_rate"),
         "continuation_onset_position_l1_distance": result.get("continuation_onset_position_l1_distance"),
         "continuation_onset_position_entropy": result.get("continuation_onset_position_entropy"),
         "continuation_bar_start_onset_ratio": result.get("continuation_bar_start_onset_ratio"),
@@ -477,6 +478,7 @@ def _to_jsonable_result(result: dict[str, Any]) -> dict[str, Any]:
         "infilling_most_common_pitch_ratio": result.get("infilling_most_common_pitch_ratio"),
         "infilling_longest_same_pitch_run_ratio": result.get("infilling_longest_same_pitch_run_ratio"),
         "infilling_pitch_diversity_score": result.get("infilling_pitch_diversity_score"),
+        "infilling_same_pitch_overlap_rate": result.get("infilling_same_pitch_overlap_rate"),
         "infilling_onset_position_l1_distance": result.get("infilling_onset_position_l1_distance"),
         "infilling_onset_position_entropy": result.get("infilling_onset_position_entropy"),
         "infilling_bar_start_onset_ratio": result.get("infilling_bar_start_onset_ratio"),
@@ -490,6 +492,7 @@ def _to_jsonable_result(result: dict[str, Any]) -> dict[str, Any]:
         "overall_most_common_pitch_ratio": result.get("overall_most_common_pitch_ratio"),
         "overall_longest_same_pitch_run_ratio": result.get("overall_longest_same_pitch_run_ratio"),
         "overall_pitch_diversity_score": result.get("overall_pitch_diversity_score"),
+        "overall_same_pitch_overlap_rate": result.get("overall_same_pitch_overlap_rate"),
         "overall_onset_position_l1_distance": result.get("overall_onset_position_l1_distance"),
         "overall_onset_position_entropy": result.get("overall_onset_position_entropy"),
         "overall_bar_start_onset_ratio": result.get("overall_bar_start_onset_ratio"),
@@ -570,6 +573,8 @@ def _case_sample_payload(case: dict[str, Any], record: dict[str, Any], fsm_recor
         "most_common_pitch_ratio": record.get("most_common_pitch_ratio"),
         "longest_same_pitch_run_ratio": record.get("longest_same_pitch_run_ratio"),
         "pitch_diversity_score": record.get("pitch_diversity_score"),
+        "same_pitch_overlap_count": record.get("same_pitch_overlap_count"),
+        "same_pitch_overlap_rate": record.get("same_pitch_overlap_rate"),
         "onset_position_entropy": record.get("onset_position_entropy"),
         "bar_start_onset_ratio": record.get("bar_start_onset_ratio"),
         "strong_beat_onset_ratio": record.get("strong_beat_onset_ratio"),
@@ -722,6 +727,7 @@ def _evaluate_checkpoint_on_manifest(
     continuation_most_common_pitch_ratios: list[float] = []
     continuation_longest_same_pitch_run_ratios: list[float] = []
     continuation_pitch_diversity_scores: list[float] = []
+    continuation_same_pitch_overlap_rates: list[float] = []
     continuation_pitch_collapse_valid = 0
     continuation_onset_position_entropies: list[float] = []
     continuation_bar_start_onset_ratios: list[float] = []
@@ -752,6 +758,7 @@ def _evaluate_checkpoint_on_manifest(
     infilling_most_common_pitch_ratios: list[float] = []
     infilling_longest_same_pitch_run_ratios: list[float] = []
     infilling_pitch_diversity_scores: list[float] = []
+    infilling_same_pitch_overlap_rates: list[float] = []
     infilling_pitch_collapse_valid = 0
     infilling_onset_position_entropies: list[float] = []
     infilling_bar_start_onset_ratios: list[float] = []
@@ -868,6 +875,10 @@ def _evaluate_checkpoint_on_manifest(
                 continuation_pitch_span_deltas.append(float(raw_record["pitch_span_delta"]))
                 continuation_onset_position_l1.append(float(raw_record["onset_position_l1_distance"]))
                 continuation_duration_l1.append(float(raw_record["duration_bin_l1_distance"]))
+                _append_if_finite(
+                    continuation_same_pitch_overlap_rates,
+                    raw_record.get("same_pitch_overlap_rate"),
+                )
                 pitch_metric_present = False
                 pitch_metric_present = _append_if_finite(
                     continuation_most_common_pitch_ratios,
@@ -1018,6 +1029,10 @@ def _evaluate_checkpoint_on_manifest(
                 infilling_boundary_time_order_valid += int(bool(raw_infill_record["boundary_time_order_valid"]))
                 infilling_syntax_invalid += int(not bool(raw_infill_record["is_structurally_valid"]))
                 infilling_onset_position_l1.append(float(raw_infill_record["onset_position_l1_distance"]))
+                _append_if_finite(
+                    infilling_same_pitch_overlap_rates,
+                    raw_infill_record.get("same_pitch_overlap_rate"),
+                )
                 pitch_metric_present = False
                 pitch_metric_present = _append_if_finite(
                     infilling_most_common_pitch_ratios,
@@ -1123,6 +1138,7 @@ def _evaluate_checkpoint_on_manifest(
         "continuation_most_common_pitch_ratio": _safe_mean(continuation_most_common_pitch_ratios),
         "continuation_longest_same_pitch_run_ratio": _safe_mean(continuation_longest_same_pitch_run_ratios),
         "continuation_pitch_diversity_score": _safe_mean(continuation_pitch_diversity_scores),
+        "continuation_same_pitch_overlap_rate": _safe_mean(continuation_same_pitch_overlap_rates),
         "continuation_pitch_collapse_coverage": _safe_rate(continuation_pitch_collapse_valid, continuation_attempted),
         "continuation_onset_position_entropy": _safe_mean(continuation_onset_position_entropies),
         "continuation_bar_start_onset_ratio": _safe_mean(continuation_bar_start_onset_ratios),
@@ -1139,6 +1155,7 @@ def _evaluate_checkpoint_on_manifest(
         "infilling_most_common_pitch_ratio": _safe_mean(infilling_most_common_pitch_ratios),
         "infilling_longest_same_pitch_run_ratio": _safe_mean(infilling_longest_same_pitch_run_ratios),
         "infilling_pitch_diversity_score": _safe_mean(infilling_pitch_diversity_scores),
+        "infilling_same_pitch_overlap_rate": _safe_mean(infilling_same_pitch_overlap_rates),
         "infilling_pitch_collapse_coverage": _safe_rate(infilling_pitch_collapse_valid, infilling_attempted),
         "infilling_onset_position_entropy": _safe_mean(infilling_onset_position_entropies),
         "infilling_bar_start_onset_ratio": _safe_mean(infilling_bar_start_onset_ratios),
@@ -1160,6 +1177,9 @@ def _evaluate_checkpoint_on_manifest(
         ),
         "overall_pitch_diversity_score": _safe_mean(
             continuation_pitch_diversity_scores + infilling_pitch_diversity_scores
+        ),
+        "overall_same_pitch_overlap_rate": _safe_mean(
+            continuation_same_pitch_overlap_rates + infilling_same_pitch_overlap_rates
         ),
         "overall_onset_position_entropy": _safe_mean(
             continuation_onset_position_entropies + infilling_onset_position_entropies
@@ -1866,6 +1886,7 @@ _METRIC_LABELS_V2 = {
     "continuation_most_common_pitch_ratio": "续写最高频 pitch 占比",
     "continuation_longest_same_pitch_run_ratio": "续写最长同 pitch 连续 run 占比",
     "continuation_pitch_diversity_score": "续写音高多样性分数",
+    "continuation_same_pitch_overlap_rate": "续写同 pitch 重叠率",
     "continuation_pitch_collapse_coverage": "续写 pitch 指标覆盖率",
     "continuation_onset_position_entropy": "续写起拍位置熵",
     "continuation_bar_start_onset_ratio": "续写小节起点占比",
@@ -1879,6 +1900,7 @@ _METRIC_LABELS_V2 = {
     "infilling_most_common_pitch_ratio": "补全最高频 pitch 占比",
     "infilling_longest_same_pitch_run_ratio": "补全最长同 pitch 连续 run 占比",
     "infilling_pitch_diversity_score": "补全音高多样性分数",
+    "infilling_same_pitch_overlap_rate": "补全同 pitch 重叠率",
     "infilling_pitch_collapse_coverage": "补全 pitch 指标覆盖率",
     "infilling_onset_position_entropy": "补全起拍位置熵",
     "infilling_bar_start_onset_ratio": "补全小节起点占比",
@@ -1892,6 +1914,7 @@ _METRIC_LABELS_V2 = {
     "overall_most_common_pitch_ratio": "总体最高频 pitch 占比",
     "overall_longest_same_pitch_run_ratio": "总体最长同 pitch 连续 run 占比",
     "overall_pitch_diversity_score": "总体音高多样性分数",
+    "overall_same_pitch_overlap_rate": "总体同 pitch 重叠率",
     "overall_pitch_collapse_coverage": "总体 pitch 指标覆盖率",
     "overall_onset_position_entropy": "总体起拍位置熵",
     "overall_bar_start_onset_ratio": "总体小节起点占比",
@@ -2020,6 +2043,7 @@ def _diagnostic_metric_specs_v2(task_scope: str) -> list[tuple[str, str]]:
         ("generated_bar_delta_mean", "生成 BAR 数偏差均值"),
         ("generated_event_delta_mean", "生成事件数偏差均值"),
         ("pitch_span_delta_mean", "音高跨度偏差均值"),
+        ("overall_same_pitch_overlap_rate", "总体同 pitch 重叠率"),
         ("duration_bin_l1_distance", "时值分桶 L1 距离"),
     ]
     if task_scope == "continuation":
@@ -2027,6 +2051,7 @@ def _diagnostic_metric_specs_v2(task_scope: str) -> list[tuple[str, str]]:
             ("continuation_first_event_hit_rate", "续写首事件命中率"),
             ("continuation_missing_eos_rate", "续写缺失 EOS 率"),
             ("continuation_syntax_invalid_rate", "续写语法非法率"),
+            ("continuation_same_pitch_overlap_rate", "续写同 pitch 重叠率"),
             *common,
         ]
     if task_scope == "infilling":
@@ -2034,6 +2059,7 @@ def _diagnostic_metric_specs_v2(task_scope: str) -> list[tuple[str, str]]:
             ("infilling_syntax_invalid_rate", "补全语法非法率"),
             ("infilling_internal_time_order_validity_rate", "补全内部时间顺序合法率"),
             ("infilling_boundary_time_order_validity_rate", "补全边界时间顺序合法率"),
+            ("infilling_same_pitch_overlap_rate", "补全同 pitch 重叠率"),
             ("fsm_structural_validity_rate", "FSM 结构合法率"),
             ("fsm_time_order_validity_rate", "FSM 时间顺序合法率"),
             ("fsm_illegal_top1_rate", "FSM 非法 top1 率"),
@@ -2044,6 +2070,7 @@ def _diagnostic_metric_specs_v2(task_scope: str) -> list[tuple[str, str]]:
         ("continuation_first_event_hit_rate", "续写首事件命中率"),
         ("continuation_missing_eos_rate", "续写缺失 EOS 率"),
         ("continuation_syntax_invalid_rate", "续写语法非法率"),
+        ("continuation_same_pitch_overlap_rate", "续写同 pitch 重叠率"),
         ("infilling_syntax_invalid_rate", "补全语法非法率"),
         ("infilling_internal_time_order_validity_rate", "补全内部时间顺序合法率"),
         ("infilling_boundary_time_order_validity_rate", "补全边界时间顺序合法率"),
@@ -2057,6 +2084,7 @@ def _pitch_metric_specs_v2(task_scope: str) -> list[tuple[str, str]]:
             ("continuation_most_common_pitch_ratio", "续写最高频 pitch 占比"),
             ("continuation_longest_same_pitch_run_ratio", "续写最长同 pitch 连续 run 占比"),
             ("continuation_pitch_diversity_score", "续写音高多样性分数"),
+            ("continuation_same_pitch_overlap_rate", "续写同 pitch 重叠率"),
             ("continuation_pitch_collapse_coverage", "续写 pitch 指标覆盖率"),
         ]
     if task_scope == "infilling":
@@ -2064,12 +2092,14 @@ def _pitch_metric_specs_v2(task_scope: str) -> list[tuple[str, str]]:
             ("infilling_most_common_pitch_ratio", "补全最高频 pitch 占比"),
             ("infilling_longest_same_pitch_run_ratio", "补全最长同 pitch 连续 run 占比"),
             ("infilling_pitch_diversity_score", "补全音高多样性分数"),
+            ("infilling_same_pitch_overlap_rate", "补全同 pitch 重叠率"),
             ("infilling_pitch_collapse_coverage", "补全 pitch 指标覆盖率"),
         ]
     return [
         ("overall_most_common_pitch_ratio", "总体最高频 pitch 占比"),
         ("overall_longest_same_pitch_run_ratio", "总体最长同 pitch 连续 run 占比"),
         ("overall_pitch_diversity_score", "总体音高多样性分数"),
+        ("overall_same_pitch_overlap_rate", "总体同 pitch 重叠率"),
         ("overall_pitch_collapse_coverage", "总体 pitch 指标覆盖率"),
     ]
 
@@ -2143,6 +2173,7 @@ def _plot_metric_specs_v2(task_scope: str, *, diagnostics: bool) -> list[dict[st
             return [
                 {"key": "continuation_missing_eos_rate", "label": "续写缺失 EOS 率", "percent": True, "goal": "min", "color": "#dc2626"},
                 {"key": "continuation_most_common_pitch_ratio", "label": "最高频 pitch 占比", "goal": "min", "color": "#2563eb"},
+                {"key": "continuation_same_pitch_overlap_rate", "label": "同 pitch 重叠率", "percent": True, "goal": "min", "color": "#f59e0b"},
                 {"key": "continuation_rhythm_diversity_score", "label": "节奏多样性分数", "goal": "max", "color": "#16a34a"},
                 {"key": "continuation_bar_start_onset_ratio", "label": "小节起点占比", "percent": True, "goal": "min", "color": "#7c3aed"},
                 {"key": "continuation_event_ngram_repeat_ratio", "label": "事件 n-gram 重复占比", "percent": True, "goal": "min", "color": "#0891b2"},
@@ -2154,6 +2185,7 @@ def _plot_metric_specs_v2(task_scope: str, *, diagnostics: bool) -> list[dict[st
                 {"key": "infilling_internal_time_order_validity_rate", "label": "内部时间顺序合法率", "percent": True, "goal": "max", "color": "#2563eb"},
                 {"key": "infilling_boundary_time_order_validity_rate", "label": "边界时间顺序合法率", "percent": True, "goal": "max", "color": "#16a34a"},
                 {"key": "infilling_most_common_pitch_ratio", "label": "最高频 pitch 占比", "goal": "min", "color": "#2563eb"},
+                {"key": "infilling_same_pitch_overlap_rate", "label": "同 pitch 重叠率", "percent": True, "goal": "min", "color": "#f59e0b"},
                 {"key": "infilling_rhythm_diversity_score", "label": "节奏多样性分数", "goal": "max", "color": "#7c3aed"},
                 {"key": "infilling_bar_start_onset_ratio", "label": "小节起点占比", "percent": True, "goal": "min", "color": "#0891b2"},
                 {"key": "infilling_event_ngram_repeat_ratio", "label": "事件 n-gram 重复占比", "percent": True, "goal": "min", "color": "#ea580c"},
@@ -2161,6 +2193,7 @@ def _plot_metric_specs_v2(task_scope: str, *, diagnostics: bool) -> list[dict[st
         return [
             {"key": "continuation_missing_eos_rate", "label": "续写缺失 EOS 率", "percent": True, "goal": "min", "color": "#dc2626"},
             {"key": "overall_most_common_pitch_ratio", "label": "总体最高频 pitch 占比", "goal": "min", "color": "#2563eb"},
+            {"key": "overall_same_pitch_overlap_rate", "label": "总体同 pitch 重叠率", "percent": True, "goal": "min", "color": "#f59e0b"},
             {"key": "overall_rhythm_diversity_score", "label": "总体节奏多样性分数", "goal": "max", "color": "#16a34a"},
             {"key": "overall_bar_start_onset_ratio", "label": "总体小节起点占比", "percent": True, "goal": "min", "color": "#7c3aed"},
             {"key": "overall_event_ngram_repeat_ratio", "label": "总体事件 n-gram 重复占比", "percent": True, "goal": "min", "color": "#0891b2"},

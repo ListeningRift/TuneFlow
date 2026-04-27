@@ -8,6 +8,9 @@ from typing import Any
 
 
 _STEP_RE = re.compile(r"^step_(\d+)\.pt$")
+_POS_TOKEN_RE = re.compile(r"^POS_(\d+)$")
+_PITCH_TOKEN_RE = re.compile(r"^PITCH_(\d+)$")
+_DUR_TOKEN_RE = re.compile(r"^DUR_(\d+)$")
 _SAFE_CLOSE_STATES = {
     "after_head_tempo",
     "after_bar",
@@ -90,6 +93,114 @@ def load_vocab(vocab_path: Path) -> tuple[dict[str, int], list[str]]:
             if 0 <= idx < len(id_to_token):
                 id_to_token[idx] = token
     return token_to_id, id_to_token
+
+
+class _SamePitchOverlapGuard:
+    """Track active note ends and block same-pitch re-attacks before release."""
+
+    def __init__(self, *, positions_per_bar: int):
+        self.positions_per_bar = max(1, int(positions_per_bar))
+        self.current_bar_index = -1
+        self.current_abs_start: int | None = None
+        self.current_inst: str | None = None
+        self.current_pitch: int | None = None
+        self.current_dur: int | None = None
+        self.active_note_end_by_voice: dict[tuple[str, int], int] = {}
+
+    @classmethod
+    def from_prefix_tokens(
+        cls,
+        *,
+        prefix_tokens: list[str],
+        positions_per_bar: int,
+    ) -> "_SamePitchOverlapGuard":
+        guard = cls(positions_per_bar=positions_per_bar)
+        for token in prefix_tokens:
+            guard.consume_token(str(token))
+        return guard
+
+    def _reset_partial_event(self) -> None:
+        self.current_abs_start = None
+        self.current_inst = None
+        self.current_pitch = None
+        self.current_dur = None
+
+    def expects_pitch(self) -> bool:
+        return (
+            self.current_abs_start is not None
+            and self.current_inst is not None
+            and self.current_pitch is None
+        )
+
+    def blocked_pitch_ids(self, pitch_id_to_value: dict[int, int]) -> set[int]:
+        if not self.expects_pitch() or self.current_abs_start is None or self.current_inst is None:
+            return set()
+        blocked: set[int] = set()
+        for pitch_id, pitch_value in pitch_id_to_value.items():
+            active_end = self.active_note_end_by_voice.get((self.current_inst, pitch_value))
+            if active_end is not None and self.current_abs_start < active_end:
+                blocked.add(int(pitch_id))
+        return blocked
+
+    def consume_token(self, token: str) -> None:
+        if token in {"BOS", "EOS", "FIM_HOLE", "FIM_MID"} or token.startswith("TEMPO_") or token.startswith("KEY_"):
+            if token == "EOS":
+                self._reset_partial_event()
+            return
+        if token == "BAR":
+            self.current_bar_index += 1
+            self._reset_partial_event()
+            return
+
+        pos_match = _POS_TOKEN_RE.match(token)
+        if pos_match:
+            pos_value = int(pos_match.group(1))
+            self.current_abs_start = (max(0, self.current_bar_index) * self.positions_per_bar) + pos_value
+            self.current_inst = None
+            self.current_pitch = None
+            self.current_dur = None
+            return
+
+        if token.startswith("INST_"):
+            if self.current_abs_start is not None:
+                self.current_inst = token
+            return
+
+        pitch_match = _PITCH_TOKEN_RE.match(token)
+        if pitch_match:
+            if self.current_abs_start is not None and self.current_inst is not None:
+                self.current_pitch = int(pitch_match.group(1))
+            return
+
+        dur_match = _DUR_TOKEN_RE.match(token)
+        if dur_match:
+            if self.current_abs_start is not None and self.current_inst is not None and self.current_pitch is not None:
+                self.current_dur = int(dur_match.group(1))
+            return
+
+        if token.startswith("VEL_"):
+            if (
+                self.current_abs_start is not None
+                and self.current_inst is not None
+                and self.current_pitch is not None
+                and self.current_dur is not None
+            ):
+                event_end = self.current_abs_start + max(1, int(self.current_dur))
+                voice_key = (self.current_inst, self.current_pitch)
+                self.active_note_end_by_voice[voice_key] = max(
+                    self.active_note_end_by_voice.get(voice_key, event_end),
+                    event_end,
+                )
+            self._reset_partial_event()
+
+
+def _infer_positions_per_bar_from_vocab(id_to_token: list[str]) -> int:
+    max_pos = -1
+    for token in id_to_token:
+        match = _POS_TOKEN_RE.match(str(token))
+        if match:
+            max_pos = max(max_pos, int(match.group(1)))
+    return max_pos + 1 if max_pos >= 0 else 32
 
 
 def continuation_eos_bias(*, generated_len: int, max_can_generate: int, fsm_state: str | None) -> float:
@@ -224,6 +335,12 @@ def generate_continuation_tokens(
     """使用温度和 top-p 采样执行续写解码，可选启用语法约束。"""
     from src.decoding import select_masked_token, select_token
 
+    positions_per_bar = _infer_positions_per_bar_from_vocab(id_to_token)
+    pitch_id_to_value = {
+        token_id: int(match.group(1))
+        for token_id, token in enumerate(id_to_token)
+        if (match := _PITCH_TOKEN_RE.match(str(token))) is not None
+    }
     prompt_ids: list[int] = []
     for token in prompt_tokens:
         token_id = token_to_id.get(token)
@@ -244,6 +361,10 @@ def generate_continuation_tokens(
     generated_tokens: list[str] = []
     reached_eos = False
     past_key_values = None
+    overlap_guard = _SamePitchOverlapGuard.from_prefix_tokens(
+        prefix_tokens=prompt_tokens,
+        positions_per_bar=positions_per_bar,
+    )
     stats: dict[str, float | int] = {
         "step_count": 0,
         "illegal_top1_count": 0,
@@ -297,7 +418,11 @@ def generate_continuation_tokens(
             )
             past_key_values = outputs.past_key_values
             step_logits = outputs.logits[0, -1, :]
+            blocked_pitch_ids = overlap_guard.blocked_pitch_ids(pitch_id_to_value)
             if grammar_fsm is None:
+                if blocked_pitch_ids:
+                    step_logits = step_logits.clone()
+                    step_logits[list(blocked_pitch_ids)] = float("-inf")
                 decision = select_token(step_logits, temperature=temperature, top_p=top_p)
                 if decision.next_id is None:
                     return generated_tokens, False, stats
@@ -313,7 +438,11 @@ def generate_continuation_tokens(
                         step_logits = step_logits.clone()
                         step_logits[grammar_fsm.eos_id] = step_logits[grammar_fsm.eos_id] + float(eos_bias)
                         stats["eos_bias_step_count"] = int(stats["eos_bias_step_count"]) + 1
-                allowed_ids = grammar_fsm.allowed_token_ids(fsm_state)
+                allowed_ids = [
+                    token_id
+                    for token_id in grammar_fsm.allowed_token_ids(fsm_state)
+                    if token_id not in blocked_pitch_ids
+                ]
                 decision = select_masked_token(
                     step_logits,
                     allowed_ids,
@@ -349,6 +478,7 @@ def generate_continuation_tokens(
                 reached_eos = True
                 break
             generated_tokens.append(next_token)
+            overlap_guard.consume_token(next_token)
 
             next_ids = torch_mod.tensor([[next_id]], dtype=torch_mod.long, device=device)
             input_ids = next_ids if past_key_values is not None else torch_mod.cat([input_ids, next_ids], dim=1)
@@ -449,6 +579,12 @@ def generate_middle_tokens(
     """使用温度和 top-p 采样执行中间补全解码，可选启用语法约束。"""
     from src.decoding import select_masked_token, select_token
 
+    positions_per_bar = _infer_positions_per_bar_from_vocab(id_to_token)
+    pitch_id_to_value = {
+        token_id: int(match.group(1))
+        for token_id, token in enumerate(id_to_token)
+        if (match := _PITCH_TOKEN_RE.match(str(token))) is not None
+    }
     prompt_ids: list[int] = []
     for token in prompt_tokens:
         token_id = token_to_id.get(token)
@@ -466,6 +602,10 @@ def generate_middle_tokens(
     middle_tokens: list[str] = []
     reached_eos = False
     past_key_values = None
+    overlap_guard = _SamePitchOverlapGuard.from_prefix_tokens(
+        prefix_tokens=prefix_tokens,
+        positions_per_bar=positions_per_bar,
+    )
     stats: dict[str, float | int] = {
         "step_count": 0,
         "illegal_top1_count": 0,
@@ -510,7 +650,11 @@ def generate_middle_tokens(
             )
             past_key_values = outputs.past_key_values
             step_logits = outputs.logits[0, -1, :]
+            blocked_pitch_ids = overlap_guard.blocked_pitch_ids(pitch_id_to_value)
             if grammar_fsm is None:
+                if blocked_pitch_ids:
+                    step_logits = step_logits.clone()
+                    step_logits[list(blocked_pitch_ids)] = float("-inf")
                 decision = select_token(step_logits, temperature=temperature, top_p=top_p)
                 if decision.next_id is None:
                     return middle_tokens, False, stats
@@ -519,6 +663,8 @@ def generate_middle_tokens(
                 allowed_ids: list[int] = []
                 for token_id in grammar_fsm.allowed_token_ids(fsm_state):
                     if token_id == grammar_fsm.eos_id:
+                        continue
+                    if token_id in blocked_pitch_ids:
                         continue
                     next_state = grammar_fsm.transition(fsm_state, token_id)
                     if next_state is not None and next_state in bridgeable_states:
@@ -561,6 +707,7 @@ def generate_middle_tokens(
                     return middle_tokens, False, stats
                 fsm_state = next_state
             middle_tokens.append(next_token)
+            overlap_guard.consume_token(next_token)
 
             next_ids = torch_mod.tensor([[next_id]], dtype=torch_mod.long, device=device)
             input_ids = next_ids if past_key_values is not None else torch_mod.cat([input_ids, next_ids], dim=1)

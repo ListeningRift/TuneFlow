@@ -12,6 +12,8 @@ from typing import Any, Sequence
 from .config_io import load_yaml_mapping
 from .eval_windows import sample_bar_aligned_subsequence
 
+_POSITIONS_PER_BAR = 32
+
 
 def _parse_prefixed_int(token: str, prefix: str) -> int | None:
     if not token.startswith(prefix):
@@ -704,7 +706,9 @@ def analyze_token_sequence(tokens: Sequence[str]) -> dict[str, Any]:
     bar_event_counts: list[int] = []
     current_bar_events: int | None = None
     current_bar_last_pos: int | None = None
+    current_bar_index = -1
     time_order_violation_count = 0
+    same_pitch_overlap_count = 0
     parsed_event_count = 0
     pitch_values: list[int] = []
     onset_positions: list[int] = []
@@ -713,6 +717,7 @@ def analyze_token_sequence(tokens: Sequence[str]) -> dict[str, Any]:
     onset_position_counts: Counter[int] = Counter()
     event_signatures: list[tuple[int, int, str]] = []
     rhythm_signatures: list[tuple[int, str]] = []
+    active_note_end_by_voice: dict[tuple[str, int], int] = {}
 
     def ensure_bar() -> None:
         nonlocal current_bar_events, current_bar_last_pos
@@ -742,6 +747,7 @@ def analyze_token_sequence(tokens: Sequence[str]) -> dict[str, Any]:
             close_bar()
             current_bar_events = 0
             current_bar_last_pos = None
+            current_bar_index += 1
             idx += 1
             continue
         if token.startswith("POS_"):
@@ -763,6 +769,7 @@ def analyze_token_sequence(tokens: Sequence[str]) -> dict[str, Any]:
             if not vel_token.startswith("VEL_"):
                 break
             pitch_value = _parse_prefixed_int(pitch_token, "PITCH_")
+            dur_value = _parse_prefixed_int(dur_token, "DUR_")
             if pos_value is not None:
                 onset_positions.append(pos_value)
                 onset_position_counts[pos_value] += 1
@@ -773,6 +780,16 @@ def analyze_token_sequence(tokens: Sequence[str]) -> dict[str, Any]:
                     event_signatures.append((pos_value, pitch_value, dur_token))
             if pos_value is not None:
                 rhythm_signatures.append((pos_value, dur_token))
+            if pos_value is not None and pitch_value is not None and dur_value is not None:
+                absolute_start = (max(0, current_bar_index) * _POSITIONS_PER_BAR) + pos_value
+                voice_key = (inst_token, pitch_value)
+                active_end = active_note_end_by_voice.get(voice_key)
+                if active_end is not None and absolute_start < active_end:
+                    same_pitch_overlap_count += 1
+                active_note_end_by_voice[voice_key] = max(
+                    active_note_end_by_voice.get(voice_key, absolute_start + max(1, dur_value)),
+                    absolute_start + max(1, dur_value),
+                )
             duration_counts[dur_token] += 1
             parsed_event_count += 1
             current_bar_events = 0 if current_bar_events is None else (current_bar_events + 1)
@@ -813,6 +830,10 @@ def analyze_token_sequence(tokens: Sequence[str]) -> dict[str, Any]:
         "onset_position_counts": dict(onset_position_counts),
         "time_order_valid": (time_order_violation_count == 0),
         "time_order_violation_count": time_order_violation_count,
+        "same_pitch_overlap_count": same_pitch_overlap_count,
+        "same_pitch_overlap_rate": (
+            same_pitch_overlap_count / float(parsed_event_count) if parsed_event_count > 0 else 0.0
+        ),
         "pitch_event_count": int(pitch_metrics["pitch_event_count"]),
         "pitch_unique_count": int(pitch_metrics["pitch_unique_count"]),
         "pitch_analysis_coverage": float(pitch_metrics["pitch_analysis_coverage"]),
@@ -943,6 +964,8 @@ def enrich_continuation_record(record: dict[str, Any], *, target_tokens: Sequenc
             "first_unit_match": first_unit_match,
             "time_order_valid": bool(reconstructed_analysis["time_order_valid"]),
             "time_order_violation_count": int(reconstructed_analysis["time_order_violation_count"]),
+            "same_pitch_overlap_count": int(reconstructed_analysis["same_pitch_overlap_count"]),
+            "same_pitch_overlap_rate": float(reconstructed_analysis["same_pitch_overlap_rate"]),
             "empty_bar_rate": float(generated_analysis["empty_bar_rate"]),
             "low_density_bar_rate": float(generated_analysis["low_density_bar_rate"]),
             "has_multi_empty_bar_run": bool(generated_analysis["has_multi_empty_bar_run"]),
@@ -967,6 +990,8 @@ def enrich_continuation_record(record: dict[str, Any], *, target_tokens: Sequenc
             "target_bar_count": int(target_analysis["bar_count"]),
             "target_event_count": int(target_analysis["event_count"]),
             "target_pitch_span": int(target_analysis["pitch_span"]),
+            "target_same_pitch_overlap_count": int(target_analysis["same_pitch_overlap_count"]),
+            "target_same_pitch_overlap_rate": float(target_analysis["same_pitch_overlap_rate"]),
             "generated_bar_delta": int(generated_bar_delta),
             "generated_event_delta": int(generated_event_delta),
             "pitch_span_delta": int(pitch_span_delta),
@@ -1003,6 +1028,8 @@ def enrich_infilling_record(record: dict[str, Any], *, target_hole_tokens: Seque
         {
             "time_order_valid": bool(reconstructed_analysis["time_order_valid"]),
             "time_order_violation_count": int(reconstructed_analysis["time_order_violation_count"]),
+            "same_pitch_overlap_count": int(reconstructed_analysis["same_pitch_overlap_count"]),
+            "same_pitch_overlap_rate": float(reconstructed_analysis["same_pitch_overlap_rate"]),
             "internal_time_order_valid": (internal_time_order_violation_count == 0),
             "internal_time_order_violation_count": internal_time_order_violation_count,
             "boundary_time_order_valid": (boundary_time_order_violation_count == 0),
@@ -1034,6 +1061,8 @@ def enrich_infilling_record(record: dict[str, Any], *, target_hole_tokens: Seque
             "target_bar_count": int(target_analysis["bar_count"]),
             "target_event_count": int(target_analysis["event_count"]),
             "target_pitch_span": int(target_analysis["pitch_span"]),
+            "target_same_pitch_overlap_count": int(target_analysis["same_pitch_overlap_count"]),
+            "target_same_pitch_overlap_rate": float(target_analysis["same_pitch_overlap_rate"]),
             "generated_bar_delta": int(generated_analysis["bar_count"] - target_analysis["bar_count"]),
             "generated_event_delta": int(generated_analysis["event_count"] - target_analysis["event_count"]),
             "pitch_span_delta": int(generated_analysis["pitch_span"] - target_analysis["pitch_span"]),
