@@ -1,6 +1,7 @@
 """通用工具集合。"""
 
 from .absolute_benchmark_scoring import attach_absolute_capability_scores, score_absolute_capabilities
+from ..inference import generate_continuation_tokens, generate_middle_tokens, load_vocab
 from .benchmarking import (
     analyze_token_sequence,
     build_benchmark_manifest,
@@ -14,9 +15,6 @@ from .benchmark_decode import (
     build_infilling_trace,
     checkpoint_sort_key,
     discover_checkpoints,
-    generate_continuation_tokens,
-    generate_middle_tokens,
-    load_vocab,
     sample_step_checkpoints,
 )
 from .checkpoint_selection import score_checkpoint_results

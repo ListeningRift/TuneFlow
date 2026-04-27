@@ -2622,13 +2622,11 @@ def main(*, task_scope: str = "all", argv: list[str] | None = None) -> None:
     from src.model.configuration import DecoderConfig
     from src.model.modeling import DecoderForCausalLM
     from src.training.train_base import _autocast_context, _load_checkpoint, _resolve_precision
+    from src.inference import generate_continuation_tokens, generate_middle_tokens, load_vocab
     from src.utils.benchmark_decode import (
         build_continuation_trace,
         build_infilling_trace,
         discover_checkpoints,
-        generate_continuation_tokens,
-        generate_middle_tokens,
-        load_vocab,
     )
     from src.utils.absolute_benchmark_scoring import attach_absolute_capability_scores
     from src.utils.benchmarking import build_benchmark_manifest, load_benchmark_config
