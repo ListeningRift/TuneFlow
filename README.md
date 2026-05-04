@@ -135,9 +135,9 @@ uv run eval-continuation --preset small
 
 这套评估会直接从训练配置里的 `output_dir` 读取 checkpoint 与 `metrics.jsonl`，不再需要手动传 `--checkpoint-dir`。
 完整 benchmark 会按顺序执行：
-- `fast benchmark` 扫全量 checkpoint
-- `formal benchmark` 复评前 3 名
-- 导出 best checkpoint、leaderboard 和样本摘要
+- `fast benchmark` 扫全量 checkpoint，只用于预筛选与趋势观察
+- `formal benchmark` 复评 fast 前 3 名，并单独输出 formal leaderboard
+- 最终推荐只从 formal leaderboard 产生，同时导出 `samples/final_top3/` 样本摘要
 
 4. 开长训前或改动训练代码后，建议先跑一遍最小回归检查：
 ```bash

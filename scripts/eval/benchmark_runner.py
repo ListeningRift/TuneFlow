@@ -1973,6 +1973,18 @@ def _result_table_rows_v2(results: list[dict[str, Any]], specs: list[tuple[str, 
     return rows
 
 
+def _ranked_results_v2(results: list[dict[str, Any]], *, limit: int | None = None) -> list[dict[str, Any]]:
+    ranked = [
+        result
+        for result in results
+        if result.get("balanced_rank") is not None
+    ]
+    ranked.sort(key=lambda item: int(item["balanced_rank"]))
+    if limit is not None:
+        return ranked[:limit]
+    return ranked
+
+
 def _counter_table_rows_v2(counter_mapping: dict[str, int], *, limit: int = 5) -> list[list[str]]:
     items = _top_counter_items(counter_mapping, limit=limit)
     if not items:
@@ -2598,6 +2610,332 @@ def _build_summary_markdown_v2(
     return "\n".join(lines).strip() + "\n"
 
 
+def _build_summary_markdown_v3(
+    *,
+    run_id: str,
+    task_scope: str,
+    benchmark_root: Path,
+    recommended: dict[str, Any] | None,
+    fast_results: list[dict[str, Any]],
+    formal_results: list[dict[str, Any]],
+    top_results: list[dict[str, Any]],
+    training_summary: dict[str, Any],
+    plot_artifacts: dict[str, str],
+    sample_artifacts: dict[str, dict[str, dict[str, str]]],
+    exported_samples: dict[str, dict[str, dict[str, list[dict[str, Any]]]]],
+    manifest_stats: dict[str, Any],
+    checkpoint_prefilter: dict[str, Any],
+    evaluation_context: dict[str, Any],
+) -> str:
+    final_sample_artifacts = dict(sample_artifacts.get("final_top3", {}))
+    final_exported_samples = dict(exported_samples.get("final_top3", {}))
+    formal_candidate_artifacts = dict(sample_artifacts.get("formal_candidates", {}))
+    decoding = dict(evaluation_context.get("decoding", {}))
+    benchmark_configs = dict(evaluation_context.get("benchmark_configs", {}))
+    config_paths = dict(evaluation_context.get("config_paths", {}))
+    train_run = dict(training_summary.get("run", {})) if isinstance(training_summary.get("run"), dict) else {}
+    core_specs = _core_metric_specs_v2(task_scope)
+    diagnostic_specs = _diagnostic_metric_specs_v2(task_scope)
+    pitch_specs = _pitch_metric_specs_v2(task_scope)
+    rhythm_specs = _rhythm_metric_specs_v2(task_scope)
+    repetition_specs = _repetition_metric_specs_v2(task_scope)
+    training_specs = _training_metric_specs_v2()
+
+    lines = [f"# {_TASK_TITLES[task_scope]}: {run_id}", ""]
+    lines.extend(
+        [
+            "## 评分说明",
+            "",
+            "- `balanced_score` 是相对分，只在当前 leaderboard 内部有效。",
+            "- `absolute_score` 是固定 0-100 标尺下的能力分，适合跨 run 追踪。",
+            "- `fast` leaderboard 只用于 checkpoint 预筛选与趋势观察。",
+            "- 最终推荐和 `samples/final_top3/` 现在只来自 `formal` leaderboard。",
+            "- 排序会保留结构门槛，并加入贴合度与重复度指标，尽量避免保守但重复的推荐。",
+            "",
+        ]
+    )
+
+    if recommended is None:
+        lines.extend(["## 最终推荐", "", "_本次没有产出推荐 checkpoint。_", ""])
+    else:
+        lines.extend(
+            [
+                "## 最终推荐",
+                "",
+                f"- Checkpoint：`{recommended.get('checkpoint_name')}`",
+                f"- Step：{_format_metric_value_v2(recommended.get('step'), key='step')}",
+                f"- 评估层级：{_format_eval_tier_v2(recommended.get('evaluation_tier'))}",
+                f"- 相对分：{_format_metric_value_v2(recommended.get('balanced_score'), key='balanced_score')}",
+                f"- 绝对分：{_format_metric_value_v2(recommended.get('absolute_score'), key='absolute_score')}",
+                f"- 绝对分覆盖率：{_format_metric_value_v2(recommended.get('absolute_score_coverage'), key='absolute_score_coverage')}",
+                f"- 推荐来源：{recommended.get('recommendation_source', 'formal')}",
+                "",
+            ]
+        )
+
+    eval_context_rows = [
+        ["task_scope", str(task_scope)],
+        ["train_config", str(config_paths.get("train_config", ""))],
+        ["fast_config", str(config_paths.get("fast_config", ""))],
+        ["formal_config", str(config_paths.get("formal_config", ""))],
+        ["vocab_path", str(config_paths.get("vocab_path", ""))],
+    ]
+    decoding_rows = [
+        ["max_new_tokens", _format_metric_value_v2(decoding.get("max_new_tokens"))],
+        ["temperature", _format_metric_value_v2(decoding.get("temperature"))],
+        ["top_p", _format_metric_value_v2(decoding.get("top_p"))],
+    ]
+    benchmark_param_rows = [
+        [
+            "fast",
+            _format_metric_value_v2(benchmark_configs.get("fast", {}).get("sample_count")),
+            _format_metric_value_v2(benchmark_configs.get("fast", {}).get("per_bucket_limit")),
+            _format_metric_value_v2(benchmark_configs.get("fast", {}).get("min_prefix_tokens")),
+            (
+                f"{_format_metric_value_v2(benchmark_configs.get('fast', {}).get('continuation_prefix_ratio_min'))} - "
+                f"{_format_metric_value_v2(benchmark_configs.get('fast', {}).get('continuation_prefix_ratio_max'))}"
+            ),
+            (
+                f"{_format_metric_value_v2(benchmark_configs.get('fast', {}).get('infilling_hole_ratio_min'))} - "
+                f"{_format_metric_value_v2(benchmark_configs.get('fast', {}).get('infilling_hole_ratio_max'))}"
+            ),
+        ],
+        [
+            "formal",
+            _format_metric_value_v2(benchmark_configs.get("formal", {}).get("sample_count")),
+            _format_metric_value_v2(benchmark_configs.get("formal", {}).get("per_bucket_limit")),
+            _format_metric_value_v2(benchmark_configs.get("formal", {}).get("min_prefix_tokens")),
+            (
+                f"{_format_metric_value_v2(benchmark_configs.get('formal', {}).get('continuation_prefix_ratio_min'))} - "
+                f"{_format_metric_value_v2(benchmark_configs.get('formal', {}).get('continuation_prefix_ratio_max'))}"
+            ),
+            (
+                f"{_format_metric_value_v2(benchmark_configs.get('formal', {}).get('infilling_hole_ratio_min'))} - "
+                f"{_format_metric_value_v2(benchmark_configs.get('formal', {}).get('infilling_hole_ratio_max'))}"
+            ),
+        ],
+    ]
+    train_sampling_rows = [
+        ["seq_len", _format_metric_value_v2(train_run.get("seq_len"), key="seq_len")],
+        ["fim_ratio", _format_metric_value_v2(train_run.get("fim_ratio"))],
+        ["fim_eos_ratio", _format_metric_value_v2(train_run.get("fim_eos_ratio"))],
+        ["single_phrase_sample_ratio", _format_metric_value_v2(train_run.get("single_phrase_sample_ratio"))],
+        ["cross_phrase_sample_ratio", _format_metric_value_v2(train_run.get("cross_phrase_sample_ratio"))],
+        ["long_context_sample_ratio", _format_metric_value_v2(train_run.get("long_context_sample_ratio"))],
+    ]
+    lines.extend(["## 评估上下文", ""])
+    lines.extend(["### 路径信息", ""])
+    lines.extend(_markdown_table_v2(["参数", "值"], eval_context_rows))
+    lines.extend(["### 解码参数", ""])
+    lines.extend(_markdown_table_v2(["参数", "值"], decoding_rows))
+    lines.extend(["### Benchmark 阶段配置", ""])
+    lines.extend(
+        _markdown_table_v2(
+            ["阶段", "sample_count", "per_bucket_limit", "min_prefix_tokens", "continuation_prefix_ratio", "infilling_hole_ratio"],
+            benchmark_param_rows,
+        )
+    )
+    lines.extend(["### 训练采样配置", ""])
+    lines.extend(_markdown_table_v2(["参数", "值"], train_sampling_rows))
+
+    prefilter_line = (
+        f"已启用，保留 {checkpoint_prefilter.get('selected_count', 0)} / {checkpoint_prefilter.get('original_count', 0)} "
+        f"(top_k={checkpoint_prefilter.get('requested_top_k', 0)}, preserve_earliest={checkpoint_prefilter.get('preserve_earliest', 0)})"
+        if checkpoint_prefilter.get("enabled")
+        else "未启用"
+    )
+    lines.extend(
+        [
+            "## 总览",
+            "",
+            f"- Fast manifest 样本数：{manifest_stats.get('fast_case_count')}",
+            f"- Formal manifest 样本数：{manifest_stats.get('formal_case_count')}",
+            f"- Formal 候选 checkpoint 数：{manifest_stats.get('candidate_count')}",
+            f"- Checkpoint 预筛选：{prefilter_line}",
+            (
+                "- Formal 候选样本已导出到 `samples/formal_candidates/`。"
+                if formal_candidate_artifacts
+                else "- 本次没有产出 `samples/formal_candidates/` 样本导出。"
+            ),
+            "- `samples/final_top3/` 现在只导出 formal Top 3。",
+            "",
+        ]
+    )
+
+    lines.extend(["## Fast 排行榜", ""])
+    lines.extend(_markdown_table_v2([label for _key, label in core_specs], _result_table_rows_v2(fast_results, core_specs)))
+
+    lines.extend(["## Formal 排行榜", ""])
+    if formal_results:
+        lines.extend(_markdown_table_v2([label for _key, label in core_specs], _result_table_rows_v2(formal_results, core_specs)))
+    else:
+        lines.extend(["_Formal 排行榜不可用，已回退到 fast 结果。_", ""])
+
+    lines.extend(["## 最终 Top 3", ""])
+    lines.extend(_markdown_table_v2([label for _key, label in core_specs], _result_table_rows_v2(top_results, core_specs)))
+
+    if recommended is not None:
+        recommended_dimensions = (
+            dict(recommended.get("absolute_score_breakdown", {}).get("dimensions", {}))
+            if isinstance(recommended.get("absolute_score_breakdown"), dict)
+            else {}
+        )
+        capability_rows: list[list[str]] = []
+        for dimension_key, payload in recommended_dimensions.items():
+            capability_rows.append(
+                [
+                    str(payload.get("label", dimension_key)),
+                    _format_metric_value_v2(payload.get("score"), key=dimension_key),
+                    _format_metric_value_v2(payload.get("coverage"), key="absolute_score_coverage"),
+                    _format_metric_value_v2(payload.get("weight")),
+                    _format_capability_type_v2(bool(payload.get("proxy"))),
+                ]
+            )
+        lines.extend(["## 推荐 Checkpoint 能力面板", ""])
+        lines.extend(_markdown_table_v2(["维度", "分数", "覆盖率", "权重", "类型"], capability_rows))
+
+        gate_rows: list[list[str]] = []
+        for metric_key, payload in sorted(recommended.get("gate_details", {}).items()):
+            gate_rows.append(
+                [
+                    _METRIC_LABELS_V2.get(metric_key, metric_key),
+                    _format_goal_v2(payload.get("goal", "")),
+                    _format_metric_value_v2(payload.get("threshold"), key=metric_key),
+                    _format_metric_value_v2(payload.get("value"), key=metric_key),
+                    _format_metric_value_v2(payload.get("passed")),
+                ]
+            )
+        lines.extend(["## 推荐 Checkpoint 门槛检查", ""])
+        lines.extend(_markdown_table_v2(["指标", "方向", "阈值", "实际值", "是否通过"], gate_rows))
+
+        relative_rows: list[list[str]] = []
+        for metric_key, payload in recommended.get("score_breakdown", {}).items():
+            relative_rows.append(
+                [
+                    _METRIC_LABELS_V2.get(metric_key, metric_key),
+                    _format_goal_v2(payload.get("goal", "")),
+                    _format_metric_value_v2(payload.get("weight")),
+                    _format_metric_value_v2(payload.get("value"), key=metric_key),
+                    _format_metric_value_v2(payload.get("rank_score")),
+                    _format_metric_value_v2(payload.get("weighted_contribution")),
+                ]
+            )
+        lines.extend(["## 推荐 Checkpoint 相对分拆解", ""])
+        lines.extend(_markdown_table_v2(["指标", "方向", "权重", "原始值", "排序分", "加权贡献"], relative_rows))
+
+        absolute_rows: list[list[str]] = []
+        for dimension_key, payload in recommended_dimensions.items():
+            for metric_key, metric_payload in dict(payload.get("submetrics", {})).items():
+                absolute_rows.append(
+                    [
+                        str(payload.get("label", dimension_key)),
+                        str(metric_payload.get("label", _METRIC_LABELS_V2.get(metric_key, metric_key))),
+                        _format_metric_value_v2(metric_payload.get("raw_value"), key=metric_key),
+                        _format_metric_value_v2(metric_payload.get("score")),
+                        _format_metric_value_v2(metric_payload.get("weight")),
+                        str(metric_payload.get("status", "")),
+                    ]
+                )
+        lines.extend(["## 推荐 Checkpoint 绝对分拆解", ""])
+        lines.extend(_markdown_table_v2(["维度", "指标", "原始值", "映射分", "权重", "状态"], absolute_rows))
+
+    lines.extend(["## 图表", ""])
+    if plot_artifacts:
+        for label, artifact_path in plot_artifacts.items():
+            relative_path = _relative_artifact_path(benchmark_root, artifact_path)
+            lines.append(f"### {label}")
+            lines.append(f"![{label}]({relative_path})")
+            lines.append("")
+    else:
+        lines.extend(["_本次没有生成图表。_", ""])
+
+    training_summary_specs = [
+        ("last_train_step", "最近训练 step"),
+        ("last_eval_step", "最近验证 step"),
+        ("tokens_seen_last", "已见 token 数"),
+        ("latest_train_loss_ema", "最近训练 EMA"),
+        ("latest_valid_loss", "最近验证损失"),
+        ("best_valid_loss", "最佳验证损失"),
+        ("best_valid_step", "最佳验证 step"),
+        ("latest_overfit_gap", "最近过拟合间隙"),
+        ("latest_valid_loss_delta", "最近验证损失变化"),
+        ("plateau_eval_streak", "平台期连续 eval 次数"),
+        ("tok_per_sec_median", "吞吐中位数"),
+        ("fim_ratio_mean", "FIM 比例均值"),
+    ]
+    lines.extend(["## 训练健康度摘要", ""])
+    lines.extend(
+        _markdown_table_v2(
+            ["指标", "值"],
+            [[label, _format_metric_value_v2(training_summary.get(key), key=key)] for key, label in training_summary_specs],
+        )
+    )
+
+    lines.extend(["## 最终 Top 3 诊断指标", ""])
+    lines.extend(_markdown_table_v2([label for _key, label in diagnostic_specs], _result_table_rows_v2(top_results, diagnostic_specs)))
+
+    lines.extend(["## 最终 Top 3 音高摘要", ""])
+    lines.extend(_markdown_table_v2([label for _key, label in pitch_specs], _result_table_rows_v2(top_results, pitch_specs)))
+
+    lines.extend(["## 最终 Top 3 节奏摘要", ""])
+    lines.extend(_markdown_table_v2([label for _key, label in rhythm_specs], _result_table_rows_v2(top_results, rhythm_specs)))
+
+    lines.extend(["## 最终 Top 3 重复度摘要", ""])
+    lines.extend(_markdown_table_v2([label for _key, label in repetition_specs], _result_table_rows_v2(top_results, repetition_specs)))
+
+    lines.extend(["## 最终 Top 3 训练指标", ""])
+    lines.extend(_markdown_table_v2([label for _key, label in training_specs], _result_table_rows_v2(top_results, training_specs)))
+
+    for result in top_results:
+        checkpoint_name = str(result.get("checkpoint_name"))
+        lines.append(f"## {checkpoint_name}")
+        lines.append("")
+        lines.append("### 失败原因")
+        lines.extend(
+            _markdown_table_v2(
+                ["原因", "次数"],
+                _counter_table_rows_v2(_scoped_failure_counts(result, task_scope=task_scope)),
+            )
+        )
+        lines.append("### 语法原因")
+        lines.extend(
+            _markdown_table_v2(
+                ["原因", "次数"],
+                _counter_table_rows_v2(_scoped_syntax_counts(result, task_scope=task_scope)),
+            )
+        )
+        artifact_paths = final_sample_artifacts.get(checkpoint_name, {})
+        lines.append("### 样本产物")
+        for task_name in _task_names_for_scope(task_scope):
+            if task_name in artifact_paths:
+                relative_path = _relative_artifact_path(benchmark_root, artifact_paths.get(task_name, ""))
+                lines.append(f"- `{task_name}`: `{relative_path}`")
+
+        checkpoint_samples = final_exported_samples.get(checkpoint_name, {})
+        lines.append("### 代表样本")
+        for task_name in _task_names_for_scope(task_scope):
+            task_samples = checkpoint_samples.get(task_name, [])
+            success_key = _sample_success_key(task_name)
+            success = next((item for item in task_samples if bool(item.get(success_key))), None)
+            failure = next((item for item in task_samples if not bool(item.get(success_key))), None)
+            if success is not None:
+                lines.append(
+                    f"- `{task_name}` 成功样本：row_id={success.get('row_id')} "
+                    f"{success.get('meta', {}).get('artist')} - {success.get('meta', {}).get('title')} | "
+                    f"预览={_sample_preview(success.get('raw_output_tokens', []))}"
+                )
+            if failure is not None:
+                lines.append(
+                    f"- `{task_name}` 失败样本：row_id={failure.get('row_id')} "
+                    f"{failure.get('meta', {}).get('artist')} - {failure.get('meta', {}).get('title')} | "
+                    f"原因={failure.get('raw_failure_reason')} / {failure.get('raw_syntax_reason')} | "
+                    f"预览={_sample_preview(failure.get('raw_output_tokens', []))}"
+                )
+        lines.append("")
+
+    return "\n".join(lines).strip() + "\n"
+
+
 def main(*, task_scope: str = "all", argv: list[str] | None = None) -> None:
     project_root = _ensure_project_root_on_path()
     os.chdir(project_root)
@@ -2794,26 +3132,14 @@ def main(*, task_scope: str = "all", argv: list[str] | None = None) -> None:
 
     formal_results = attach_absolute_capability_scores(formal_results)
     formal_results, formal_selection = score_checkpoint_results(formal_results, profile=selection_profile)
-    formal_by_path = {str(item["checkpoint_path"]): item for item in formal_results}
-
-    combined_results: list[dict[str, Any]] = []
-    for fast_result in fast_results:
-        checkpoint_path = str(fast_result["checkpoint_path"])
-        if checkpoint_path in formal_by_path:
-            merged = dict(fast_result)
-            merged.update(formal_by_path[checkpoint_path])
-            merged["fast_pass_balanced_score"] = fast_result.get("balanced_score")
-            merged["fast_pass_balanced_rank"] = fast_result.get("balanced_rank")
-            merged["evaluation_tier"] = "formal"
-            combined_results.append(merged)
-        else:
-            combined_results.append(dict(fast_result))
-
-    combined_results = attach_absolute_capability_scores(combined_results)
-    combined_results, combined_selection = score_checkpoint_results(combined_results, profile=selection_profile)
-    recommended = combined_selection.get("recommended_checkpoint")
+    recommended_source = "formal"
+    recommended = formal_selection.get("recommended_checkpoint")
     if recommended is None:
-        recommended = formal_selection.get("recommended_checkpoint")
+        recommended = fast_selection.get("recommended_checkpoint")
+        recommended_source = "fast_fallback"
+    if recommended is not None:
+        recommended = dict(recommended)
+        recommended["recommendation_source"] = recommended_source
 
     samples_root = benchmark_root / "samples"
     sample_artifacts: dict[str, dict[str, dict[str, str]]] = {
@@ -2824,10 +3150,11 @@ def main(*, task_scope: str = "all", argv: list[str] | None = None) -> None:
         "final_top3": {},
         "formal_candidates": {},
     }
-    top_results = sorted(
-        [item for item in combined_results if item.get("balanced_rank") is not None],
-        key=lambda item: int(item["balanced_rank"]),
-    )[:3]
+    fast_top_results = _ranked_results_v2(fast_results, limit=5)
+    formal_top_results = _ranked_results_v2(formal_results, limit=5)
+    top_results = _ranked_results_v2(formal_results, limit=3)
+    if not top_results:
+        top_results = _ranked_results_v2(fast_results, limit=3)
 
     group_artifacts, group_exports = _write_sample_group(
         samples_root=samples_root,
@@ -2852,7 +3179,7 @@ def main(*, task_scope: str = "all", argv: list[str] | None = None) -> None:
     )
     sample_artifacts["final_top3"] = group_artifacts
     exported_samples["final_top3"] = group_exports
-    plot_results = sorted(combined_results, key=lambda item: int(item.get("step", -1)))
+    plot_results = sorted(fast_results, key=lambda item: int(item.get("step", -1)))
     plot_artifacts: dict[str, str] = {}
     if plot_results:
         core_plot_path = benchmark_root / f"{_TASK_LABELS[task_scope]}_core_metrics.png"
@@ -2927,6 +3254,8 @@ def main(*, task_scope: str = "all", argv: list[str] | None = None) -> None:
         "summary": {
             "recommended_checkpoint": recommended,
             "top_k_candidates": [str(path.name) for path in candidate_paths],
+            "fast_top_checkpoints": [str(result["checkpoint_name"]) for result in fast_top_results],
+            "formal_top_checkpoints": [str(result["checkpoint_name"]) for result in formal_top_results],
             "final_top3_checkpoints": [str(path.name) for path in final_top_paths],
             "sample_artifacts": sample_artifacts,
         },
@@ -2939,19 +3268,26 @@ def main(*, task_scope: str = "all", argv: list[str] | None = None) -> None:
             "results": [_to_jsonable_result(result) for result in formal_results],
         },
         "final_selection": {
-            "selection": combined_selection,
+            "selection": formal_selection if formal_results else fast_selection,
             "recommended_checkpoint": recommended,
-            "leaderboard": combined_selection["leaderboard"],
+            "leaderboard": (
+                formal_selection["leaderboard"]
+                if formal_results
+                else fast_selection["leaderboard"]
+            ),
+            "recommendation_source": recommended_source,
         },
         "sample_artifacts": sample_artifacts,
     }
     dump_json_file(report_path, report, ensure_ascii=False, indent=2)
 
-    summary_text = _build_summary_markdown_v2(
+    summary_text = _build_summary_markdown_v3(
         run_id=run_id,
         task_scope=task_scope,
         benchmark_root=benchmark_root,
         recommended=recommended,
+        fast_results=fast_top_results,
+        formal_results=formal_top_results,
         top_results=top_results,
         training_summary=training_summary,
         plot_artifacts=plot_artifacts,
