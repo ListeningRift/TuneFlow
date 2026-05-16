@@ -6,13 +6,14 @@ import math
 from typing import Any
 
 
-ABSOLUTE_SCORE_VERSION = "absolute_v2_tightened_capability_panel"
+ABSOLUTE_SCORE_VERSION = "absolute_v3_expression_first"
 
 DIMENSION_SCORE_KEYS = {
     "continuation_closure": "absolute_continuation_closure_score",
     "continuation_structure": "absolute_continuation_structure_score",
     "infilling_integrity": "absolute_infilling_integrity_score",
     "phrase_coherence": "absolute_phrase_coherence_score",
+    "musical_expression": "absolute_musical_expression_score",
     "long_context_stability": "absolute_long_context_stability_score",
     "training_health": "absolute_training_health_score",
 }
@@ -20,7 +21,7 @@ DIMENSION_SCORE_KEYS = {
 _DIMENSION_SPECS: dict[str, dict[str, Any]] = {
     "continuation_closure": {
         "label": "续写收束",
-        "weight": 0.20,
+        "weight": 0.12,
         "proxy": False,
         "description": "衡量续写样本能否自然收束，而不是缺少 EOS 或被预算截断。",
         "metrics": [
@@ -64,7 +65,7 @@ _DIMENSION_SPECS: dict[str, dict[str, Any]] = {
     },
     "continuation_structure": {
         "label": "续写结构",
-        "weight": 0.20,
+        "weight": 0.07,
         "proxy": False,
         "description": "衡量续写输出是否保持结构合法、时间顺序正确且不过于空洞。",
         "metrics": [
@@ -108,7 +109,7 @@ _DIMENSION_SPECS: dict[str, dict[str, Any]] = {
     },
     "infilling_integrity": {
         "label": "补全完整性",
-        "weight": 0.22,
+        "weight": 0.08,
         "proxy": False,
         "description": "衡量补全输出是否保持结构合法、时间顺序正确且语法合法。",
         "metrics": [
@@ -143,15 +144,15 @@ _DIMENSION_SPECS: dict[str, dict[str, Any]] = {
     },
     "phrase_coherence": {
         "label": "乐句连贯性",
-        "weight": 0.15,
+        "weight": 0.24,
         "proxy": True,
-        "description": "v1 代理维度，使用首事件对齐、时值分布漂移和音高多样性近似衡量乐句自然度。",
+        "description": "v2 代理维度，使用首事件对齐、时值分布漂移和局部音高组织近似衡量乐句自然度。",
         "metrics": [
             {
                 "key": "continuation_first_event_hit_rate",
                 "label": "续写首事件命中率",
                 "goal": "max",
-                "weight": 0.25,
+                "weight": 0.30,
                 "bad": 0.12,
                 "acceptable": 0.48,
                 "ideal": 0.82,
@@ -160,7 +161,7 @@ _DIMENSION_SPECS: dict[str, dict[str, Any]] = {
                 "key": "duration_bin_l1_distance",
                 "label": "时值分桶 L1 距离",
                 "goal": "min",
-                "weight": 0.25,
+                "weight": 0.30,
                 "bad": 1.30,
                 "acceptable": 0.55,
                 "ideal": 0.15,
@@ -169,7 +170,7 @@ _DIMENSION_SPECS: dict[str, dict[str, Any]] = {
                 "key": "continuation_pitch_diversity_score",
                 "label": "续写音高多样性分数",
                 "goal": "max",
-                "weight": 0.20,
+                "weight": 0.15,
                 "bad": 0.12,
                 "acceptable": 0.52,
                 "ideal": 0.82,
@@ -178,7 +179,7 @@ _DIMENSION_SPECS: dict[str, dict[str, Any]] = {
                 "key": "infilling_pitch_diversity_score",
                 "label": "补全音高多样性分数",
                 "goal": "max",
-                "weight": 0.20,
+                "weight": 0.15,
                 "bad": 0.12,
                 "acceptable": 0.52,
                 "ideal": 0.82,
@@ -194,9 +195,62 @@ _DIMENSION_SPECS: dict[str, dict[str, Any]] = {
             },
         ],
     },
+    "musical_expression": {
+        "label": "音乐表达力",
+        "weight": 0.29,
+        "proxy": True,
+        "description": "v2 代理维度，使用音高/节奏多样性、同音堆叠和重复度近似衡量生成结果的真实音乐表达张力。",
+        "metrics": [
+            {
+                "key": "overall_pitch_diversity_score",
+                "label": "总体音高多样性分数",
+                "goal": "max",
+                "weight": 0.26,
+                "bad": 0.12,
+                "acceptable": 0.52,
+                "ideal": 0.82,
+            },
+            {
+                "key": "overall_rhythm_diversity_score",
+                "label": "总体节奏多样性分数",
+                "goal": "max",
+                "weight": 0.24,
+                "bad": 0.15,
+                "acceptable": 0.44,
+                "ideal": 0.70,
+            },
+            {
+                "key": "overall_same_pitch_overlap_rate",
+                "label": "总体同 pitch 重叠率",
+                "goal": "min",
+                "weight": 0.20,
+                "bad": 0.28,
+                "acceptable": 0.10,
+                "ideal": 0.02,
+            },
+            {
+                "key": "overall_event_ngram_repeat_ratio",
+                "label": "总体事件 n-gram 重复占比",
+                "goal": "min",
+                "weight": 0.16,
+                "bad": 0.35,
+                "acceptable": 0.10,
+                "ideal": 0.01,
+            },
+            {
+                "key": "overall_rhythm_ngram_repeat_ratio",
+                "label": "总体节奏 n-gram 重复占比",
+                "goal": "min",
+                "weight": 0.14,
+                "bad": 0.70,
+                "acceptable": 0.35,
+                "ideal": 0.12,
+            },
+        ],
+    },
     "long_context_stability": {
         "label": "长上下文稳定性",
-        "weight": 0.15,
+        "weight": 0.14,
         "proxy": True,
         "description": "v1 代理维度，使用稀疏 BAR、塌缩比例和长度漂移近似衡量长程退化风险。",
         "metrics": [
@@ -258,7 +312,7 @@ _DIMENSION_SPECS: dict[str, dict[str, Any]] = {
     },
     "training_health": {
         "label": "训练健康度",
-        "weight": 0.08,
+        "weight": 0.06,
         "proxy": False,
         "description": "基于验证损失、历史最佳验证损失和过拟合间隙衡量训练阶段健康度。",
         "metrics": [
@@ -521,6 +575,7 @@ def score_absolute_capabilities(result: dict[str, Any]) -> dict[str, Any]:
         "continuation_structure": "continuation_structure_score",
         "infilling_integrity": "infilling_integrity_score",
         "phrase_coherence": "phrase_coherence_score",
+        "musical_expression": "musical_expression_score",
         "long_context_stability": "long_context_stability_score",
         "training_health": "training_health_score",
     }

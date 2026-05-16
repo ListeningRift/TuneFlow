@@ -31,6 +31,10 @@ def _base_result() -> dict[str, float]:
         "infilling_longest_same_pitch_run_ratio": 0.30,
         "overall_most_common_pitch_ratio": 0.36,
         "overall_pitch_diversity_score": 0.54,
+        "overall_same_pitch_overlap_rate": 0.08,
+        "overall_rhythm_diversity_score": 0.50,
+        "overall_event_ngram_repeat_ratio": 0.06,
+        "overall_rhythm_ngram_repeat_ratio": 0.28,
         "valid_loss_from_training": 0.82,
         "best_valid_loss_so_far": 0.80,
         "train_loss_ema": 0.95,
@@ -74,6 +78,7 @@ class AbsoluteBenchmarkScoringTests(unittest.TestCase):
             "continuation_structure_score",
             "infilling_integrity_score",
             "phrase_coherence_score",
+            "musical_expression_score",
             "long_context_stability_score",
             "training_health_score",
         ):
@@ -84,6 +89,57 @@ class AbsoluteBenchmarkScoringTests(unittest.TestCase):
         scored = score_absolute_capabilities(_base_result())
         self.assertGreater(float(scored["absolute_score"]), 50.0)
         self.assertLess(float(scored["absolute_score"]), 70.0)
+
+    def test_expression_improvement_raises_expression_dimension(self) -> None:
+        baseline = score_absolute_capabilities(_base_result())
+        improved = score_absolute_capabilities(
+            {
+                **_base_result(),
+                "overall_pitch_diversity_score": 0.82,
+                "overall_rhythm_diversity_score": 0.72,
+                "overall_same_pitch_overlap_rate": 0.03,
+                "overall_event_ngram_repeat_ratio": 0.02,
+                "overall_rhythm_ngram_repeat_ratio": 0.14,
+            }
+        )
+        self.assertGreater(
+            float(improved["musical_expression_score"]),
+            float(baseline["musical_expression_score"]),
+        )
+
+    def test_expression_can_outweigh_small_structure_gap(self) -> None:
+        structure_heavy = score_absolute_capabilities(
+            {
+                **_base_result(),
+                "continuation_structural_validity_rate": 0.90,
+                "continuation_time_order_validity_rate": 0.995,
+                "infilling_structural_validity_rate": 0.92,
+                "infilling_time_order_validity_rate": 0.90,
+                "overall_pitch_diversity_score": 0.42,
+                "overall_rhythm_diversity_score": 0.36,
+                "overall_same_pitch_overlap_rate": 0.15,
+                "overall_event_ngram_repeat_ratio": 0.11,
+                "overall_rhythm_ngram_repeat_ratio": 0.40,
+                "phrase_coherence_score": None,
+            }
+        )
+        expression_heavy = score_absolute_capabilities(
+            {
+                **_base_result(),
+                "continuation_structural_validity_rate": 0.80,
+                "continuation_time_order_validity_rate": 0.97,
+                "infilling_structural_validity_rate": 0.82,
+                "infilling_time_order_validity_rate": 0.84,
+                "continuation_first_event_hit_rate": 0.58,
+                "duration_bin_l1_distance": 0.36,
+                "overall_pitch_diversity_score": 0.81,
+                "overall_rhythm_diversity_score": 0.69,
+                "overall_same_pitch_overlap_rate": 0.04,
+                "overall_event_ngram_repeat_ratio": 0.02,
+                "overall_rhythm_ngram_repeat_ratio": 0.15,
+            }
+        )
+        self.assertGreater(float(expression_heavy["absolute_score"]), float(structure_heavy["absolute_score"]))
 
     def test_missing_metrics_do_not_crash_and_report_coverage(self) -> None:
         scored = score_absolute_capabilities(

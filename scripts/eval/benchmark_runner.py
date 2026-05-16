@@ -520,6 +520,7 @@ def _to_jsonable_result(result: dict[str, Any]) -> dict[str, Any]:
         "continuation_structure_score": result.get("continuation_structure_score"),
         "infilling_integrity_score": result.get("infilling_integrity_score"),
         "phrase_coherence_score": result.get("phrase_coherence_score"),
+        "musical_expression_score": result.get("musical_expression_score"),
         "long_context_stability_score": result.get("long_context_stability_score"),
         "training_health_score": result.get("training_health_score"),
     }
@@ -1853,6 +1854,7 @@ _METRIC_LABELS_V2 = {
     "continuation_structure_score": "续写结构",
     "infilling_integrity_score": "补全完整性",
     "phrase_coherence_score": "乐句连贯性",
+    "musical_expression_score": "音乐表达力",
     "long_context_stability_score": "长上下文稳定性",
     "training_health_score": "训练健康度",
     "continuation_stop_success_rate": "续写成功停机率",
@@ -2025,6 +2027,7 @@ def _core_metric_specs_v2(task_scope: str) -> list[tuple[str, str]]:
             *base,
             ("continuation_closure_score", "续写收束"),
             ("continuation_structure_score", "续写结构"),
+            ("musical_expression_score", "音乐表达力"),
             ("long_context_stability_score", "长上下文稳定性"),
             ("training_health_score", "训练健康度"),
         ]
@@ -2033,6 +2036,7 @@ def _core_metric_specs_v2(task_scope: str) -> list[tuple[str, str]]:
             *base,
             ("infilling_integrity_score", "补全完整性"),
             ("phrase_coherence_score", "乐句连贯性"),
+            ("musical_expression_score", "音乐表达力"),
             ("long_context_stability_score", "长上下文稳定性"),
             ("training_health_score", "训练健康度"),
         ]
@@ -2042,6 +2046,7 @@ def _core_metric_specs_v2(task_scope: str) -> list[tuple[str, str]]:
         ("continuation_structure_score", "续写结构"),
         ("infilling_integrity_score", "补全完整性"),
         ("phrase_coherence_score", "乐句连贯性"),
+        ("musical_expression_score", "音乐表达力"),
         ("long_context_stability_score", "长上下文稳定性"),
         ("training_health_score", "训练健康度"),
     ]
@@ -2217,6 +2222,7 @@ def _plot_metric_specs_v2(task_scope: str, *, diagnostics: bool) -> list[dict[st
             {"key": "absolute_score", "label": "绝对分", "goal": "max", "color": "#1d4ed8"},
             {"key": "continuation_closure_score", "label": "续写收束", "goal": "max", "color": "#2563eb"},
             {"key": "continuation_structure_score", "label": "续写结构", "goal": "max", "color": "#16a34a"},
+            {"key": "musical_expression_score", "label": "音乐表达力", "goal": "max", "color": "#ea580c"},
             {"key": "long_context_stability_score", "label": "长上下文稳定性", "goal": "max", "color": "#7c3aed"},
         ]
     if task_scope == "infilling":
@@ -2225,6 +2231,7 @@ def _plot_metric_specs_v2(task_scope: str, *, diagnostics: bool) -> list[dict[st
             {"key": "absolute_score", "label": "绝对分", "goal": "max", "color": "#1d4ed8"},
             {"key": "infilling_integrity_score", "label": "补全完整性", "goal": "max", "color": "#2563eb"},
             {"key": "phrase_coherence_score", "label": "乐句连贯性", "goal": "max", "color": "#16a34a"},
+            {"key": "musical_expression_score", "label": "音乐表达力", "goal": "max", "color": "#ea580c"},
             {"key": "training_health_score", "label": "训练健康度", "goal": "max", "color": "#7c3aed"},
         ]
     return [
@@ -2234,6 +2241,7 @@ def _plot_metric_specs_v2(task_scope: str, *, diagnostics: bool) -> list[dict[st
         {"key": "continuation_structure_score", "label": "续写结构", "goal": "max", "color": "#16a34a"},
         {"key": "infilling_integrity_score", "label": "补全完整性", "goal": "max", "color": "#0891b2"},
         {"key": "phrase_coherence_score", "label": "乐句连贯性", "goal": "max", "color": "#ea580c"},
+        {"key": "musical_expression_score", "label": "音乐表达力", "goal": "max", "color": "#dc2626"},
         {"key": "long_context_stability_score", "label": "长上下文稳定性", "goal": "max", "color": "#7c3aed"},
     ]
 
@@ -2244,6 +2252,7 @@ def _absolute_plot_metric_specs_v2(task_scope: str) -> list[dict[str, Any]]:
             {"key": "absolute_score", "label": "绝对分", "goal": "max", "color": "#1d4ed8"},
             {"key": "continuation_closure_score", "label": "续写收束", "goal": "max", "color": "#2563eb"},
             {"key": "continuation_structure_score", "label": "续写结构", "goal": "max", "color": "#16a34a"},
+            {"key": "musical_expression_score", "label": "音乐表达力", "goal": "max", "color": "#ea580c"},
             {"key": "long_context_stability_score", "label": "长上下文稳定性", "goal": "max", "color": "#7c3aed"},
             {"key": "training_health_score", "label": "训练健康度", "goal": "max", "color": "#ea580c"},
         ]
@@ -2252,6 +2261,7 @@ def _absolute_plot_metric_specs_v2(task_scope: str) -> list[dict[str, Any]]:
             {"key": "absolute_score", "label": "绝对分", "goal": "max", "color": "#1d4ed8"},
             {"key": "infilling_integrity_score", "label": "补全完整性", "goal": "max", "color": "#2563eb"},
             {"key": "phrase_coherence_score", "label": "乐句连贯性", "goal": "max", "color": "#16a34a"},
+            {"key": "musical_expression_score", "label": "音乐表达力", "goal": "max", "color": "#ea580c"},
             {"key": "long_context_stability_score", "label": "长上下文稳定性", "goal": "max", "color": "#7c3aed"},
             {"key": "training_health_score", "label": "训练健康度", "goal": "max", "color": "#ea580c"},
         ]
@@ -2261,6 +2271,7 @@ def _absolute_plot_metric_specs_v2(task_scope: str) -> list[dict[str, Any]]:
         {"key": "continuation_structure_score", "label": "续写结构", "goal": "max", "color": "#16a34a"},
         {"key": "infilling_integrity_score", "label": "补全完整性", "goal": "max", "color": "#0891b2"},
         {"key": "phrase_coherence_score", "label": "乐句连贯性", "goal": "max", "color": "#ea580c"},
+        {"key": "musical_expression_score", "label": "音乐表达力", "goal": "max", "color": "#dc2626"},
         {"key": "long_context_stability_score", "label": "长上下文稳定性", "goal": "max", "color": "#7c3aed"},
         {"key": "training_health_score", "label": "训练健康度", "goal": "max", "color": "#b45309"},
     ]
