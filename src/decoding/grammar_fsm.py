@@ -15,6 +15,7 @@ AFTER_BAR = "after_bar"
 AFTER_BAR_TEMPO = "after_bar_tempo"
 AFTER_BAR_KEY = "after_bar_key"
 AFTER_BAR_TEMPO_KEY = "after_bar_tempo_key"
+AFTER_PHRASE = "after_phrase"
 AFTER_POS = "after_pos"
 AFTER_INST = "after_inst"
 AFTER_PITCH = "after_pitch"
@@ -46,6 +47,7 @@ class TuneFlowGrammarFSM:
         AFTER_BAR_TEMPO,
         AFTER_BAR_KEY,
         AFTER_BAR_TEMPO_KEY,
+        AFTER_PHRASE,
         AFTER_POS,
         AFTER_INST,
         AFTER_PITCH,
@@ -65,6 +67,7 @@ class TuneFlowGrammarFSM:
 
         self._tempo_ids: tuple[int, ...] = self._collect_prefix_ids("TEMPO_")
         self._key_ids: tuple[int, ...] = self._collect_prefix_ids("KEY_")
+        self._phrase_ids: tuple[int, ...] = self._collect_prefix_ids("PHRASE")
         self._pos_ids: tuple[int, ...] = self._collect_prefix_ids("POS_")
         self._inst_ids: tuple[int, ...] = self._collect_prefix_ids("INST_")
         self._pitch_ids: tuple[int, ...] = self._collect_prefix_ids("PITCH_")
@@ -77,6 +80,7 @@ class TuneFlowGrammarFSM:
         self._register_ids((self.bar_id,), "BAR")
         self._register_ids(self._tempo_ids, "TEMPO")
         self._register_ids(self._key_ids, "KEY")
+        self._register_ids(self._phrase_ids, "PHRASE")
         self._register_ids(self._pos_ids, "POS")
         self._register_ids(self._inst_ids, "INST")
         self._register_ids(self._pitch_ids, "PITCH")
@@ -89,15 +93,22 @@ class TuneFlowGrammarFSM:
             AFTER_HEAD_TEMPO: (*self._key_ids, self.bar_id, self.eos_id),
             AFTER_HEAD_KEY: (self.bar_id, self.eos_id),
             AFTER_HEAD_TEMPO_KEY: (self.bar_id, self.eos_id),
-            AFTER_BAR: (*self._tempo_ids, *self._key_ids, *self._pos_ids, self.bar_id, self.eos_id),
-            AFTER_BAR_TEMPO: (*self._key_ids, *self._pos_ids, self.bar_id, self.eos_id),
-            AFTER_BAR_KEY: (*self._pos_ids, self.bar_id, self.eos_id),
-            AFTER_BAR_TEMPO_KEY: (*self._pos_ids, self.bar_id, self.eos_id),
+            AFTER_BAR: (
+                *self._tempo_ids, *self._key_ids, *self._phrase_ids,
+                *self._pos_ids, self.bar_id, self.eos_id,
+            ),
+            AFTER_BAR_TEMPO: (
+                *self._key_ids, *self._phrase_ids,
+                *self._pos_ids, self.bar_id, self.eos_id,
+            ),
+            AFTER_BAR_KEY: (*self._phrase_ids, *self._pos_ids, self.bar_id, self.eos_id),
+            AFTER_BAR_TEMPO_KEY: (*self._phrase_ids, *self._pos_ids, self.bar_id, self.eos_id),
+            AFTER_PHRASE: self._pos_ids,
             AFTER_POS: self._inst_ids,
             AFTER_INST: self._pitch_ids,
             AFTER_PITCH: self._dur_ids,
             AFTER_DUR: self._vel_ids,
-            AFTER_VEL: (*self._pos_ids, self.bar_id, self.eos_id),
+            AFTER_VEL: (*self._phrase_ids, *self._pos_ids, self.bar_id, self.eos_id),
             TERMINAL: (),
         }
 
@@ -167,6 +178,8 @@ class TuneFlowGrammarFSM:
                 return AFTER_BAR_TEMPO
             if category == "KEY":
                 return AFTER_BAR_KEY
+            if category == "PHRASE":
+                return AFTER_PHRASE
             if category == "POS":
                 return AFTER_POS
             if category == "BAR":
@@ -177,6 +190,8 @@ class TuneFlowGrammarFSM:
         if state == AFTER_BAR_TEMPO:
             if category == "KEY":
                 return AFTER_BAR_TEMPO_KEY
+            if category == "PHRASE":
+                return AFTER_PHRASE
             if category == "POS":
                 return AFTER_POS
             if category == "BAR":
@@ -185,6 +200,8 @@ class TuneFlowGrammarFSM:
                 return TERMINAL
             return None
         if state == AFTER_BAR_KEY:
+            if category == "PHRASE":
+                return AFTER_PHRASE
             if category == "POS":
                 return AFTER_POS
             if category == "BAR":
@@ -193,6 +210,8 @@ class TuneFlowGrammarFSM:
                 return TERMINAL
             return None
         if state == AFTER_BAR_TEMPO_KEY:
+            if category == "PHRASE":
+                return AFTER_PHRASE
             if category == "POS":
                 return AFTER_POS
             if category == "BAR":
@@ -200,6 +219,8 @@ class TuneFlowGrammarFSM:
             if category == "EOS":
                 return TERMINAL
             return None
+        if state == AFTER_PHRASE:
+            return AFTER_POS if category == "POS" else None
         if state == AFTER_POS:
             return AFTER_INST if category == "INST" else None
         if state == AFTER_INST:
@@ -209,6 +230,8 @@ class TuneFlowGrammarFSM:
         if state == AFTER_DUR:
             return AFTER_VEL if category == "VEL" else None
         if state == AFTER_VEL:
+            if category == "PHRASE":
+                return AFTER_PHRASE
             if category == "POS":
                 return AFTER_POS
             if category == "BAR":
@@ -331,13 +354,15 @@ class TuneFlowGrammarFSM:
         if state == AFTER_HEAD_TEMPO_KEY:
             return f"expected_bar_or_eos@{index}:{token}"
         if state == AFTER_BAR:
-            return f"expected_tempo_key_pos_bar_or_eos@{index}:{token}"
+            return f"expected_tempo_key_phrase_pos_bar_or_eos@{index}:{token}"
         if state == AFTER_BAR_TEMPO:
-            return f"expected_key_pos_bar_or_eos@{index}:{token}"
+            return f"expected_key_phrase_pos_bar_or_eos@{index}:{token}"
         if state == AFTER_BAR_KEY:
-            return f"expected_pos_bar_or_eos@{index}:{token}"
+            return f"expected_phrase_pos_bar_or_eos@{index}:{token}"
         if state == AFTER_BAR_TEMPO_KEY:
-            return f"expected_pos_bar_or_eos@{index}:{token}"
+            return f"expected_phrase_pos_bar_or_eos@{index}:{token}"
+        if state == AFTER_PHRASE:
+            return f"expected_pos@{index}:{token}"
         if state == AFTER_POS:
             return f"expected_inst@{index}:{token}"
         if state == AFTER_INST:
@@ -347,7 +372,7 @@ class TuneFlowGrammarFSM:
         if state == AFTER_DUR:
             return f"expected_vel@{index}:{token}"
         if state == AFTER_VEL:
-            return f"expected_pos_bar_or_eos@{index}:{token}"
+            return f"expected_phrase_pos_bar_or_eos@{index}:{token}"
         if state == TERMINAL:
             return f"unexpected_token_after_eos@{index}:{token}"
         return f"invalid_token@{index}:{token}"
@@ -367,6 +392,8 @@ class TuneFlowGrammarFSM:
             AFTER_VEL,
         }:
             return "missing_eos"
+        if state == AFTER_PHRASE:
+            return "incomplete_phrase_expected_pos"
         if state == AFTER_POS:
             return "incomplete_note_tuple_expected_inst"
         if state == AFTER_INST:

@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from .config_io import load_yaml_mapping
-from .eval_windows import sample_bar_aligned_subsequence
+from .eval_windows import sample_phrase_aligned_subsequence
 
 _POSITIONS_PER_BAR = 32
 
@@ -69,6 +69,10 @@ def _collect_continuation_split_positions(core: list[str]) -> list[int]:
             idx += 1
         if idx < len(core) and core[idx].startswith("KEY_"):
             idx += 1
+        if idx < len(core) and core[idx] == "PHRASE":
+            # bar-head PHRASE: 标记为合法 split 边界（split 后 target 以 PHRASE 起首即可）
+            positions.add(idx)
+            idx += 1
 
         while idx < len(core) and core[idx].startswith("POS_"):
             positions.add(idx)
@@ -83,6 +87,10 @@ def _collect_continuation_split_positions(core: list[str]) -> list[int]:
             if not core[idx + 4].startswith("VEL_"):
                 return []
             idx += 5
+            if idx < len(core) and core[idx] == "PHRASE":
+                # mid-bar PHRASE：与 bar-head 相同，记为合法 split 边界
+                positions.add(idx)
+                idx += 1
 
     positions.discard(0)
     positions.discard(len(core))
@@ -117,6 +125,20 @@ def _collect_infill_maskable_units(core: list[str]) -> list[tuple[int, int, str,
             idx += 1
             group_id += 1
 
+        # bar-head PHRASE: 与紧随的 event 一起作为 `phrase_event` 6-token 单元
+        if idx < len(core) and core[idx] == "PHRASE":
+            if idx + 5 < len(core) and (
+                core[idx + 1].startswith("POS_")
+                and core[idx + 2].startswith("INST_")
+                and core[idx + 3].startswith("PITCH_")
+                and core[idx + 4].startswith("DUR_")
+                and core[idx + 5].startswith("VEL_")
+            ):
+                units.append((idx, idx + 6, "phrase_event", group_id))
+                idx += 6
+            else:
+                return []
+
         while idx < len(core) and core[idx].startswith("POS_"):
             if idx + 4 >= len(core):
                 return []
@@ -130,6 +152,19 @@ def _collect_infill_maskable_units(core: list[str]) -> list[tuple[int, int, str,
                 return []
             units.append((idx, idx + 5, "event", group_id))
             idx += 5
+            # mid-bar PHRASE + event 也作为 `phrase_event` 6-token 单元
+            if idx < len(core) and core[idx] == "PHRASE":
+                if idx + 5 < len(core) and (
+                    core[idx + 1].startswith("POS_")
+                    and core[idx + 2].startswith("INST_")
+                    and core[idx + 3].startswith("PITCH_")
+                    and core[idx + 4].startswith("DUR_")
+                    and core[idx + 5].startswith("VEL_")
+                ):
+                    units.append((idx, idx + 6, "phrase_event", group_id))
+                    idx += 6
+                else:
+                    return []
     return units
 
 
@@ -238,7 +273,7 @@ def build_continuation_case(
     rng = random.Random(seed)
     min_core_len = max(int(min_prefix_tokens) + 8, 24)
     max_core_len = max(min_core_len, int(max_positions) - 8)
-    sequence_window = sample_bar_aligned_subsequence(
+    sequence_window = sample_phrase_aligned_subsequence(
         source_tokens,
         max_core_tokens=max_core_len,
         min_core_tokens=min_core_len,
@@ -298,7 +333,7 @@ def build_infilling_case(
         return None
 
     rng = random.Random(seed)
-    sequence_window = sample_bar_aligned_subsequence(
+    sequence_window = sample_phrase_aligned_subsequence(
         source_tokens,
         max_core_tokens=max(24, int(max_positions) - 8),
         min_core_tokens=20,

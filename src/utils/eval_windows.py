@@ -5,44 +5,77 @@ from __future__ import annotations
 import random
 from typing import Sequence
 
-from src.music_analysis import analyze_phrase_candidates
+from src.music_analysis import PhraseAnalysis, analyze_phrase_candidates
 
 
-def _build_bar_span_window(
+def _scan_structural_positions(tokens: Sequence[str]) -> tuple[list[int], list[int]]:
+    """One-pass scan returning (bar_positions, phrase_positions)."""
+    bar_positions: list[int] = []
+    phrase_positions: list[int] = []
+    for idx, token in enumerate(tokens):
+        if token == "BAR":
+            bar_positions.append(idx)
+        elif token == "PHRASE":
+            phrase_positions.append(idx)
+    return bar_positions, phrase_positions
+
+
+def _build_window_at_positions(
     source_tokens: Sequence[str],
+    analysis: PhraseAnalysis,
     *,
-    start_bar: int,
-    end_bar: int,
+    start_index: int,
+    end_index: int,
 ) -> list[str] | None:
-    analysis = analyze_phrase_candidates(source_tokens)
-    if not analysis.bars or not (0 <= start_bar < end_bar <= len(analysis.bars)):
+    """Materialize a window starting at `start_index` (a BAR cut) and ending
+    just before `end_index` (a BAR cut or EOS index).
+
+    Header is `BOS [TEMPO] [KEY]` derived from the effective context at start.
+    Body BAR headers are normalized: redundant TEMPO/KEY stripped, PHRASE preserved.
+    Window body always starts with `BAR` to satisfy `validate_token_order`.
+    """
+    if not analysis.bars:
         return None
 
-    window_tokens: list[str] = ["BOS"]
-    leading_tempo = analysis.bars[start_bar].effective_tempo_token
-    leading_key = analysis.bars[start_bar].effective_key_token
-    if leading_tempo is not None:
-        window_tokens.append(leading_tempo)
-    if leading_key is not None:
-        window_tokens.append(leading_key)
+    bar_index = -1
+    for idx, bar in enumerate(analysis.bars):
+        if bar.start_token == start_index:
+            bar_index = idx
+            break
+    if bar_index < 0:
+        return None
 
-    for bar_index in range(start_bar, end_bar):
-        bar = analysis.bars[bar_index]
-        raw_bar_tokens = [str(token) for token in source_tokens[bar.start_token : bar.end_token]]
-        if raw_bar_tokens and raw_bar_tokens[0] == "BAR":
-            idx = 1
-            if idx < len(raw_bar_tokens) and raw_bar_tokens[idx].startswith("TEMPO_"):
+    tempo_token = analysis.bars[bar_index].effective_tempo_token
+    key_token = analysis.bars[bar_index].effective_key_token
+
+    body = [str(token) for token in source_tokens[start_index:end_index]]
+    normalized: list[str] = []
+    idx = 0
+    while idx < len(body):
+        token = body[idx]
+        if token == "BAR":
+            normalized.append("BAR")
+            idx += 1
+            while idx < len(body) and (body[idx].startswith("TEMPO_") or body[idx].startswith("KEY_")):
                 idx += 1
-            if idx < len(raw_bar_tokens) and raw_bar_tokens[idx].startswith("KEY_"):
+            if idx < len(body) and body[idx] == "PHRASE":
+                normalized.append("PHRASE")
                 idx += 1
-            raw_bar_tokens = ["BAR", *raw_bar_tokens[idx:]]
-        window_tokens.extend(raw_bar_tokens)
+            continue
+        normalized.append(token)
+        idx += 1
 
-    window_tokens.append("EOS")
-    return window_tokens
+    window: list[str] = ["BOS"]
+    if tempo_token is not None:
+        window.append(tempo_token)
+    if key_token is not None:
+        window.append(key_token)
+    window.extend(normalized)
+    window.append("EOS")
+    return window
 
 
-def sample_bar_aligned_subsequence(
+def sample_phrase_aligned_subsequence(
     source_tokens: Sequence[str],
     *,
     max_core_tokens: int,
@@ -50,11 +83,11 @@ def sample_bar_aligned_subsequence(
     rng: random.Random,
     max_attempts: int = 64,
 ) -> list[str] | None:
-    """
-    Sample a valid normalized subsequence in `BOS [TEMPO] BAR ... EOS` form.
+    """Sample a valid normalized subsequence in `BOS [TEMPO] [KEY] body EOS` form.
 
-    The window keeps only the tempo active at the window start, matching the
-    phrase-oriented training view.
+    `body` always starts with `BAR` (required by `validate_token_order`).
+    PHRASE priority is expressed as "prefer bars whose interior carries a PHRASE
+    token"; bars without inline PHRASE serve as fallback.
     """
     if max_core_tokens <= 0:
         return None
@@ -63,41 +96,51 @@ def sample_bar_aligned_subsequence(
     if not source_tokens or source_tokens[0] != "BOS" or source_tokens[-1] != "EOS":
         return None
 
+    bar_positions, phrase_positions = _scan_structural_positions(source_tokens)
+    if not bar_positions:
+        return None
+    eos_index = len(source_tokens) - 1
     analysis = analyze_phrase_candidates(source_tokens)
-    bars = list(analysis.bars)
+    if not analysis.bars:
+        return None
 
-    if not bars:
-        body = [str(token) for token in source_tokens[1:-1]]
-        if not (min_core_tokens <= len(body) <= max_core_tokens):
-            return None
-        return ["BOS", *body, "EOS"]
-
-    def _build_window(start_bar: int, choose_random_end: bool) -> list[str] | None:
-        candidate_ends: list[int] = []
-        for end_bar in range(start_bar + 1, len(bars) + 1):
-            window = _build_bar_span_window(source_tokens, start_bar=start_bar, end_bar=end_bar)
-            if window is None:
-                return None
-            body_len = len(window) - 2
-            if body_len > max_core_tokens:
+    # Map PHRASE token index → enclosing BAR start index.
+    phrase_bar_starts: set[int] = set()
+    for phrase_idx in phrase_positions:
+        enclosing = -1
+        for bar_pos in bar_positions:
+            if bar_pos < phrase_idx:
+                enclosing = bar_pos
+            else:
                 break
-            if body_len >= min_core_tokens:
-                candidate_ends.append(end_bar)
+        if enclosing >= 0:
+            phrase_bar_starts.add(enclosing)
 
-        if not candidate_ends:
+    # Cut points: all BAR starts; "preferred" subset is those that carry a PHRASE.
+    all_cuts = [*bar_positions, eos_index]
+    preferred_starts = [pos for pos in bar_positions if pos in phrase_bar_starts]
+    fallback_starts = list(bar_positions)
+
+    def _try_pick(starts: list[int]) -> list[str] | None:
+        if not starts:
             return None
+        for _ in range(max_attempts):
+            start = starts[rng.randrange(len(starts))]
+            valid_ends = [
+                end for end in all_cuts
+                if end > start and min_core_tokens <= (end - start) <= max_core_tokens
+            ]
+            if not valid_ends:
+                continue
+            end = valid_ends[rng.randrange(len(valid_ends))]
+            window = _build_window_at_positions(
+                source_tokens, analysis, start_index=start, end_index=end,
+            )
+            if window is None:
+                continue
+            body_len = len(window) - 2
+            if min_core_tokens <= body_len <= max_core_tokens:
+                return window
+        return None
 
-        chosen_end = rng.choice(candidate_ends) if choose_random_end else candidate_ends[-1]
-        return _build_bar_span_window(source_tokens, start_bar=start_bar, end_bar=chosen_end)
-
-    for _ in range(max_attempts):
-        start_bar = rng.randrange(len(bars))
-        window = _build_window(start_bar, choose_random_end=True)
-        if window is not None:
-            return window
-
-    for start_bar in range(len(bars)):
-        window = _build_window(start_bar, choose_random_end=False)
-        if window is not None:
-            return window
-    return None
+    return _try_pick(preferred_starts) or _try_pick(fallback_starts)

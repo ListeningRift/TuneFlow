@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
 import json
 import math
 import mmap
@@ -13,12 +12,6 @@ import time
 from contextlib import nullcontext
 from pathlib import Path
 
-from ..music_analysis import (
-    PhraseAnalysisConfig,
-    PhraseWindowPolicy,
-    analyze_phrase_candidates,
-    sample_phrase_window,
-)
 from ..utils.output_cleanup import ensure_clean_directory, remove_file_if_exists
 from ..utils.torch_utils import count_parameters, lazy_import_torch, resolve_torch_device
 
@@ -43,23 +36,6 @@ def _load_id_to_token(vocab_path: Path) -> list[str]:
         if 0 <= int_idx < len(id_to_token):
             id_to_token[int_idx] = str(token)
     return id_to_token
-
-
-@dataclass(frozen=True)
-class PhraseSamplingConfig:
-    """Controls phrase-oriented window sampling."""
-
-    enabled: bool = False
-    analysis_config: PhraseAnalysisConfig = PhraseAnalysisConfig()
-    single_phrase_ratio: float = 0.40
-    cross_phrase_ratio: float = 0.40
-    long_context_ratio: float = 0.20
-    single_phrase_bar_min: int = 2
-    single_phrase_bar_max: int = 4
-    cross_phrase_bar_min: int = 4
-    cross_phrase_bar_max: int = 8
-    long_context_bar_min: int = 12
-    long_context_bar_max: int = 24
 
 
 class TokenBinDataset:
@@ -168,91 +144,12 @@ class TokenBinDataset:
         return padded_rows, padded_labels
 
     @staticmethod
-    def _pick_phrase_policy_kind(rng: random.Random, phrase_sampling: PhraseSamplingConfig) -> str:
-        pick = rng.random()
-        if pick < phrase_sampling.single_phrase_ratio:
-            return "single_phrase"
-        if pick < phrase_sampling.single_phrase_ratio + phrase_sampling.cross_phrase_ratio:
-            return "cross_boundary"
-        return "long_context"
-
-    @staticmethod
-    def _phrase_policy_fallback_order(kind: str) -> list[str]:
-        if kind == "long_context":
-            return ["long_context", "cross_boundary", "single_phrase"]
-        if kind == "cross_boundary":
-            return ["cross_boundary", "single_phrase", "long_context"]
-        return ["single_phrase", "cross_boundary", "long_context"]
-
-    @staticmethod
-    def _phrase_policy_for_kind(
-        phrase_sampling: PhraseSamplingConfig,
-        kind: str,
-        *,
-        max_tokens: int,
-    ) -> PhraseWindowPolicy:
-        if kind == "single_phrase":
-            return PhraseWindowPolicy(
-                kind="single_phrase",
-                min_bars=phrase_sampling.single_phrase_bar_min,
-                max_bars=phrase_sampling.single_phrase_bar_max,
-                max_tokens=max_tokens,
-            )
-        if kind == "cross_boundary":
-            return PhraseWindowPolicy(
-                kind="cross_boundary",
-                min_bars=phrase_sampling.cross_phrase_bar_min,
-                max_bars=phrase_sampling.cross_phrase_bar_max,
-                max_tokens=max_tokens,
-            )
-        if kind == "long_context":
-            return PhraseWindowPolicy(
-                kind="long_context",
-                min_bars=phrase_sampling.long_context_bar_min,
-                max_bars=phrase_sampling.long_context_bar_max,
-                max_tokens=max_tokens,
-            )
-        raise ValueError(f"Unsupported phrase policy kind: {kind!r}")
-
-    def _sample_phrase_window(
-        self,
-        rng: random.Random,
-        *,
-        seq_len: int,
-        id_to_token: list[str],
-        phrase_sampling: PhraseSamplingConfig,
-        max_attempts: int = 64,
-    ) -> tuple[list[str], str]:
-        if not phrase_sampling.enabled:
-            raise ValueError("Phrase sampling requested but disabled.")
-
-        candidates = self._eligible_indices(8)
-        if not candidates:
-            raise ValueError(f"No eligible sequences found in {self.idx_path}.")
-
-        for _ in range(max_attempts):
-            seq_idx = candidates[rng.randrange(len(candidates))]
-            source_ids = self._sequence_tokens(seq_idx)
-            source_tokens = self._sequence_token_strings(source_ids, id_to_token)
-            analysis = analyze_phrase_candidates(source_tokens, config=phrase_sampling.analysis_config)
-            if not analysis.bars:
-                continue
-
-            requested_kind = self._pick_phrase_policy_kind(rng, phrase_sampling)
-            for kind in self._phrase_policy_fallback_order(requested_kind):
-                policy = self._phrase_policy_for_kind(phrase_sampling, kind, max_tokens=seq_len)
-                sampled = sample_phrase_window(source_tokens, analysis, policy, rng)
-                if sampled is not None:
-                    return list(sampled.tokens), sampled.source_kind
-
-        raise ValueError("Unable to sample a phrase-aware window after multiple retries.")
-
-    @staticmethod
     def _collect_window_cut_positions(sequence_tokens: list[int], id_to_token: list[str]) -> list[int]:
         """
         收集 NEXT/validation 允许切分的边界位置。
 
         目标是保证窗口首尾都落在完整结构单元边界上，不在完整音符事件内部截断。
+        PHRASE 不构成独立 cut 边界：必须与紧随的 event 一起作为长度 6 的整体推进。
         """
         positions: list[int] = [0]
         idx = 0
@@ -270,6 +167,31 @@ class TokenBinDataset:
                 or token == "BAR"
             ):
                 idx += 1
+                positions.append(idx)
+                continue
+
+            if token == "PHRASE":
+                if idx + 5 >= len(sequence_tokens):
+                    return []
+                pos_id = int(sequence_tokens[idx + 1])
+                inst_id = int(sequence_tokens[idx + 2])
+                pitch_id = int(sequence_tokens[idx + 3])
+                dur_id = int(sequence_tokens[idx + 4])
+                vel_id = int(sequence_tokens[idx + 5])
+                if not (
+                    0 <= pos_id < len(id_to_token)
+                    and 0 <= inst_id < len(id_to_token)
+                    and 0 <= pitch_id < len(id_to_token)
+                    and 0 <= dur_id < len(id_to_token)
+                    and 0 <= vel_id < len(id_to_token)
+                    and id_to_token[pos_id].startswith("POS_")
+                    and id_to_token[inst_id].startswith("INST_")
+                    and id_to_token[pitch_id].startswith("PITCH_")
+                    and id_to_token[dur_id].startswith("DUR_")
+                    and id_to_token[vel_id].startswith("VEL_")
+                ):
+                    return []
+                idx += 6
                 positions.append(idx)
                 continue
 
@@ -321,11 +243,14 @@ class TokenBinDataset:
                 "Please lower --seq-len or regenerate data."
             )
 
+        rejected_no_cuts = 0
+        rejected_no_exact_start = 0
         for _ in range(max_attempts):
             seq_idx = candidates[rng.randrange(len(candidates))]
             seq_tokens = self._sequence_tokens(seq_idx)
             cut_positions = self._collect_window_cut_positions(seq_tokens, id_to_token)
             if len(cut_positions) < 2:
+                rejected_no_cuts += 1
                 continue
             cut_set = set(cut_positions)
             exact_starts = [start for start in cut_positions[:-1] if start + window_len in cut_set]
@@ -337,13 +262,19 @@ class TokenBinDataset:
                 exact_starts = [start for start in exact_starts if start + window_len == len(seq_tokens)]
 
             if not exact_starts:
+                rejected_no_exact_start += 1
                 continue
 
             start = exact_starts[rng.randrange(len(exact_starts))]
             end = start + window_len
             return seq_tokens[start:end]
 
-        raise ValueError("Unable to sample an aligned window after multiple retries.")
+        raise ValueError(
+            f"Unable to sample an aligned window after {max_attempts} retries "
+            f"(rejected: no_cuts={rejected_no_cuts}, no_exact_start={rejected_no_exact_start}). "
+            f"Possible causes: data contains malformed structural units, "
+            f"or window_len={window_len} does not align with any structural boundary."
+        )
 
     def _sample_window(self, rng: random.Random, window_len: int, anchor: str = "random") -> list[int]:
         """随机抽取一个连续窗口（长度为 `window_len`）。"""
@@ -392,11 +323,12 @@ class TokenBinDataset:
         """
         收集训练时允许被 FIM mask 的完整结构单元。
 
-        只允许 mask：
-        - `BAR`
-        - 完整音符事件 `POS -> INST -> PITCH -> DUR -> VEL`
+        允许 mask：
+        - `BAR`（长度 1）
+        - 完整音符事件 `POS -> INST -> PITCH -> DUR -> VEL`（长度 5）
+        - `PHRASE + 完整音符事件`（长度 6）：保证 hole 不会只 mask 单 PHRASE token
 
-        `BOS/EOS/TEMPO_*` 以及无法识别的残缺片段都视为不可 mask 边界。
+        `BOS/EOS/TEMPO_*/KEY_*` 以及无法识别的残缺片段都视为不可 mask 边界。
         """
         units: list[tuple[int, int, str, int]] = []
         idx = 0
@@ -422,6 +354,32 @@ class TokenBinDataset:
             if token == "BAR":
                 units.append((idx, idx + 1, "bar", group_id))
                 idx += 1
+                continue
+
+            if token == "PHRASE":
+                if idx + 5 < len(base_tokens):
+                    pos_id = int(base_tokens[idx + 1])
+                    inst_id = int(base_tokens[idx + 2])
+                    pitch_id = int(base_tokens[idx + 3])
+                    dur_id = int(base_tokens[idx + 4])
+                    vel_id = int(base_tokens[idx + 5])
+                    if (
+                        0 <= pos_id < len(id_to_token)
+                        and 0 <= inst_id < len(id_to_token)
+                        and 0 <= pitch_id < len(id_to_token)
+                        and 0 <= dur_id < len(id_to_token)
+                        and 0 <= vel_id < len(id_to_token)
+                        and id_to_token[pos_id].startswith("POS_")
+                        and id_to_token[inst_id].startswith("INST_")
+                        and id_to_token[pitch_id].startswith("PITCH_")
+                        and id_to_token[dur_id].startswith("DUR_")
+                        and id_to_token[vel_id].startswith("VEL_")
+                    ):
+                        units.append((idx, idx + 6, "phrase_event", group_id))
+                        idx += 6
+                        continue
+                idx += 1
+                group_id += 1
                 continue
 
             if token.startswith("POS_") and idx + 4 < len(base_tokens):
@@ -500,171 +458,6 @@ class TokenBinDataset:
         near_best = [(start, end) for gap, start, end in candidate_bounds if gap <= best_gap + 4]
         return near_best[rng.randrange(len(near_best))]
 
-    @staticmethod
-    def _choose_phrase_hole_bar_span(
-        base_tokens_text: list[str],
-        *,
-        source_kind: str,
-        rng: random.Random,
-        phrase_sampling: PhraseSamplingConfig,
-        fim_min_span: int,
-        fim_max_span: int,
-    ) -> tuple[int, int] | None:
-        analysis = analyze_phrase_candidates(base_tokens_text, config=phrase_sampling.analysis_config)
-        total_bars = len(analysis.bars)
-        if total_bars < 3:
-            return None
-
-        phrase_boundaries = {span.start_bar for span in analysis.phrase_spans[1:]}
-        phrase_index_by_bar: dict[int, int] = {}
-        for phrase_index, span in enumerate(analysis.phrase_spans):
-            for bar_index in range(span.start_bar, span.end_bar):
-                phrase_index_by_bar[bar_index] = phrase_index
-
-        target_span = (fim_min_span + fim_max_span) / 2.0
-        sequence_center = total_bars / 2.0
-        candidate_spans: list[tuple[float, int, int]] = []
-
-        def add_bar_span(start_bar: int, end_bar: int) -> None:
-            if start_bar <= 0 or end_bar >= total_bars or end_bar <= start_bar:
-                return
-            start_token = analysis.bars[start_bar].start_token
-            end_token = analysis.bars[end_bar - 1].end_token
-            span_len = end_token - start_token
-            if span_len < fim_min_span or span_len > fim_max_span:
-                return
-            boundary_count = sum(1 for boundary in phrase_boundaries if start_bar < boundary < end_bar)
-            start_phrase = phrase_index_by_bar.get(start_bar)
-            end_phrase = phrase_index_by_bar.get(end_bar - 1)
-            within_single_phrase = (start_phrase is not None) and (start_phrase == end_phrase)
-            exact_phrase_match = any(
-                span.start_bar == start_bar and span.end_bar == end_bar
-                for span in analysis.phrase_spans
-            )
-            center_penalty = abs(((start_bar + end_bar) / 2.0) - sequence_center)
-            score = abs(span_len - target_span) * 1.0
-            score += center_penalty * 2.0
-
-            if source_kind == "single_phrase":
-                score += 0.0 if within_single_phrase else 40.0
-                score += float(boundary_count) * 12.0
-                if exact_phrase_match:
-                    score -= 8.0
-            elif source_kind == "cross_boundary":
-                if boundary_count <= 0:
-                    score += 40.0
-                else:
-                    score += abs(boundary_count - 1) * 10.0
-                if exact_phrase_match:
-                    score += 10.0
-            else:
-                score += 0.0 if (boundary_count >= 1 or exact_phrase_match) else 24.0
-                if exact_phrase_match:
-                    score -= 6.0
-            candidate_spans.append((score, start_token, end_token))
-
-        for start_bar in range(1, total_bars - 1):
-            for end_bar in range(start_bar + 1, total_bars):
-                add_bar_span(start_bar, end_bar)
-
-        if not candidate_spans:
-            return None
-
-        candidate_spans.sort(key=lambda item: (item[0], item[1], item[2]))
-        best_gap = float(candidate_spans[0][0])
-        near_best = [(start, end) for gap, start, end in candidate_spans if float(gap) <= best_gap + 12.0]
-        return near_best[rng.randrange(len(near_best))]
-
-    @classmethod
-    def _build_phrase_aware_fim_example(
-        cls,
-        *,
-        base_tokens_text: list[str],
-        token_to_id: dict[str, int],
-        rng: random.Random,
-        source_kind: str,
-        phrase_sampling: PhraseSamplingConfig,
-        fim_min_span: int,
-        fim_max_span: int,
-        append_eos: bool = False,
-    ) -> tuple[list[int], list[int], str]:
-        working_tokens = list(base_tokens_text)
-        if append_eos and working_tokens and working_tokens[-1] == "EOS":
-            working_tokens = working_tokens[:-1]
-
-        hole_bounds = cls._choose_phrase_hole_bar_span(
-            working_tokens,
-            source_kind=source_kind,
-            rng=rng,
-            phrase_sampling=phrase_sampling,
-            fim_min_span=fim_min_span,
-            fim_max_span=fim_max_span,
-        )
-        if hole_bounds is None:
-            raise ValueError("Unable to find a phrase-aware FIM hole.")
-
-        start, end = hole_bounds
-        prefix = list(working_tokens[:start])
-        middle = list(working_tokens[start:end])
-        suffix = list(working_tokens[end:])
-        fim_tokens_text = [*prefix, "FIM_HOLE", *suffix, "FIM_MID", *middle]
-        if append_eos:
-            fim_tokens_text.append("EOS")
-
-        fim_tokens = cls._encode_tokens(fim_tokens_text, token_to_id)
-        labels = fim_tokens.copy()
-        fim_mid_pos = len(prefix) + 1 + len(suffix)
-        for idx in range(fim_mid_pos + 1):
-            labels[idx] = -100
-        return fim_tokens, labels, source_kind
-
-    @classmethod
-    def _build_phrase_or_fallback_fim_example(
-        cls,
-        *,
-        base_tokens_text: list[str],
-        token_to_id: dict[str, int],
-        id_to_token: list[str],
-        rng: random.Random,
-        source_kind: str,
-        phrase_sampling: PhraseSamplingConfig,
-        fim_hole_token_id: int,
-        fim_mid_token_id: int,
-        fim_min_span: int,
-        fim_max_span: int,
-        append_eos: bool = False,
-        eos_token_id: int | None = None,
-    ) -> tuple[list[int], list[int], str, bool]:
-        try:
-            fim_input, fim_labels, fim_kind = cls._build_phrase_aware_fim_example(
-                base_tokens_text=base_tokens_text,
-                token_to_id=token_to_id,
-                rng=rng,
-                source_kind=source_kind,
-                phrase_sampling=phrase_sampling,
-                fim_min_span=fim_min_span,
-                fim_max_span=fim_max_span,
-                append_eos=append_eos,
-            )
-            return fim_input, fim_labels, fim_kind, True
-        except ValueError:
-            fallback_base_tokens_text = list(base_tokens_text)
-            if append_eos and fallback_base_tokens_text and fallback_base_tokens_text[-1] == "EOS":
-                fallback_base_tokens_text = fallback_base_tokens_text[:-1]
-            fallback_base_tokens = cls._encode_tokens(fallback_base_tokens_text, token_to_id)
-            fim_input, fim_labels = cls._build_fim_example(
-                base_tokens=fallback_base_tokens,
-                rng=rng,
-                id_to_token=id_to_token,
-                fim_hole_token_id=fim_hole_token_id,
-                fim_mid_token_id=fim_mid_token_id,
-                fim_min_span=fim_min_span,
-                fim_max_span=fim_max_span,
-                append_eos=append_eos,
-                eos_token_id=eos_token_id,
-            )
-            return fim_input, fim_labels, source_kind, False
-
     @classmethod
     def _build_fim_example(
         cls,
@@ -726,33 +519,20 @@ class TokenBinDataset:
         id_to_token: list[str],
         token_to_id: dict[str, int] | None = None,
         eos_token_id: int | None = None,
-        phrase_sampling: PhraseSamplingConfig | None = None,
     ):
         """采样 NEXT batch（labels 与 input_ids 对齐，由模型内部完成 shift）。"""
+        del token_to_id
         input_rows: list[list[int]] = []
         label_rows: list[list[int]] = []
         for _ in range(batch_size):
-            if phrase_sampling is not None and phrase_sampling.enabled:
-                if token_to_id is None or eos_token_id is None:
-                    raise ValueError("Phrase-aware sampling requires token_to_id and eos_token_id.")
-                window_tokens, _window_kind = self._sample_phrase_window(
-                    rng=rng,
-                    seq_len=seq_len,
-                    id_to_token=id_to_token,
-                    phrase_sampling=phrase_sampling,
-                )
-                encoded = self._encode_tokens(window_tokens, token_to_id)
-                input_rows.append(encoded)
-                label_rows.append(encoded.copy())
-            else:
-                window = self._sample_aligned_window(
-                    rng=rng,
-                    window_len=seq_len,
-                    id_to_token=id_to_token,
-                    anchor="random",
-                )
-                input_rows.append(window)
-                label_rows.append(window.copy())
+            window = self._sample_aligned_window(
+                rng=rng,
+                window_len=seq_len,
+                id_to_token=id_to_token,
+                anchor="random",
+            )
+            input_rows.append(window)
+            label_rows.append(window.copy())
 
         if eos_token_id is not None:
             input_rows, label_rows = self._pad_rows(
@@ -782,13 +562,9 @@ class TokenBinDataset:
         fim_max_span: int,
         fim_eos_ratio: float,
         eos_token_id: int | None,
-        phrase_sampling: PhraseSamplingConfig | None = None,
     ):
-        """
-        采样 NEXT + FIM 混合 batch。
-
-        返回 `(input_ids, labels, fim_examples)`，其中 `fim_examples` 为当前 batch 的 FIM 条数。
-        """
+        """采样 NEXT + FIM 混合 batch。返回 `(input_ids, labels, fim_examples)`。"""
+        del token_to_id
         if not (0.0 <= fim_ratio <= 1.0):
             raise ValueError(f"fim_ratio must be within [0, 1], got {fim_ratio}.")
 
@@ -799,13 +575,6 @@ class TokenBinDataset:
         input_rows: list[list[int]] = []
         label_rows: list[list[int]] = []
         fim_examples = 0
-        sample_stats = {
-            "single_phrase_examples": 0,
-            "cross_boundary_examples": 0,
-            "long_context_examples": 0,
-            "phrase_fim_examples": 0,
-            "phrase_fim_fallback_examples": 0,
-        }
 
         for _ in range(batch_size):
             pick_fim = use_fim and (rng.random() < fim_ratio)
@@ -818,98 +587,49 @@ class TokenBinDataset:
                 )
                 fim_input = None
                 fim_labels = None
-                fim_kind = None
                 for _ in range(16):
-                    if phrase_sampling is not None and phrase_sampling.enabled:
-                        if token_to_id is None or eos_token_id is None:
-                            raise ValueError("Phrase-aware FIM sampling requires token_to_id and eos_token_id.")
-                        base_tokens_text, fim_kind = self._sample_phrase_window(
+                    if use_fim_eos:
+                        base_tokens = self._sample_aligned_window(
                             rng=rng,
-                            seq_len=max(8, seq_len - (3 if use_fim_eos else 2)),
+                            window_len=seq_len - 3,
                             id_to_token=id_to_token,
-                            phrase_sampling=phrase_sampling,
+                            exclude_terminal_eos=True,
                         )
-                        try:
-                            fim_input, fim_labels, _hole_kind, used_phrase_hole = self._build_phrase_or_fallback_fim_example(
-                                base_tokens_text=base_tokens_text,
-                                token_to_id=token_to_id,
-                                id_to_token=id_to_token,
-                                rng=rng,
-                                source_kind=fim_kind,
-                                phrase_sampling=phrase_sampling,
-                                fim_hole_token_id=fim_hole_token_id,
-                                fim_mid_token_id=fim_mid_token_id,
-                                fim_min_span=fim_min_span,
-                                fim_max_span=fim_max_span,
-                                append_eos=use_fim_eos,
-                                eos_token_id=eos_token_id,
-                            )
-                            if used_phrase_hole:
-                                sample_stats["phrase_fim_examples"] += 1
-                            else:
-                                sample_stats["phrase_fim_fallback_examples"] += 1
-                            break
-                        except ValueError:
-                            continue
                     else:
-                        if use_fim_eos:
-                            base_tokens = self._sample_aligned_window(
-                                rng=rng,
-                                window_len=seq_len - 3,
-                                id_to_token=id_to_token,
-                                exclude_terminal_eos=True,
-                            )
-                        else:
-                            base_tokens = self._sample_aligned_window(
-                                rng=rng,
-                                window_len=seq_len - 2,
-                                id_to_token=id_to_token,
-                            )
-                        try:
-                            fim_input, fim_labels = self._build_fim_example(
-                                base_tokens=base_tokens,
-                                rng=rng,
-                                id_to_token=id_to_token,
-                                fim_hole_token_id=fim_hole_token_id,
-                                fim_mid_token_id=fim_mid_token_id,
-                                fim_min_span=fim_min_span,
-                                fim_max_span=fim_max_span,
-                                append_eos=use_fim_eos,
-                                eos_token_id=eos_token_id,
-                            )
-                            break
-                        except ValueError:
-                            continue
+                        base_tokens = self._sample_aligned_window(
+                            rng=rng,
+                            window_len=seq_len - 2,
+                            id_to_token=id_to_token,
+                        )
+                    try:
+                        fim_input, fim_labels = self._build_fim_example(
+                            base_tokens=base_tokens,
+                            rng=rng,
+                            id_to_token=id_to_token,
+                            fim_hole_token_id=fim_hole_token_id,
+                            fim_mid_token_id=fim_mid_token_id,
+                            fim_min_span=fim_min_span,
+                            fim_max_span=fim_max_span,
+                            append_eos=use_fim_eos,
+                            eos_token_id=eos_token_id,
+                        )
+                        break
+                    except ValueError:
+                        continue
                 if fim_input is None or fim_labels is None:
                     raise ValueError("Unable to sample a valid FIM example after multiple retries.")
                 input_rows.append(fim_input)
                 label_rows.append(fim_labels)
                 fim_examples += 1
-                if fim_kind in {"single_phrase", "cross_boundary", "long_context"}:
-                    sample_stats[f"{fim_kind}_examples"] += 1
             else:
-                if phrase_sampling is not None and phrase_sampling.enabled:
-                    if token_to_id is None or eos_token_id is None:
-                        raise ValueError("Phrase-aware NEXT sampling requires token_to_id and eos_token_id.")
-                    window_tokens, window_kind = self._sample_phrase_window(
-                        rng=rng,
-                        seq_len=seq_len,
-                        id_to_token=id_to_token,
-                        phrase_sampling=phrase_sampling,
-                    )
-                    encoded = self._encode_tokens(window_tokens, token_to_id)
-                    input_rows.append(encoded)
-                    label_rows.append(encoded.copy())
-                    sample_stats[f"{window_kind}_examples"] += 1
-                else:
-                    window = self._sample_aligned_window(
-                        rng=rng,
-                        window_len=seq_len,
-                        id_to_token=id_to_token,
-                        anchor="random",
-                    )
-                    input_rows.append(window)
-                    label_rows.append(window.copy())
+                window = self._sample_aligned_window(
+                    rng=rng,
+                    window_len=seq_len,
+                    id_to_token=id_to_token,
+                    anchor="random",
+                )
+                input_rows.append(window)
+                label_rows.append(window.copy())
 
         if eos_token_id is not None:
             input_rows, label_rows = self._pad_rows(
@@ -921,7 +641,7 @@ class TokenBinDataset:
 
         input_ids = torch_mod.tensor(input_rows, dtype=torch_mod.long, device=device)
         labels = torch_mod.tensor(label_rows, dtype=torch_mod.long, device=device)
-        return input_ids, labels, fim_examples, sample_stats
+        return input_ids, labels, fim_examples
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -1021,67 +741,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=1.0,
         help="Fraction of FIM samples that explicitly supervise EOS after middle generation.",
-    )
-    parser.add_argument(
-        "--use-phrase-window-sampling",
-        action="store_true",
-        help="Enable phrase-aware window sampling with a single-tempo phrase view.",
-    )
-    parser.add_argument(
-        "--single-phrase-sample-ratio",
-        type=float,
-        default=0.40,
-        help="Fraction of phrase-aware windows sampled as single-phrase windows.",
-    )
-    parser.add_argument(
-        "--cross-phrase-sample-ratio",
-        type=float,
-        default=0.40,
-        help="Fraction of phrase-aware windows sampled across one phrase boundary.",
-    )
-    parser.add_argument(
-        "--long-context-sample-ratio",
-        type=float,
-        default=0.20,
-        help="Fraction of phrase-aware windows sampled as longer multi-phrase context.",
-    )
-    parser.add_argument("--phrase-min-bars", type=int, default=2, help="Minimum bars for one phrase span.")
-    parser.add_argument("--phrase-max-bars", type=int, default=8, help="Maximum bars for one phrase span.")
-    parser.add_argument(
-        "--single-phrase-bar-min",
-        type=int,
-        default=2,
-        help="Minimum bars for single-phrase sampled windows.",
-    )
-    parser.add_argument(
-        "--single-phrase-bar-max",
-        type=int,
-        default=4,
-        help="Maximum bars for single-phrase sampled windows.",
-    )
-    parser.add_argument(
-        "--cross-phrase-bar-min",
-        type=int,
-        default=4,
-        help="Minimum bars for cross-boundary sampled windows.",
-    )
-    parser.add_argument(
-        "--cross-phrase-bar-max",
-        type=int,
-        default=8,
-        help="Maximum bars for cross-boundary sampled windows.",
-    )
-    parser.add_argument(
-        "--long-context-bar-min",
-        type=int,
-        default=12,
-        help="Minimum bars for long-context sampled windows.",
-    )
-    parser.add_argument(
-        "--long-context-bar-max",
-        type=int,
-        default=24,
-        help="Maximum bars for long-context sampled windows.",
     )
     # 学习率调度
     parser.add_argument(
@@ -1287,7 +946,6 @@ def _evaluate(
     id_to_token: list[str],
     token_to_id: dict[str, int],
     eos_token_id: int,
-    phrase_sampling: PhraseSamplingConfig,
 ) -> float:
     """在验证集上采样若干 batch，返回平均 loss。"""
     if eval_batches <= 0:
@@ -1307,7 +965,6 @@ def _evaluate(
                 id_to_token=id_to_token,
                 token_to_id=token_to_id,
                 eos_token_id=eos_token_id,
-                phrase_sampling=phrase_sampling,
             )
             # 评估阶段与训练保持一致的精度策略，避免统计口径偏差。
             with _autocast_context(torch_mod, use_amp=use_amp, device_type=device.type, amp_dtype=amp_dtype):
@@ -1337,29 +994,6 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit("--fim-min-span must be > 0.")
     if args.fim_max_span <= 0:
         raise SystemExit("--fim-max-span must be > 0.")
-    for name in (
-        "single_phrase_sample_ratio",
-        "cross_phrase_sample_ratio",
-        "long_context_sample_ratio",
-    ):
-        value = float(getattr(args, name))
-        if not (0.0 <= value <= 1.0):
-            raise SystemExit(f"--{name.replace('_', '-')} must be within [0, 1].")
-    total_phrase_ratio = (
-        float(args.single_phrase_sample_ratio)
-        + float(args.cross_phrase_sample_ratio)
-        + float(args.long_context_sample_ratio)
-    )
-    if args.use_phrase_window_sampling and abs(total_phrase_ratio - 1.0) > 1e-6:
-        raise SystemExit("Phrase sampling ratios must sum to 1.0 when phrase sampling is enabled.")
-    if args.phrase_min_bars <= 0 or args.phrase_max_bars < args.phrase_min_bars:
-        raise SystemExit("--phrase-min-bars/--phrase-max-bars must define a valid positive range.")
-    if args.single_phrase_bar_min <= 0 or args.single_phrase_bar_max < args.single_phrase_bar_min:
-        raise SystemExit("single phrase bar range is invalid.")
-    if args.cross_phrase_bar_min <= 0 or args.cross_phrase_bar_max < args.cross_phrase_bar_min:
-        raise SystemExit("cross phrase bar range is invalid.")
-    if args.long_context_bar_min <= 0 or args.long_context_bar_max < args.long_context_bar_min:
-        raise SystemExit("long context bar range is invalid.")
 
     # 先设全局随机种子，再创建独立 run_rng（用于数据采样）。
     random.seed(args.seed)
@@ -1392,22 +1026,6 @@ def main(argv: list[str] | None = None) -> None:
     token_to_id = {token: idx for idx, token in enumerate(id_to_token)}
     if eos_token_id is None:
         raise SystemExit("Training window sampling requires eos_token_id in model config.")
-    phrase_sampling = PhraseSamplingConfig(
-        enabled=bool(args.use_phrase_window_sampling),
-        analysis_config=PhraseAnalysisConfig(
-            min_phrase_bars=args.phrase_min_bars,
-            max_phrase_bars=args.phrase_max_bars,
-        ),
-        single_phrase_ratio=float(args.single_phrase_sample_ratio),
-        cross_phrase_ratio=float(args.cross_phrase_sample_ratio),
-        long_context_ratio=float(args.long_context_sample_ratio),
-        single_phrase_bar_min=int(args.single_phrase_bar_min),
-        single_phrase_bar_max=int(args.single_phrase_bar_max),
-        cross_phrase_bar_min=int(args.cross_phrase_bar_min),
-        cross_phrase_bar_max=int(args.cross_phrase_bar_max),
-        long_context_bar_min=int(args.long_context_bar_min),
-        long_context_bar_max=int(args.long_context_bar_max),
-    )
 
     train_dataset = TokenBinDataset(args.train_idx, args.train_bin)
     valid_dataset = TokenBinDataset(args.valid_idx, args.valid_bin) if args.valid_idx.exists() else None
@@ -1470,14 +1088,6 @@ def main(argv: list[str] | None = None) -> None:
         f"effective_batch={effective_batch} seq_len={args.seq_len} fim_ratio={args.fim_ratio:.2f} "
         f"fim_eos_ratio={args.fim_eos_ratio:.2f}"
     )
-    if phrase_sampling.enabled:
-        print(
-            "[train_base] phrase_sampling=on "
-            f"single/cross/long={phrase_sampling.single_phrase_ratio:.2f}/"
-            f"{phrase_sampling.cross_phrase_ratio:.2f}/{phrase_sampling.long_context_ratio:.2f} "
-            f"phrase_bars={phrase_sampling.analysis_config.min_phrase_bars}-"
-            f"{phrase_sampling.analysis_config.max_phrase_bars}"
-        )
     print(
         f"[train_base] train={train_dataset.idx_path} ({train_dataset.num_sequences} seqs, "
         f"{train_dataset.num_tokens} tokens)"
@@ -1524,10 +1134,6 @@ def main(argv: list[str] | None = None) -> None:
             "fim_eos_ratio": args.fim_eos_ratio,
             "fim_min_span": args.fim_min_span,
             "fim_max_span": args.fim_max_span,
-            "use_phrase_window_sampling": phrase_sampling.enabled,
-            "single_phrase_sample_ratio": phrase_sampling.single_phrase_ratio,
-            "cross_phrase_sample_ratio": phrase_sampling.cross_phrase_ratio,
-            "long_context_sample_ratio": phrase_sampling.long_context_ratio,
             "resume_from": None if args.resume_from is None else str(args.resume_from),
         },
     )
@@ -1544,15 +1150,8 @@ def main(argv: list[str] | None = None) -> None:
 
             step_loss = 0.0
             step_fim_examples = 0
-            step_sample_stats = {
-                "single_phrase_examples": 0,
-                "cross_boundary_examples": 0,
-                "long_context_examples": 0,
-                "phrase_fim_examples": 0,
-                "phrase_fim_fallback_examples": 0,
-            }
             for _ in range(args.grad_accum_steps):
-                input_ids, labels, fim_examples, sample_stats = train_dataset.sample_mixed_batch(
+                input_ids, labels, fim_examples = train_dataset.sample_mixed_batch(
                     torch_mod=torch,
                     rng=run_rng,
                     batch_size=args.batch_size,
@@ -1567,7 +1166,6 @@ def main(argv: list[str] | None = None) -> None:
                     fim_max_span=args.fim_max_span,
                     fim_eos_ratio=args.fim_eos_ratio,
                     eos_token_id=eos_token_id,
-                    phrase_sampling=phrase_sampling,
                 )
                 with _autocast_context(
                     torch_mod=torch, use_amp=use_amp, device_type=device.type, amp_dtype=amp_dtype
@@ -1587,8 +1185,6 @@ def main(argv: list[str] | None = None) -> None:
                     scaled_loss.backward()
                 step_loss += float(raw_loss.item())
                 step_fim_examples += int(fim_examples)
-                for key, value in sample_stats.items():
-                    step_sample_stats[key] = int(step_sample_stats.get(key, 0)) + int(value)
 
             step_loss /= args.grad_accum_steps
             if train_loss_ema is None:
@@ -1635,13 +1231,7 @@ def main(argv: list[str] | None = None) -> None:
                     f"loss={step_loss:.6f} "
                     f"lr={current_lr:.6e} "
                     f"tok/s={toks_per_sec:.1f} "
-                    f"fim_in_batch={step_fim_examples}/{step_total_examples}({step_fim_ratio:.2f}) "
-                    f"phrase(single/cross/long)="
-                    f"{step_sample_stats['single_phrase_examples']}/"
-                    f"{step_sample_stats['cross_boundary_examples']}/"
-                    f"{step_sample_stats['long_context_examples']} "
-                    f"phrase_fim={step_sample_stats['phrase_fim_examples']} "
-                    f"fallback={step_sample_stats['phrase_fim_fallback_examples']}"
+                    f"fim_in_batch={step_fim_examples}/{step_total_examples}({step_fim_ratio:.2f})"
                 )
                 _append_metrics(
                     metrics_path,
@@ -1654,11 +1244,6 @@ def main(argv: list[str] | None = None) -> None:
                         "tok_per_sec": toks_per_sec,
                         "fim_examples": step_fim_examples,
                         "fim_ratio_in_batch": step_fim_ratio,
-                        "single_phrase_examples": step_sample_stats["single_phrase_examples"],
-                        "cross_boundary_examples": step_sample_stats["cross_boundary_examples"],
-                        "long_context_examples": step_sample_stats["long_context_examples"],
-                        "phrase_fim_examples": step_sample_stats["phrase_fim_examples"],
-                        "phrase_fim_fallback_examples": step_sample_stats["phrase_fim_fallback_examples"],
                         "tokens_seen": tokens_seen,
                         "train_loss_ema": train_loss_ema,
                     },
@@ -1686,7 +1271,6 @@ def main(argv: list[str] | None = None) -> None:
                     id_to_token=id_to_token,
                     token_to_id=token_to_id,
                     eos_token_id=eos_token_id,
-                    phrase_sampling=phrase_sampling,
                 )
                 print(f"[train_base] eval step={step} valid_loss={val_loss:.6f}")
                 best_valid_loss_so_far = min(best_valid_loss, val_loss)

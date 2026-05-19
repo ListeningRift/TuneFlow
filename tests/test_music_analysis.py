@@ -6,15 +6,12 @@ import unittest
 from src.music_analysis import (
     KeyAnalysisConfig,
     PhraseAnalysisConfig,
-    PhraseWindowPolicy,
+    PhraseBoundary,
     analyze_key_timeline,
     analyze_phrase_candidates,
-    extract_phrase,
-    sample_phrase_window,
 )
 from src.tokenizer.midi_codec import inject_key_tokens
-from src.training.train_base import PhraseSamplingConfig, TokenBinDataset
-from src.utils.eval_windows import sample_bar_aligned_subsequence
+from src.utils.eval_windows import sample_phrase_aligned_subsequence
 
 
 def _bar(*events: tuple[int, int, int], tempo: str | None = None) -> list[str]:
@@ -147,25 +144,56 @@ class MusicAnalysisTests(unittest.TestCase):
         self.assertTrue(any(score.bar_index in {2, 3, 5, 6} for score in analysis.boundary_scores if score.score > 0.5))
         self.assertTrue(all(2 <= (span.end_bar - span.start_bar) <= 8 for span in analysis.phrase_spans))
 
-    def test_extract_phrase_rebuilds_single_tempo_view(self) -> None:
-        tokens = _phrase_source_tokens()
-        analysis = analyze_phrase_candidates(tokens)
-        phrase = extract_phrase(tokens, analysis, 2)
-        self.assertEqual(phrase.tokens[0], "BOS")
-        self.assertEqual(phrase.tokens[-1], "EOS")
-        self.assertEqual(phrase.tempo_token, "TEMPO_132")
-        self.assertEqual(phrase.tokens[1], "TEMPO_132")
-        self.assertEqual(sum(1 for token in phrase.tokens if token.startswith("TEMPO_")), 1)
+    def test_bar_info_exposes_onset_positions(self) -> None:
+        analysis = analyze_phrase_candidates(_phrase_source_tokens())
+        self.assertEqual(analysis.bars[0].onset_positions, (0, 8))
+        self.assertEqual(analysis.bars[3].onset_positions, (0, 16))
 
-    def test_extract_phrase_keeps_only_window_start_key_token(self) -> None:
-        tokens = inject_key_tokens(_c_to_g_major_tokens())
-        analysis = analyze_phrase_candidates(tokens)
-        phrase = extract_phrase(tokens, analysis, 1)
-        self.assertEqual(phrase.key_token, "KEY_G_MAJ")
-        self.assertEqual(phrase.tokens[0], "BOS")
-        self.assertEqual(phrase.tokens[1], "TEMPO_120")
-        self.assertEqual(phrase.tokens[2], "KEY_G_MAJ")
-        self.assertEqual(sum(1 for token in phrase.tokens if token.startswith("KEY_")), 1)
+    def test_analyze_phrase_candidates_returns_boundaries(self) -> None:
+        analysis = analyze_phrase_candidates(_phrase_source_tokens())
+        self.assertTrue(analysis.boundaries)
+        first_content_bar = next(i for i, bar in enumerate(analysis.bars) if bar.note_count > 0)
+        self.assertEqual(analysis.boundaries[0], PhraseBoundary(first_content_bar, 0))
+
+    def test_phrase_spans_align_with_boundaries(self) -> None:
+        analysis = analyze_phrase_candidates(_phrase_source_tokens())
+        expected_starts = tuple(b.bar_index for b in analysis.boundaries)
+        actual_starts = tuple(span.start_bar for span in analysis.phrase_spans)
+        self.assertEqual(actual_starts, expected_starts)
+
+    def test_mid_bar_anchor_picks_first_onset_when_rest_threshold_met(self) -> None:
+        from src.music_analysis.phrase_analysis import _pick_in_bar_anchor, BarInfo
+        cfg = PhraseAnalysisConfig()
+        right = BarInfo(
+            start_token=0, end_token=0, note_count=2, onset_count=2,
+            rest_ratio=0.5, pitch_span=0, mean_duration=4.0,
+            effective_tempo_token=None, effective_key_token=None,
+            onset_positions=(16, 24),
+        )
+        left = BarInfo(
+            start_token=0, end_token=0, note_count=4, onset_count=4,
+            rest_ratio=0.0, pitch_span=0, mean_duration=4.0,
+            effective_tempo_token=None, effective_key_token=None,
+            onset_positions=(0, 8, 16, 24),
+        )
+        self.assertEqual(_pick_in_bar_anchor(left, right, cfg), 16)
+
+    def test_mid_bar_anchor_returns_zero_when_no_lead_rest(self) -> None:
+        from src.music_analysis.phrase_analysis import _pick_in_bar_anchor, BarInfo
+        cfg = PhraseAnalysisConfig()
+        right = BarInfo(
+            start_token=0, end_token=0, note_count=2, onset_count=2,
+            rest_ratio=0.0, pitch_span=0, mean_duration=4.0,
+            effective_tempo_token=None, effective_key_token=None,
+            onset_positions=(0, 8),
+        )
+        left = BarInfo(
+            start_token=0, end_token=0, note_count=4, onset_count=4,
+            rest_ratio=0.0, pitch_span=0, mean_duration=4.0,
+            effective_tempo_token=None, effective_key_token=None,
+            onset_positions=(0, 8, 16, 24),
+        )
+        self.assertEqual(_pick_in_bar_anchor(left, right, cfg), 0)
 
     def test_analyze_phrase_candidates_accepts_missing_terminal_eos(self) -> None:
         tokens = _phrase_source_tokens()[:-1]
@@ -173,37 +201,10 @@ class MusicAnalysisTests(unittest.TestCase):
         self.assertEqual(len(analysis.bars), 8)
         self.assertTrue(analysis.phrase_spans)
 
-    def test_sample_phrase_window_supports_cross_boundary_and_long_context(self) -> None:
-        tokens = _long_phrase_source_tokens()
-        analysis = analyze_phrase_candidates(tokens)
-        rng = random.Random(42)
-
-        cross_window = sample_phrase_window(
-            tokens,
-            analysis,
-            PhraseWindowPolicy(kind="cross_boundary", min_bars=4, max_bars=8, max_tokens=128),
-            rng,
-        )
-        self.assertIsNotNone(cross_window)
-        assert cross_window is not None
-        self.assertEqual(cross_window.source_kind, "cross_boundary")
-        self.assertGreaterEqual(cross_window.boundary_count, 1)
-
-        long_window = sample_phrase_window(
-            tokens,
-            analysis,
-            PhraseWindowPolicy(kind="long_context", min_bars=6, max_bars=12, max_tokens=256),
-            rng,
-        )
-        self.assertIsNotNone(long_window)
-        assert long_window is not None
-        self.assertEqual(long_window.source_kind, "long_context")
-        self.assertGreaterEqual(long_window.boundary_count, 1)
-
     def test_eval_window_keeps_only_window_start_tempo(self) -> None:
         tokens = _phrase_source_tokens()
         rng = random.Random(7)
-        window = sample_bar_aligned_subsequence(tokens, max_core_tokens=48, min_core_tokens=12, rng=rng)
+        window = sample_phrase_aligned_subsequence(tokens, max_core_tokens=48, min_core_tokens=12, rng=rng)
         self.assertIsNotNone(window)
         assert window is not None
         self.assertEqual(window[0], "BOS")
@@ -213,99 +214,55 @@ class MusicAnalysisTests(unittest.TestCase):
     def test_eval_window_keeps_only_window_start_key(self) -> None:
         tokens = inject_key_tokens(_c_to_g_major_tokens())
         rng = random.Random(7)
-        window = sample_bar_aligned_subsequence(tokens, max_core_tokens=80, min_core_tokens=24, rng=rng)
+        window = sample_phrase_aligned_subsequence(tokens, max_core_tokens=80, min_core_tokens=24, rng=rng)
         self.assertIsNotNone(window)
         assert window is not None
         self.assertEqual(window[0], "BOS")
         self.assertEqual(window[-1], "EOS")
         self.assertLessEqual(sum(1 for token in window if token.startswith("KEY_")), 1)
 
+    def test_eval_window_starts_on_bar_after_header(self) -> None:
+        from src.tokenizer import TokenizerConfig, build_vocab
+        from src.tokenizer.midi_codec import inject_phrase_tokens, validate_token_order
+        raw = _phrase_source_tokens()
+        tokens = inject_phrase_tokens(inject_key_tokens(raw))
+        vocab = build_vocab(TokenizerConfig())
+        rng = random.Random(0)
+        for _ in range(8):
+            window = sample_phrase_aligned_subsequence(
+                tokens, max_core_tokens=120, min_core_tokens=12, rng=rng,
+            )
+            if window is None:
+                continue
+            self.assertEqual(window[0], "BOS")
+            self.assertEqual(window[-1], "EOS")
+            # First non-header body token must be BAR (validate_token_order requirement)
+            idx = 1
+            while idx < len(window) and (
+                window[idx].startswith("TEMPO_") or window[idx].startswith("KEY_")
+            ):
+                idx += 1
+            self.assertEqual(window[idx], "BAR", msg=f"window: {window}")
+            # The window itself must be a valid full sequence
+            valid, oov = validate_token_order(window, vocab)
+            self.assertTrue(valid, msg=f"window failed validate: {window}")
+            self.assertEqual(oov, 0)
 
-    def test_phrase_fim_builder_falls_back_to_generic_structure(self) -> None:
-        base_tokens_text = ["BOS", "TEMPO_120", "KEY_UNCERTAIN", "BAR", "POS_0", "INST_PIANO", "PITCH_60", "DUR_1", "VEL_8", "BAR", "EOS"]
-        vocab_tokens = [
-            "BOS",
-            "EOS",
-            "FIM_HOLE",
-            "FIM_MID",
-            "BAR",
-            "POS_0",
-            "INST_PIANO",
-            "PITCH_60",
-            "DUR_1",
-            "VEL_8",
-            "TEMPO_120",
-            "KEY_UNCERTAIN",
-        ]
-        token_to_id = {token: idx for idx, token in enumerate(vocab_tokens)}
-        id_to_token = list(vocab_tokens)
-        fim_input, fim_labels, _source_kind, used_phrase_hole = TokenBinDataset._build_phrase_or_fallback_fim_example(
-            base_tokens_text=base_tokens_text,
-            token_to_id=token_to_id,
-            id_to_token=id_to_token,
-            rng=random.Random(123),
-            source_kind="single_phrase",
-            phrase_sampling=PhraseSamplingConfig(enabled=True),
-            fim_hole_token_id=token_to_id["FIM_HOLE"],
-            fim_mid_token_id=token_to_id["FIM_MID"],
-            fim_min_span=4,
-            fim_max_span=16,
-            append_eos=False,
-            eos_token_id=token_to_id["EOS"],
-        )
-        self.assertFalse(used_phrase_hole)
-        self.assertIn(token_to_id["FIM_HOLE"], fim_input)
-        self.assertIn(token_to_id["FIM_MID"], fim_input)
-        self.assertIn(-100, fim_labels)
+    def test_eval_window_keeps_inline_phrases(self) -> None:
+        from src.tokenizer.midi_codec import inject_phrase_tokens
+        raw = _long_phrase_source_tokens()
+        tokens = inject_phrase_tokens(inject_key_tokens(raw))
+        # confirm source contains PHRASE
+        self.assertIn("PHRASE", tokens)
+        survived = 0
+        for seed in range(16):
+            window = sample_phrase_aligned_subsequence(
+                tokens, max_core_tokens=240, min_core_tokens=24, rng=random.Random(seed),
+            )
+            if window is not None and "PHRASE" in window:
+                survived += 1
+        self.assertGreater(survived, 0, msg="No window preserved an inline PHRASE")
 
-    def test_phrase_fim_builder_uses_phrase_hole_on_rich_window(self) -> None:
-        base_tokens_text = _long_phrase_source_tokens()
-        vocab_tokens = ["FIM_HOLE", "FIM_MID", *dict.fromkeys(base_tokens_text)]
-        token_to_id = {token: idx for idx, token in enumerate(vocab_tokens)}
-        id_to_token = list(vocab_tokens)
-        fim_input, fim_labels, _source_kind, used_phrase_hole = TokenBinDataset._build_phrase_or_fallback_fim_example(
-            base_tokens_text=base_tokens_text,
-            token_to_id=token_to_id,
-            id_to_token=id_to_token,
-            rng=random.Random(42),
-            source_kind="cross_boundary",
-            phrase_sampling=PhraseSamplingConfig(enabled=True),
-            fim_hole_token_id=token_to_id["FIM_HOLE"],
-            fim_mid_token_id=token_to_id["FIM_MID"],
-            fim_min_span=16,
-            fim_max_span=128,
-            append_eos=False,
-            eos_token_id=token_to_id["EOS"],
-        )
-        self.assertTrue(used_phrase_hole)
-        self.assertIn(token_to_id["FIM_HOLE"], fim_input)
-        self.assertIn(token_to_id["FIM_MID"], fim_input)
-        self.assertIn(-100, fim_labels)
-
-    def test_phrase_fim_builder_keeps_phrase_hole_when_reappending_eos(self) -> None:
-        base_tokens_text = _long_phrase_source_tokens()
-        vocab_tokens = ["FIM_HOLE", "FIM_MID", *dict.fromkeys(base_tokens_text)]
-        token_to_id = {token: idx for idx, token in enumerate(vocab_tokens)}
-        id_to_token = list(vocab_tokens)
-        fim_input, fim_labels, _source_kind, used_phrase_hole = TokenBinDataset._build_phrase_or_fallback_fim_example(
-            base_tokens_text=base_tokens_text,
-            token_to_id=token_to_id,
-            id_to_token=id_to_token,
-            rng=random.Random(7),
-            source_kind="cross_boundary",
-            phrase_sampling=PhraseSamplingConfig(enabled=True),
-            fim_hole_token_id=token_to_id["FIM_HOLE"],
-            fim_mid_token_id=token_to_id["FIM_MID"],
-            fim_min_span=16,
-            fim_max_span=128,
-            append_eos=True,
-            eos_token_id=token_to_id["EOS"],
-        )
-        self.assertTrue(used_phrase_hole)
-        self.assertEqual(fim_input[-1], token_to_id["EOS"])
-        self.assertIn(token_to_id["FIM_HOLE"], fim_input)
-        self.assertIn(token_to_id["FIM_MID"], fim_input)
-        self.assertIn(-100, fim_labels)
 
     def test_key_timeline_detects_single_major_key(self) -> None:
         analysis = analyze_key_timeline(_c_major_tokens())

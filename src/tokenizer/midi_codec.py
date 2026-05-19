@@ -24,6 +24,7 @@ from .common import (
 )
 from .velocity import VelocityConfig, bin_to_velocity, velocity_to_bin
 from ..music_analysis.key_analysis import analyze_key_timeline
+from ..music_analysis import analyze_phrase_candidates
 
 _DEFAULT_TICKS_PER_BEAT = 480
 _DEFAULT_BPM = 120.0
@@ -251,6 +252,65 @@ def inject_key_tokens(tokens: Sequence[str]) -> List[str]:
     return injected
 
 
+def inject_phrase_tokens(tokens: Sequence[str]) -> List[str]:
+    """Inject `PHRASE` structural tokens based on phrase analysis boundaries.
+
+    Input must already have KEY tokens injected. PHRASE 在 bar-aligned 位置插在
+    `BAR [TEMPO] [KEY]` 头部之后、首个 POS 之前；mid-bar anchor 插在指定 POS 之前。
+    """
+    base_tokens = [str(token) for token in tokens]
+    if not base_tokens or base_tokens[0] != "BOS":
+        return base_tokens
+
+    analysis = analyze_phrase_candidates(base_tokens)
+    if not analysis.boundaries:
+        return base_tokens
+
+    out = list(base_tokens)
+    for boundary in sorted(analysis.boundaries, key=lambda b: (b.bar_index, b.anchor_pos), reverse=True):
+        if boundary.bar_index >= len(analysis.bars):
+            continue
+        bar = analysis.bars[boundary.bar_index]
+        if bar.note_count == 0:
+            continue
+        bar_start = bar.start_token
+        header_end = bar_start + 1
+        while header_end < len(out) and (
+            out[header_end].startswith("TEMPO_") or out[header_end].startswith("KEY_")
+        ):
+            header_end += 1
+
+        if boundary.anchor_pos == 0:
+            insert_at = header_end
+        else:
+            target = f"POS_{boundary.anchor_pos}"
+            scan = header_end
+            found = -1
+            first_pos = -1
+            while scan < len(out) and out[scan] != "BAR":
+                if out[scan].startswith("POS_"):
+                    if first_pos < 0:
+                        first_pos = scan
+                    if out[scan] == target:
+                        found = scan
+                        break
+                scan += 1
+            if found >= 0:
+                insert_at = found
+            elif first_pos >= 0:
+                insert_at = first_pos
+            else:
+                continue
+        out.insert(insert_at, "PHRASE")
+
+    deduped: List[str] = []
+    for token in out:
+        if deduped and deduped[-1] == "PHRASE" and token == "PHRASE":
+            continue
+        deduped.append(token)
+    return deduped
+
+
 def build_vocab(config: TokenizerConfig) -> Dict[str, int]:
     """构建词表映射 token -> id。"""
     vocab: List[str] = []
@@ -258,6 +318,7 @@ def build_vocab(config: TokenizerConfig) -> Dict[str, int]:
     if config.include_task_tokens:
         vocab.extend(config.task_tokens)
     vocab.append("BAR")
+    vocab.append("PHRASE")
     vocab.extend([f"POS_{i}" for i in range(config.positions_per_bar)])
     vocab.extend([f"INST_{x}" for x in config.inst_classes])
     vocab.extend([f"PITCH_{p}" for p in range(config.pitch_min, config.pitch_max + 1)])
@@ -313,7 +374,7 @@ def _tokenize_note_events(
 ) -> List[str]:
     """将音符事件与节奏信息编码成 token 序列。"""
     if not notes:
-        return inject_key_tokens(["BOS", "EOS"])
+        return inject_phrase_tokens(inject_key_tokens(["BOS", "EOS"]))
 
     pos_ticks = bar_ticks / config.positions_per_bar
     velocity_config = config.velocity_config()
@@ -360,7 +421,7 @@ def _tokenize_note_events(
             tokens.append(f"VEL_{vel_bin}")
 
     tokens.append("EOS")
-    return inject_key_tokens(tokens)
+    return inject_phrase_tokens(inject_key_tokens(tokens))
 
 
 def tokenize_midi(mido_file: mido.MidiFile, config: TokenizerConfig) -> List[str]:
@@ -379,22 +440,31 @@ def validate_token_order(tokens: Sequence[str], vocab: Mapping[str, int]) -> Tup
     if tokens[-1] != "EOS":
         return False, oov
 
+    last_index = len(tokens) - 1
     idx = 1
-    if idx < len(tokens) - 1 and tokens[idx].startswith("TEMPO_"):
+    if idx < last_index and tokens[idx].startswith("TEMPO_"):
         idx += 1
-    if idx < len(tokens) - 1 and is_key_token(tokens[idx]):
+    if idx < last_index and is_key_token(tokens[idx]):
         idx += 1
 
-    while idx < len(tokens) - 1:
+    while idx < last_index:
         if tokens[idx] != "BAR":
             return False, oov
         idx += 1
-        if idx < len(tokens) - 1 and tokens[idx].startswith("TEMPO_"):
+        if idx < last_index and tokens[idx].startswith("TEMPO_"):
             idx += 1
-        if idx < len(tokens) - 1 and is_key_token(tokens[idx]):
+        if idx < last_index and is_key_token(tokens[idx]):
             idx += 1
-        while idx < len(tokens) - 1 and tokens[idx].startswith("POS_"):
-            if idx + 4 >= len(tokens):
+        # Optional bar-head PHRASE: must be followed by a complete event tuple
+        if idx < last_index and tokens[idx] == "PHRASE":
+            # 需要至少 5 个 event token (POS/INST/PITCH/DUR/VEL) 后跟终结
+            if idx + 5 >= last_index:
+                return False, oov
+            if not tokens[idx + 1].startswith("POS_"):
+                return False, oov
+            idx += 1
+        while idx < last_index and tokens[idx].startswith("POS_"):
+            if idx + 4 >= last_index:
                 return False, oov
             if not tokens[idx + 1].startswith("INST_"):
                 return False, oov
@@ -405,7 +475,14 @@ def validate_token_order(tokens: Sequence[str], vocab: Mapping[str, int]) -> Tup
             if not tokens[idx + 4].startswith("VEL_"):
                 return False, oov
             idx += 5
-        if idx < len(tokens) - 1 and tokens[idx] != "BAR":
+            if idx < last_index and tokens[idx] == "PHRASE":
+                # mid-bar PHRASE 后需要至少 5 个 event token 后跟终结
+                if idx + 5 >= last_index:
+                    return False, oov
+                if not tokens[idx + 1].startswith("POS_"):
+                    return False, oov
+                idx += 1
+        if idx < last_index and tokens[idx] != "BAR":
             return False, oov
 
     return True, oov
@@ -539,8 +616,15 @@ def tokens_to_midi(
             idx += 1
         if idx < len(normalized) - 1 and is_key_token(normalized[idx]):
             idx += 1
+        if idx < len(normalized) - 1 and normalized[idx] == "PHRASE":
+            idx += 1
 
-        while idx < len(normalized) - 1 and normalized[idx].startswith("POS_"):
+        while idx < len(normalized) - 1 and (
+            normalized[idx].startswith("POS_") or normalized[idx] == "PHRASE"
+        ):
+            if normalized[idx] == "PHRASE":
+                idx += 1
+                continue
             if idx + 4 >= len(normalized):
                 raise ValueError("incomplete note event at end of token sequence")
             pos = _parse_token_int(normalized[idx], "POS_")

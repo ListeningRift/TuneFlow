@@ -13,12 +13,9 @@ from .phrase_analysis import (
     BoundaryScore,
     PhraseAnalysis,
     PhraseAnalysisConfig,
+    PhraseBoundary,
     PhraseSpan,
-    PhraseWindowPolicy,
-    SampledWindow,
     analyze_phrase_candidates,
-    extract_phrase,
-    sample_phrase_window,
 )
 
 __all__ = [
@@ -31,11 +28,8 @@ __all__ = [
     "ModulationPoint",
     "PhraseAnalysis",
     "PhraseAnalysisConfig",
+    "PhraseBoundary",
     "PhraseSpan",
-    "PhraseWindowPolicy",
-    "SampledWindow",
     "analyze_key_timeline",
     "analyze_phrase_candidates",
-    "extract_phrase",
-    "sample_phrase_window",
 ]

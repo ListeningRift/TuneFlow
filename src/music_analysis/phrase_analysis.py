@@ -1,10 +1,8 @@
-"""TuneFlow token 序列的乐句分析与采样工具。"""
+"""TuneFlow token 序列的乐句分析工具。"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-import math
-import random
 from typing import Sequence
 
 
@@ -17,11 +15,20 @@ class PhraseAnalysisConfig:
     max_phrase_bars: int = 8
     preferred_phrase_bars: int = 4
     min_boundary_gap_bars: int = 2
+    mid_bar_min_rest_pos: int = 8
     rest_weight: float = 0.40
     note_density_weight: float = 0.24
     onset_density_weight: float = 0.18
     pitch_span_weight: float = 0.12
     duration_weight: float = 0.06
+
+
+@dataclass(frozen=True)
+class PhraseBoundary:
+    """PHRASE 落点。anchor_pos==0 表示 bar-aligned；>0 表示 mid-bar POS 槽前。"""
+
+    bar_index: int
+    anchor_pos: int
 
 
 @dataclass(frozen=True)
@@ -37,6 +44,7 @@ class BarInfo:
     mean_duration: float
     effective_tempo_token: str | None
     effective_key_token: str | None
+    onset_positions: tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -68,30 +76,8 @@ class PhraseAnalysis:
 
     bars: tuple[BarInfo, ...]
     boundary_scores: tuple[BoundaryScore, ...]
+    boundaries: tuple[PhraseBoundary, ...]
     phrase_spans: tuple[PhraseSpan, ...]
-
-
-@dataclass(frozen=True)
-class PhraseWindowPolicy:
-    """面向乐句窗口的采样策略。"""
-
-    kind: str
-    min_bars: int
-    max_bars: int
-    max_tokens: int
-
-
-@dataclass(frozen=True)
-class SampledWindow:
-    """可直接用于训练或评测的标准化采样窗口。"""
-
-    tokens: tuple[str, ...]
-    source_kind: str
-    start_bar: int
-    end_bar: int
-    tempo_token: str | None
-    key_token: str | None
-    boundary_count: int
 
 
 def _safe_ratio(delta: float, left: float, right: float) -> float:
@@ -206,6 +192,7 @@ def _build_bar_info(tokens: Sequence[str], config: PhraseAnalysisConfig) -> tupl
                 mean_duration=mean_duration,
                 effective_tempo_token=effective_tempo,
                 effective_key_token=effective_key,
+                onset_positions=tuple(sorted(onset_positions)),
             )
         )
     return tuple(bars)
@@ -275,148 +262,116 @@ def _pick_candidate_boundaries(
     return filtered
 
 
-def _find_best_split(
-    start_bar: int,
-    end_bar: int,
-    candidate_boundaries: Sequence[int],
+def _pick_in_bar_anchor(
+    left_bar: BarInfo,
+    right_bar: BarInfo,
     config: PhraseAnalysisConfig,
 ) -> int:
-    ideal = start_bar + config.preferred_phrase_bars
-    valid_candidates = [
-        boundary
-        for boundary in candidate_boundaries
-        if start_bar + config.min_phrase_bars <= boundary <= end_bar - config.min_phrase_bars
-    ]
-    if valid_candidates:
-        return min(valid_candidates, key=lambda boundary: (abs(boundary - ideal), abs(boundary - start_bar)))
-    fallback = min(end_bar - config.min_phrase_bars, max(start_bar + config.min_phrase_bars, ideal))
-    return fallback
+    """v1：只在右 bar 起首有 >=1 拍留白时把 PHRASE 推迟到首个 onset。"""
+    del left_bar
+    if not right_bar.onset_positions:
+        return 0
+    first_onset = right_bar.onset_positions[0]
+    if first_onset >= config.mid_bar_min_rest_pos:
+        return first_onset
+    return 0
 
 
-def _merge_short_spans(
-    spans: list[tuple[int, int]],
-    config: PhraseAnalysisConfig,
-) -> list[tuple[int, int]]:
-    merged: list[tuple[int, int]] = []
-    idx = 0
-    while idx < len(spans):
-        start_bar, end_bar = spans[idx]
-        length = end_bar - start_bar
-        if length >= config.min_phrase_bars or len(spans) == 1:
-            merged.append((start_bar, end_bar))
-            idx += 1
-            continue
-        if merged:
-            prev_start, _prev_end = merged[-1]
-            merged[-1] = (prev_start, end_bar)
-            idx += 1
-            continue
-        if idx + 1 < len(spans):
-            _next_start, next_end = spans[idx + 1]
-            merged.append((start_bar, next_end))
-            idx += 2
-            continue
-        merged.append((start_bar, end_bar))
-        idx += 1
-    return merged
-
-
-def _build_phrase_spans(
-    tokens: Sequence[str],
+def _assemble_final_boundaries(
     bars: Sequence[BarInfo],
-    boundary_scores: Sequence[BoundaryScore],
+    candidate_boundary_bars: Sequence[int],
     config: PhraseAnalysisConfig,
-) -> tuple[PhraseSpan, ...]:
+) -> tuple[PhraseBoundary, ...]:
     if not bars:
         return tuple()
 
-    candidate_boundaries = _pick_candidate_boundaries(boundary_scores, config)
-    boundaries = [0, *candidate_boundaries, len(bars)]
-    raw_spans: list[tuple[int, int]] = []
-    for idx in range(len(boundaries) - 1):
-        start_bar = boundaries[idx]
-        end_bar = boundaries[idx + 1]
-        if end_bar > start_bar:
-            raw_spans.append((start_bar, end_bar))
+    first_content_bar = next((i for i, bar in enumerate(bars) if bar.note_count > 0), None)
+    if first_content_bar is None:
+        return tuple()
 
-    merged_spans = _merge_short_spans(raw_spans, config)
-    normalized_spans: list[tuple[int, int]] = []
-    for start_bar, end_bar in merged_spans:
-        cursor = start_bar
-        while end_bar - cursor > config.max_phrase_bars:
-            split_bar = _find_best_split(cursor, end_bar, candidate_boundaries, config)
-            normalized_spans.append((cursor, split_bar))
-            cursor = split_bar
-        normalized_spans.append((cursor, end_bar))
+    boundary_set: dict[tuple[int, int], PhraseBoundary] = {}
+    forced = PhraseBoundary(bar_index=first_content_bar, anchor_pos=0)
+    boundary_set[(forced.bar_index, forced.anchor_pos)] = forced
 
-    phrase_spans: list[PhraseSpan] = []
-    for start_bar, end_bar in normalized_spans:
-        phrase_spans.append(
-            _build_phrase_span(
-                tokens=tokens,
-                bars=bars,
+    for bar_index in candidate_boundary_bars:
+        if bar_index <= first_content_bar or bar_index >= len(bars):
+            continue
+        if bars[bar_index].note_count == 0:
+            continue
+        anchor_pos = _pick_in_bar_anchor(bars[bar_index - 1], bars[bar_index], config)
+        key = (bar_index, anchor_pos)
+        if key not in boundary_set:
+            boundary_set[key] = PhraseBoundary(bar_index=bar_index, anchor_pos=anchor_pos)
+
+    ordered = sorted(boundary_set.values(), key=lambda b: (b.bar_index, b.anchor_pos))
+
+    expanded: list[PhraseBoundary] = []
+    for idx, current in enumerate(ordered):
+        expanded.append(current)
+        next_bar = ordered[idx + 1].bar_index if idx + 1 < len(ordered) else len(bars)
+        cursor = current.bar_index
+        gap = next_bar - cursor
+        while gap > config.max_phrase_bars:
+            synth_bar = cursor + config.preferred_phrase_bars
+            if synth_bar >= next_bar:
+                break
+            while synth_bar < next_bar and bars[synth_bar].note_count == 0:
+                synth_bar += 1
+            if synth_bar >= next_bar:
+                break
+            expanded.append(PhraseBoundary(bar_index=synth_bar, anchor_pos=0))
+            cursor = synth_bar
+            gap = next_bar - cursor
+
+    merged: list[PhraseBoundary] = []
+    for boundary in expanded:
+        if not merged:
+            merged.append(boundary)
+            continue
+        prev = merged[-1]
+        if (
+            boundary.bar_index - prev.bar_index < config.min_phrase_bars
+            and boundary.bar_index != first_content_bar
+        ):
+            continue
+        merged.append(boundary)
+
+    # Invariant: at most one boundary per bar after merging.
+    bar_indices = [b.bar_index for b in merged]
+    assert len(bar_indices) == len(set(bar_indices)), (
+        f"_assemble_final_boundaries produced multiple boundaries in the same bar: {merged}"
+    )
+    return tuple(merged)
+
+
+def _derive_phrase_spans(
+    bars: Sequence[BarInfo],
+    boundaries: Sequence[PhraseBoundary],
+) -> tuple[PhraseSpan, ...]:
+    if not bars or not boundaries:
+        return tuple()
+    sorted_boundaries = sorted(boundaries, key=lambda b: (b.bar_index, b.anchor_pos))
+    spans: list[PhraseSpan] = []
+    for idx, current in enumerate(sorted_boundaries):
+        start_bar = current.bar_index
+        end_bar = sorted_boundaries[idx + 1].bar_index if idx + 1 < len(sorted_boundaries) else len(bars)
+        if end_bar <= start_bar:
+            continue
+        start_token = bars[start_bar].start_token
+        end_token = bars[end_bar - 1].end_token
+        spans.append(
+            PhraseSpan(
                 start_bar=start_bar,
                 end_bar=end_bar,
+                start_token=start_token,
+                end_token=end_token,
+                tempo_token=bars[start_bar].effective_tempo_token,
+                key_token=bars[start_bar].effective_key_token,
+                tokens=tuple(),
                 source_kind="single_phrase",
             )
         )
-    return tuple(phrase_spans)
-
-
-def _normalized_bar_tokens(tokens: Sequence[str], bar: BarInfo) -> list[str]:
-    raw_tokens = [str(token) for token in tokens[bar.start_token : bar.end_token]]
-    if raw_tokens and raw_tokens[0] == "BAR":
-        idx = 1
-        if idx < len(raw_tokens) and raw_tokens[idx].startswith("TEMPO_"):
-            idx += 1
-        if idx < len(raw_tokens) and raw_tokens[idx].startswith("KEY_"):
-            idx += 1
-        return ["BAR", *raw_tokens[idx:]]
-    return raw_tokens
-
-
-def _build_phrase_view_tokens(
-    tokens: Sequence[str],
-    bars: Sequence[BarInfo],
-    start_bar: int,
-    end_bar: int,
-) -> tuple[str, ...]:
-    if not (0 <= start_bar < end_bar <= len(bars)):
-        raise IndexError("invalid bar span")
-    phrase_tokens: list[str] = ["BOS"]
-    tempo_token = bars[start_bar].effective_tempo_token
-    key_token = bars[start_bar].effective_key_token
-    if tempo_token is not None:
-        phrase_tokens.append(tempo_token)
-    if key_token is not None:
-        phrase_tokens.append(key_token)
-    for bar_index in range(start_bar, end_bar):
-        phrase_tokens.extend(_normalized_bar_tokens(tokens, bars[bar_index]))
-    phrase_tokens.append("EOS")
-    return tuple(phrase_tokens)
-
-
-def _build_phrase_span(
-    tokens: Sequence[str],
-    bars: Sequence[BarInfo],
-    start_bar: int,
-    end_bar: int,
-    source_kind: str,
-) -> PhraseSpan:
-    start_token = bars[start_bar].start_token
-    end_token = bars[end_bar - 1].end_token
-    tempo_token = bars[start_bar].effective_tempo_token
-    key_token = bars[start_bar].effective_key_token
-    return PhraseSpan(
-        start_bar=start_bar,
-        end_bar=end_bar,
-        start_token=start_token,
-        end_token=end_token,
-        tempo_token=tempo_token,
-        key_token=key_token,
-        tokens=_build_phrase_view_tokens(tokens, bars, start_bar, end_bar),
-        source_kind=source_kind,
-    )
+    return tuple(spans)
 
 
 def analyze_phrase_candidates(
@@ -427,189 +382,12 @@ def analyze_phrase_candidates(
     config = PhraseAnalysisConfig() if config is None else config
     bars = _build_bar_info(tokens, config)
     boundary_scores = _build_boundary_scores(bars, config)
-    phrase_spans = _build_phrase_spans(tokens, bars, boundary_scores, config)
+    candidate_boundary_bars = _pick_candidate_boundaries(boundary_scores, config)
+    boundaries = _assemble_final_boundaries(bars, candidate_boundary_bars, config)
+    phrase_spans = _derive_phrase_spans(bars, boundaries)
     return PhraseAnalysis(
         bars=bars,
         boundary_scores=boundary_scores,
+        boundaries=boundaries,
         phrase_spans=phrase_spans,
     )
-
-
-def extract_phrase(
-    tokens: Sequence[str],
-    analysis: PhraseAnalysis,
-    phrase_index: int,
-    tempo_mode: str = "phrase_start",
-) -> PhraseSpan:
-    """提取一个已经分析出的乐句区间。"""
-    if tempo_mode != "phrase_start":
-        raise ValueError(f"Unsupported tempo_mode: {tempo_mode!r}")
-    if phrase_index < 0 or phrase_index >= len(analysis.phrase_spans):
-        raise IndexError(f"phrase_index out of range: {phrase_index}")
-    span = analysis.phrase_spans[phrase_index]
-    rebuilt_tokens = _build_phrase_view_tokens(tokens, analysis.bars, span.start_bar, span.end_bar)
-    return PhraseSpan(
-        start_bar=span.start_bar,
-        end_bar=span.end_bar,
-        start_token=span.start_token,
-        end_token=span.end_token,
-        tempo_token=span.tempo_token,
-        key_token=span.key_token,
-        tokens=rebuilt_tokens,
-        source_kind=span.source_kind,
-    )
-
-
-def _phrase_boundaries_from_spans(analysis: PhraseAnalysis) -> set[int]:
-    return {span.start_bar for span in analysis.phrase_spans[1:]}
-
-
-def _count_phrase_boundaries(analysis: PhraseAnalysis, start_bar: int, end_bar: int) -> int:
-    boundaries = _phrase_boundaries_from_spans(analysis)
-    return sum(1 for boundary in boundaries if start_bar < boundary < end_bar)
-
-
-def _choose_single_phrase_window(
-    tokens: Sequence[str],
-    analysis: PhraseAnalysis,
-    policy: PhraseWindowPolicy,
-    rng: random.Random,
-) -> SampledWindow | None:
-    candidates: list[SampledWindow] = []
-    for span in analysis.phrase_spans:
-        span_len = span.end_bar - span.start_bar
-        if policy.min_bars <= span_len <= policy.max_bars and len(span.tokens) <= policy.max_tokens:
-            candidates.append(
-                SampledWindow(
-                    tokens=span.tokens,
-                    source_kind="single_phrase",
-                    start_bar=span.start_bar,
-                    end_bar=span.end_bar,
-                    tempo_token=span.tempo_token,
-                    key_token=span.key_token,
-                    boundary_count=0,
-                )
-            )
-            continue
-        if span_len <= policy.max_bars:
-            continue
-        for sub_len in range(policy.min_bars, policy.max_bars + 1):
-            if sub_len > span_len:
-                break
-            max_start = span.end_bar - sub_len
-            for start_bar in range(span.start_bar, max_start + 1):
-                end_bar = start_bar + sub_len
-                sampled_tokens = _build_phrase_view_tokens(tokens, analysis.bars, start_bar, end_bar)
-                if len(sampled_tokens) > policy.max_tokens:
-                    continue
-                candidates.append(
-                    SampledWindow(
-                        tokens=sampled_tokens,
-                        source_kind="single_phrase",
-                        start_bar=start_bar,
-                        end_bar=end_bar,
-                        tempo_token=analysis.bars[start_bar].effective_tempo_token,
-                        key_token=analysis.bars[start_bar].effective_key_token,
-                        boundary_count=0,
-                    )
-                )
-    if not candidates:
-        return None
-    return candidates[rng.randrange(len(candidates))]
-
-
-def _choose_cross_boundary_window(
-    tokens: Sequence[str],
-    analysis: PhraseAnalysis,
-    policy: PhraseWindowPolicy,
-    rng: random.Random,
-) -> SampledWindow | None:
-    if len(analysis.phrase_spans) < 2:
-        return None
-
-    candidates: list[SampledWindow] = []
-    for left, right in zip(analysis.phrase_spans[:-1], analysis.phrase_spans[1:], strict=True):
-        boundary_bar = right.start_bar
-        left_available = boundary_bar - left.start_bar
-        right_available = right.end_bar - boundary_bar
-        for total_bars in range(policy.min_bars, policy.max_bars + 1):
-            for left_take in range(1, total_bars):
-                right_take = total_bars - left_take
-                if left_take > left_available or right_take > right_available:
-                    continue
-                start_bar = boundary_bar - left_take
-                end_bar = boundary_bar + right_take
-                sampled_tokens = _build_phrase_view_tokens(tokens, analysis.bars, start_bar, end_bar)
-                if len(sampled_tokens) > policy.max_tokens:
-                    continue
-                candidates.append(
-                    SampledWindow(
-                        tokens=sampled_tokens,
-                        source_kind="cross_boundary",
-                        start_bar=start_bar,
-                        end_bar=end_bar,
-                        tempo_token=analysis.bars[start_bar].effective_tempo_token,
-                        key_token=analysis.bars[start_bar].effective_key_token,
-                        boundary_count=1,
-                    )
-                )
-    if not candidates:
-        return None
-    return candidates[rng.randrange(len(candidates))]
-
-
-def _choose_long_context_window(
-    tokens: Sequence[str],
-    analysis: PhraseAnalysis,
-    policy: PhraseWindowPolicy,
-    rng: random.Random,
-) -> SampledWindow | None:
-    if not analysis.bars:
-        return None
-
-    candidates: list[SampledWindow] = []
-    phrase_boundaries = [span.start_bar for span in analysis.phrase_spans]
-    phrase_ends = [span.end_bar for span in analysis.phrase_spans]
-    for start_bar in phrase_boundaries:
-        for end_bar in phrase_ends:
-            if end_bar <= start_bar:
-                continue
-            span_len = end_bar - start_bar
-            if span_len < policy.min_bars or span_len > policy.max_bars:
-                continue
-            boundary_count = _count_phrase_boundaries(analysis, start_bar, end_bar)
-            if boundary_count < 1:
-                continue
-            sampled_tokens = _build_phrase_view_tokens(tokens, analysis.bars, start_bar, end_bar)
-            if len(sampled_tokens) > policy.max_tokens:
-                continue
-            candidates.append(
-                SampledWindow(
-                    tokens=sampled_tokens,
-                    source_kind="long_context",
-                    start_bar=start_bar,
-                    end_bar=end_bar,
-                    tempo_token=analysis.bars[start_bar].effective_tempo_token,
-                    key_token=analysis.bars[start_bar].effective_key_token,
-                    boundary_count=boundary_count,
-                )
-            )
-    if not candidates:
-        return None
-    return candidates[rng.randrange(len(candidates))]
-
-
-def sample_phrase_window(
-    tokens: Sequence[str],
-    analysis: PhraseAnalysis,
-    policy: PhraseWindowPolicy,
-    rng: random.Random,
-) -> SampledWindow | None:
-    """从 token 序列中采样一个带乐句感知的窗口。"""
-    if policy.kind == "single_phrase":
-        return _choose_single_phrase_window(tokens, analysis, policy, rng)
-    if policy.kind == "cross_boundary":
-        return _choose_cross_boundary_window(tokens, analysis, policy, rng)
-    if policy.kind == "long_context":
-        return _choose_long_context_window(tokens, analysis, policy, rng)
-    raise ValueError(f"Unsupported phrase window policy kind: {policy.kind!r}")

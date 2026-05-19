@@ -11,12 +11,12 @@ import mido
 
 from src.tokenizer import TokenizerConfig, build_vocab, tokenize_midi, tokens_to_midi
 from src.tokenizer.common import collect_tempo_changes
-from src.tokenizer.midi_codec import inject_key_tokens
+from src.tokenizer.midi_codec import inject_key_tokens, inject_phrase_tokens
 from src.tokenizer.tokenize_dataset import process as tokenize_dataset_process
 
 
 def _roundtrip_tokens() -> list[str]:
-    return inject_key_tokens([
+    return inject_phrase_tokens(inject_key_tokens([
         "BOS",
         "TEMPO_120",
         "BAR",
@@ -38,7 +38,7 @@ def _roundtrip_tokens() -> list[str]:
         "DUR_8",
         "VEL_10",
         "EOS",
-    ])
+    ]))
 
 
 def _default_tempo_tokens() -> list[str]:
@@ -56,7 +56,7 @@ def _default_tempo_tokens() -> list[str]:
 
 
 def _continuation_full_tokens() -> list[str]:
-    return inject_key_tokens([
+    return inject_phrase_tokens(inject_key_tokens([
         "BOS",
         "TEMPO_120",
         "BAR",
@@ -72,7 +72,7 @@ def _continuation_full_tokens() -> list[str]:
         "DUR_4",
         "VEL_8",
         "EOS",
-    ])
+    ]))
 
 
 def _continuation_prompt_tokens() -> list[str]:
@@ -101,7 +101,7 @@ def _continuation_output_tokens() -> list[str]:
 
 
 def _continuation_partial_expected_tokens() -> list[str]:
-    return [
+    return inject_phrase_tokens([
         "BOS",
         "TEMPO_120",
         "KEY_UNCERTAIN",
@@ -113,7 +113,7 @@ def _continuation_partial_expected_tokens() -> list[str]:
         "DUR_4",
         "VEL_8",
         "EOS",
-    ]
+    ])
 
 
 def _continuation_target_tokens() -> list[str]:
@@ -127,7 +127,7 @@ def _continuation_target_tokens() -> list[str]:
 
 
 def _continuation_target_expected_tokens() -> list[str]:
-    return [
+    return inject_phrase_tokens([
         "BOS",
         "TEMPO_120",
         "KEY_UNCERTAIN",
@@ -139,11 +139,11 @@ def _continuation_target_expected_tokens() -> list[str]:
         "DUR_4",
         "VEL_8",
         "EOS",
-    ]
+    ])
 
 
 def _continuation_reference_full_tokens() -> list[str]:
-    return inject_key_tokens([
+    return inject_phrase_tokens(inject_key_tokens([
         "BOS",
         "TEMPO_120",
         "BAR",
@@ -159,11 +159,11 @@ def _continuation_reference_full_tokens() -> list[str]:
         "DUR_4",
         "VEL_8",
         "EOS",
-    ])
+    ]))
 
 
 def _infilling_full_tokens() -> list[str]:
-    return inject_key_tokens([
+    return inject_phrase_tokens(inject_key_tokens([
         "BOS",
         "TEMPO_120",
         "BAR",
@@ -183,7 +183,7 @@ def _infilling_full_tokens() -> list[str]:
         "DUR_4",
         "VEL_8",
         "EOS",
-    ])
+    ]))
 
 
 def _infilling_prompt_tokens() -> list[str]:
@@ -218,7 +218,7 @@ def _infilling_output_tokens() -> list[str]:
 
 
 def _infilling_partial_expected_tokens() -> list[str]:
-    return [
+    return inject_phrase_tokens([
         "BOS",
         "TEMPO_120",
         "KEY_UNCERTAIN",
@@ -229,7 +229,7 @@ def _infilling_partial_expected_tokens() -> list[str]:
         "DUR_4",
         "VEL_8",
         "EOS",
-    ]
+    ])
 
 
 def _infilling_target_tokens() -> list[str]:
@@ -243,7 +243,7 @@ def _infilling_target_tokens() -> list[str]:
 
 
 def _infilling_target_expected_tokens() -> list[str]:
-    return [
+    return inject_phrase_tokens([
         "BOS",
         "TEMPO_120",
         "KEY_UNCERTAIN",
@@ -254,11 +254,11 @@ def _infilling_target_expected_tokens() -> list[str]:
         "DUR_4",
         "VEL_8",
         "EOS",
-    ]
+    ])
 
 
 def _infilling_reference_full_tokens() -> list[str]:
-    return inject_key_tokens([
+    return inject_phrase_tokens(inject_key_tokens([
         "BOS",
         "TEMPO_120",
         "BAR",
@@ -278,11 +278,11 @@ def _infilling_reference_full_tokens() -> list[str]:
         "DUR_4",
         "VEL_8",
         "EOS",
-    ])
+    ]))
 
 
 def _c_major_roundtrip_tokens() -> list[str]:
-    return [
+    return inject_phrase_tokens([
         "BOS",
         "TEMPO_120",
         "KEY_C_MAJ",
@@ -351,11 +351,11 @@ def _c_major_roundtrip_tokens() -> list[str]:
         "DUR_12",
         "VEL_8",
         "EOS",
-    ]
+    ])
 
 
 def _c_to_g_major_roundtrip_tokens() -> list[str]:
-    return [
+    return inject_phrase_tokens([
         "BOS",
         "TEMPO_120",
         "KEY_C_MAJ",
@@ -489,18 +489,19 @@ def _c_to_g_major_roundtrip_tokens() -> list[str]:
         "DUR_12",
         "VEL_8",
         "EOS",
-    ]
+    ])
 
 
 class TokenizerMidiCodecTests(unittest.TestCase):
     def test_build_vocab_appends_key_tokens_without_shifting_existing_ids(self) -> None:
         vocab = build_vocab(TokenizerConfig())
         self.assertEqual(vocab["BAR"], 4)
-        self.assertEqual(vocab["TEMPO_40"], 152)
-        self.assertEqual(vocab["TEMPO_220"], 242)
-        self.assertEqual(vocab["KEY_C_MAJ"], 243)
-        self.assertEqual(vocab["KEY_B_MIN"], 266)
-        self.assertEqual(vocab["KEY_UNCERTAIN"], 267)
+        self.assertEqual(vocab["PHRASE"], 5)
+        self.assertEqual(vocab["TEMPO_40"], 153)
+        self.assertEqual(vocab["TEMPO_220"], 243)
+        self.assertEqual(vocab["KEY_C_MAJ"], 244)
+        self.assertEqual(vocab["KEY_B_MIN"], 267)
+        self.assertEqual(vocab["KEY_UNCERTAIN"], 268)
 
     def test_tokens_to_midi_roundtrip_preserves_quantized_tokens(self) -> None:
         config = TokenizerConfig()
@@ -865,3 +866,149 @@ class ExportTokensToMidiCliTests(unittest.TestCase):
 
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("only complete sequence fields are supported", result.stderr)
+
+
+class PhraseTokenTests(unittest.TestCase):
+    def test_phrase_token_in_vocab(self) -> None:
+        config = TokenizerConfig()
+        vocab = build_vocab(config)
+        self.assertIn("PHRASE", vocab)
+        self.assertIn("BAR", vocab)
+        self.assertLess(vocab["BAR"], vocab["PHRASE"], "PHRASE must follow BAR in vocab order")
+        self.assertLess(vocab["PHRASE"], vocab["POS_0"], "PHRASE must precede POS_* tokens")
+
+    def test_validate_token_order_accepts_bar_head_phrase(self) -> None:
+        from src.tokenizer.midi_codec import validate_token_order
+        config = TokenizerConfig()
+        vocab = build_vocab(config)
+        tokens = [
+            "BOS", "TEMPO_120", "KEY_UNCERTAIN",
+            "BAR", "PHRASE", "POS_0", "INST_PIANO", "PITCH_60", "DUR_4", "VEL_8",
+            "EOS",
+        ]
+        valid, oov = validate_token_order(tokens, vocab)
+        self.assertTrue(valid)
+        self.assertEqual(oov, 0)
+
+    def test_validate_token_order_accepts_mid_bar_phrase(self) -> None:
+        from src.tokenizer.midi_codec import validate_token_order
+        config = TokenizerConfig()
+        vocab = build_vocab(config)
+        tokens = [
+            "BOS", "TEMPO_120", "KEY_UNCERTAIN",
+            "BAR", "POS_0", "INST_PIANO", "PITCH_60", "DUR_4", "VEL_8",
+            "PHRASE", "POS_8", "INST_PIANO", "PITCH_64", "DUR_4", "VEL_8",
+            "EOS",
+        ]
+        valid, _ = validate_token_order(tokens, vocab)
+        self.assertTrue(valid)
+
+    def test_validate_token_order_rejects_consecutive_phrase(self) -> None:
+        from src.tokenizer.midi_codec import validate_token_order
+        config = TokenizerConfig()
+        vocab = build_vocab(config)
+        tokens = [
+            "BOS", "TEMPO_120", "KEY_UNCERTAIN",
+            "BAR", "PHRASE", "PHRASE", "POS_0", "INST_PIANO", "PITCH_60", "DUR_4", "VEL_8",
+            "EOS",
+        ]
+        valid, _ = validate_token_order(tokens, vocab)
+        self.assertFalse(valid)
+
+    def test_validate_token_order_rejects_phrase_before_bar(self) -> None:
+        from src.tokenizer.midi_codec import validate_token_order
+        config = TokenizerConfig()
+        vocab = build_vocab(config)
+        tokens_phrase_before_bar = [
+            "BOS", "TEMPO_120", "KEY_UNCERTAIN",
+            "BAR", "POS_0", "INST_PIANO", "PITCH_60", "DUR_4", "VEL_8",
+            "PHRASE", "BAR", "POS_0", "INST_PIANO", "PITCH_60", "DUR_4", "VEL_8",
+            "EOS",
+        ]
+        valid, _ = validate_token_order(tokens_phrase_before_bar, vocab)
+        self.assertFalse(valid)
+
+    def test_validate_token_order_rejects_phrase_at_bos(self) -> None:
+        from src.tokenizer.midi_codec import validate_token_order
+        config = TokenizerConfig()
+        vocab = build_vocab(config)
+        tokens = [
+            "BOS", "PHRASE", "TEMPO_120", "KEY_UNCERTAIN",
+            "BAR", "POS_0", "INST_PIANO", "PITCH_60", "DUR_4", "VEL_8",
+            "EOS",
+        ]
+        valid, _ = validate_token_order(tokens, vocab)
+        self.assertFalse(valid)
+
+    def test_inject_phrase_tokens_forces_first_phrase(self) -> None:
+        from src.tokenizer.midi_codec import inject_phrase_tokens
+        tokens = [
+            "BOS", "TEMPO_120", "KEY_UNCERTAIN",
+            "BAR",
+            "BAR", "POS_0", "INST_PIANO", "PITCH_60", "DUR_4", "VEL_8",
+            "BAR", "POS_0", "INST_PIANO", "PITCH_62", "DUR_4", "VEL_8",
+            "EOS",
+        ]
+        out = inject_phrase_tokens(tokens)
+        bar_positions = [i for i, t in enumerate(out) if t == "BAR"]
+        self.assertEqual(out[bar_positions[1] + 1], "PHRASE")
+        self.assertEqual(out[bar_positions[1] + 2], "POS_0")
+
+    def test_inject_phrase_tokens_no_phrase_on_empty_bar(self) -> None:
+        from src.tokenizer.midi_codec import inject_phrase_tokens
+        tokens = ["BOS", "TEMPO_120", "KEY_UNCERTAIN", "BAR", "EOS"]
+        out = inject_phrase_tokens(tokens)
+        self.assertNotIn("PHRASE", out)
+
+    def test_inject_phrase_tokens_dedups_adjacent(self) -> None:
+        from src.tokenizer.midi_codec import inject_phrase_tokens
+        tokens = [
+            "BOS", "TEMPO_120", "KEY_UNCERTAIN",
+            "BAR", "POS_0", "INST_PIANO", "PITCH_60", "DUR_4", "VEL_8",
+            "EOS",
+        ]
+        out = inject_phrase_tokens(tokens)
+        for i in range(len(out) - 1):
+            self.assertFalse(out[i] == "PHRASE" and out[i + 1] == "PHRASE")
+
+    def test_tokenize_midi_emits_phrase_tokens(self) -> None:
+        midi = mido.MidiFile(type=1, ticks_per_beat=480)
+        track = mido.MidiTrack()
+        midi.tracks.append(track)
+        track.append(mido.MetaMessage("set_tempo", tempo=mido.bpm2tempo(120.0), time=0))
+        track.append(mido.Message("note_on", note=60, velocity=80, time=0))
+        track.append(mido.Message("note_off", note=60, velocity=0, time=240))
+        track.append(mido.Message("note_on", note=62, velocity=80, time=1920))
+        track.append(mido.Message("note_off", note=62, velocity=0, time=240))
+        config = TokenizerConfig()
+        tokens = tokenize_midi(midi, config)
+        self.assertIn("PHRASE", tokens)
+
+    def test_tokens_to_midi_ignores_phrase(self) -> None:
+        config = TokenizerConfig()
+        base = inject_key_tokens([
+            "BOS", "TEMPO_120",
+            "BAR", "POS_0", "INST_PIANO", "PITCH_60", "DUR_4", "VEL_8",
+            "BAR", "POS_0", "INST_PIANO", "PITCH_62", "DUR_4", "VEL_8",
+            "EOS",
+        ])
+        with_phrase = list(base)
+        bar_idx = with_phrase.index("BAR")
+        header_end = bar_idx + 1
+        while header_end < len(with_phrase) and (
+            with_phrase[header_end].startswith("TEMPO_") or with_phrase[header_end].startswith("KEY_")
+        ):
+            header_end += 1
+        with_phrase.insert(header_end, "PHRASE")
+        midi_no = tokens_to_midi(base, config)
+        midi_yes = tokens_to_midi(with_phrase, config)
+        msgs_no = [m for m in midi_no.tracks[1] if not m.is_meta and m.type in {"note_on", "note_off"}]
+        msgs_yes = [m for m in midi_yes.tracks[1] if not m.is_meta and m.type in {"note_on", "note_off"}]
+        self.assertEqual(
+            [(m.type, m.note, m.velocity, m.time) for m in msgs_no],
+            [(m.type, m.note, m.velocity, m.time) for m in msgs_yes],
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

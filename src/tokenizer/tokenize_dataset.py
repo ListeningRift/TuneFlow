@@ -43,6 +43,80 @@ def _empty_key_token_stats(key_tokens: List[str]) -> Dict[str, object]:
     }
 
 
+def _empty_phrase_token_stats() -> Dict[str, object]:
+    return {
+        "phrase_token_total": 0,
+        "bar_aligned_phrase_total": 0,
+        "mid_bar_phrase_total": 0,
+        "bar_spans_sum": 0,
+        "bar_spans_count": 0,
+    }
+
+
+def _accumulate_phrase_token_stats(stats: Dict[str, object], tokens: List[str]) -> None:
+    bar_positions: List[int] = []
+    phrase_indices: List[int] = []
+    for idx, token in enumerate(tokens):
+        if token == "BAR":
+            bar_positions.append(idx)
+        elif token == "PHRASE":
+            phrase_indices.append(idx)
+    if not phrase_indices:
+        return
+    stats["phrase_token_total"] = int(stats.get("phrase_token_total", 0)) + len(phrase_indices)
+
+    def _enclosing_bar(token_index: int) -> int:
+        bar_index = -1
+        for i, pos in enumerate(bar_positions):
+            if pos < token_index:
+                bar_index = i
+            else:
+                break
+        return bar_index
+
+    phrase_bar_indices: List[int] = []
+    for phrase_idx in phrase_indices:
+        prev = phrase_idx - 1
+        while prev > 0 and (str(tokens[prev]).startswith("TEMPO_") or str(tokens[prev]).startswith("KEY_")):
+            prev -= 1
+        is_bar_aligned = tokens[prev] == "BAR" if prev >= 0 else False
+        if is_bar_aligned:
+            stats["bar_aligned_phrase_total"] = int(stats.get("bar_aligned_phrase_total", 0)) + 1
+        else:
+            stats["mid_bar_phrase_total"] = int(stats.get("mid_bar_phrase_total", 0)) + 1
+        phrase_bar_indices.append(_enclosing_bar(phrase_idx))
+
+    # Per-PHRASE span: distance (in BARs) from this PHRASE's enclosing bar to the
+    # next PHRASE's enclosing bar, or to EOS. Preserves count for same-bar PHRASEs.
+    eos_bar = len(bar_positions)
+    for i, current_bar in enumerate(phrase_bar_indices):
+        if current_bar < 0:
+            continue
+        next_bar = phrase_bar_indices[i + 1] if i + 1 < len(phrase_bar_indices) else eos_bar
+        if next_bar < 0:
+            next_bar = eos_bar
+        span = next_bar - current_bar
+        if span < 0:
+            continue
+        stats["bar_spans_sum"] = int(stats.get("bar_spans_sum", 0)) + span
+        stats["bar_spans_count"] = int(stats.get("bar_spans_count", 0)) + 1
+
+
+def _finalize_phrase_token_stats(stats: Dict[str, object], num_sequences: int) -> Dict[str, object]:
+    total = int(stats.get("phrase_token_total", 0))
+    bar_count = int(stats.get("bar_spans_count", 0))
+    bar_sum = int(stats.get("bar_spans_sum", 0))
+    mid_bar = int(stats.get("mid_bar_phrase_total", 0))
+    return {
+        "phrase_token_total": total,
+        "bar_aligned_phrase_total": int(stats.get("bar_aligned_phrase_total", 0)),
+        "mid_bar_phrase_total": mid_bar,
+        "mean_phrases_per_sequence": (0.0 if num_sequences == 0 else total / float(num_sequences)),
+        "mid_bar_phrase_ratio": (0.0 if total == 0 else mid_bar / float(total)),
+        "mean_phrase_bar_span": (0.0 if bar_count == 0 else bar_sum / float(bar_count)),
+    }
+
+
 def _accumulate_key_token_stats(stats: Dict[str, object], tokens: List[str]) -> None:
     counts_by_token = stats.get("counts_by_token")
     if not isinstance(counts_by_token, dict):
@@ -104,6 +178,7 @@ def process(
     total_transpose_skips = 0
     parse_errors: List[Dict[str, str]] = []
     total_key_token_stats = _empty_key_token_stats(key_vocab_tokens)
+    total_phrase_token_stats = _empty_phrase_token_stats()
 
     for split_name, split_file in config.split_files.items():
         rows = load_jsonl(Path(split_file))
@@ -123,6 +198,7 @@ def process(
             str(offset): 0 for offset in config.train_transpose_offsets
         }
         split_key_token_stats = _empty_key_token_stats(key_vocab_tokens)
+        split_phrase_token_stats = _empty_phrase_token_stats()
 
         for row_idx, row in enumerate(rows, 1):
             rel = str(row.get("midi_path", "")).strip()
@@ -163,6 +239,8 @@ def process(
                     oov_count += line_oov
                     _accumulate_key_token_stats(split_key_token_stats, tokens)
                     _accumulate_key_token_stats(total_key_token_stats, tokens)
+                    _accumulate_phrase_token_stats(split_phrase_token_stats, tokens)
+                    _accumulate_phrase_token_stats(total_phrase_token_stats, tokens)
                     tok_lines.append(" ".join(tokens))
                     lengths.append(len(tokens))
             except Exception as exc:  # pylint: disable=broad-except
@@ -191,6 +269,7 @@ def process(
             "oov_count": oov_count,
             "length_stats": summarize_lengths(lengths),
             "key_token_stats": split_key_token_stats,
+            "phrase_token_stats": _finalize_phrase_token_stats(split_phrase_token_stats, len(tok_lines)),
             "output_file": str(out_path),
         }
 
@@ -212,6 +291,7 @@ def process(
         "total_transpose_skips": total_transpose_skips,
         "invalid_ratio": (0.0 if total_samples == 0 else total_invalid / total_samples),
         "key_token_stats": total_key_token_stats,
+        "phrase_token_stats": _finalize_phrase_token_stats(total_phrase_token_stats, total_written_rows),
         "split_stats": split_stats,
         "parse_errors_head": parse_errors[:200],
     }
