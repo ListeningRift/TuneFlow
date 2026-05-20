@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>TuneFlow 标注检查 Viewer</title>
+  <link rel="stylesheet" href="./annotation_review_viewer.css" />
+</head>
+<body>
+  <div class="app">
+    <section class="toolbar">
+      <div class="cluster">
+        <button id="openDirBtn" class="btn" type="button">选择数据目录</button>
+        <button id="openLegacyBtn" class="btn secondary" type="button">打开单个 JSON</button>
+      </div>
+      <div class="cluster">
+        <button id="prevBtn" class="btn secondary" type="button">上一条</button>
+        <button id="nextBtn" class="btn" type="button">下一条</button>
+        <button id="markKeepBtn" class="btn keep" type="button">标记保留</button>
+        <button id="markDropBtn" class="btn danger" type="button">标记剔除</button>
+        <button id="clearDecisionBtn" class="btn secondary" type="button">清空标记</button>
+        <button id="exportDecisionsBtn" class="btn secondary" type="button">导出决策</button>
+      </div>
+      <div id="statusText" class="status">请先选择 review 数据目录</div>
+      <div class="cluster">
+        <input id="searchInput" type="text" placeholder="按 row_id、文件名、标题搜索" />
+        <button id="searchBtn" class="btn secondary" type="button">跳转</button>
+      </div>
+      <div class="cluster toggles">
+        <label><input id="suspiciousOnlyToggle" type="checkbox" /> 只看可疑样本</label>
+        <label><input id="undecidedOnlyToggle" type="checkbox" /> 只看未标记</label>
+        <label><input id="hideDroppedToggle" type="checkbox" /> 隐藏已剔除</label>
+        <label><input id="showPitchLabelsToggle" type="checkbox" checked /> 显示音高标签</label>
+      </div>
+      <div id="metaSummary" class="status"></div>
+      <input id="bundleDirInput" type="file" webkitdirectory directory multiple hidden />
+      <input id="legacyFileInput" type="file" accept=".json,application/json" hidden />
+    </section>
+
+    <section class="main">
+      <section class="timeline-panel">
+        <div class="timeline-header">
+          <div class="title-block">
+            <h1 id="caseTitle">未加载样本</h1>
+            <p id="caseSubtitle"></p>
+          </div>
+          <div class="meta-block">
+            <div id="caseMeta" class="status"></div>
+            <div id="caseDecision" class="decision-pill undecided">未标记</div>
+          </div>
+        </div>
+        <div class="timeline-wrapper">
+          <div id="timelineContainer" class="empty">选择 review 目录后开始浏览</div>
+        </div>
+      </section>
+
+      <aside class="info-panel">
+        <div class="card">
+          <h2>数据包</h2>
+          <div id="bundleInfo" class="kv"></div>
+        </div>
+        <div class="card">
+          <h2>基本信息</h2>
+          <div id="basicInfo" class="kv"></div>
+        </div>
+        <div class="card">
+          <h2>调性摘要</h2>
+          <div id="keyInfo" class="kv"></div>
+        </div>
+        <div class="card">
+          <h2>乐句摘要</h2>
+          <div id="phraseInfo" class="kv"></div>
+        </div>
+        <div class="card">
+          <h2>可疑标记</h2>
+          <div id="flagList" class="pill-list"></div>
+        </div>
+      </aside>
+    </section>
+
+    <section class="footer-panel">
+      <details open>
+        <summary>调性帧表</summary>
+        <div id="frameTable"></div>
+      </details>
+      <details>
+        <summary>乐句边界表</summary>
+        <div id="boundaryTable"></div>
+      </details>
+    </section>
+  </div>
+  <div id="tooltip" class="tooltip"></div>
+  <script src="./annotation_review_viewer.js"></script>
+</body>
+</html>
