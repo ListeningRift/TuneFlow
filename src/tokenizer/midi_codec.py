@@ -1,4 +1,4 @@
-"""Reusable TuneFlow MIDI/token codec helpers."""
+"""TuneFlow 的 MIDI 与 token 编解码辅助工具。"""
 
 from __future__ import annotations
 
@@ -167,12 +167,12 @@ def bpm_to_token(bpm: float, config: TokenizerConfig) -> str:
 
 
 def is_key_token(token: str) -> bool:
-    """Return whether a token is a KEY control token."""
+    """判断一个 token 是否为 KEY 控制 token。"""
     return str(token).startswith("KEY_")
 
 
 def key_name_to_token(key_name: str) -> str:
-    """Map key-analysis labels like `C:maj` to ASCII-safe `KEY_*` tokens."""
+    """把调性分析标签映射为 ASCII 安全的 `KEY_*` token。"""
     normalized = str(key_name).strip()
     if normalized == "uncertain":
         return "KEY_UNCERTAIN"
@@ -190,7 +190,7 @@ def key_name_to_token(key_name: str) -> str:
 
 
 def build_key_vocab_tokens() -> List[str]:
-    """Return the full KEY token list in a stable vocabulary order."""
+    """按稳定顺序构建完整的 KEY token 列表。"""
     vocab: List[str] = []
     for root_token in _KEY_TOKEN_ROOTS:
         vocab.append(f"KEY_{root_token}_MAJ")
@@ -201,12 +201,12 @@ def build_key_vocab_tokens() -> List[str]:
 
 
 def strip_key_tokens(tokens: Sequence[str]) -> List[str]:
-    """Drop structural KEY tokens from a token sequence."""
+    """从 token 序列中移除结构性 KEY token。"""
     return [str(token) for token in tokens if not is_key_token(str(token))]
 
 
 def inject_key_tokens(tokens: Sequence[str]) -> List[str]:
-    """Inject sparse KEY tokens at the head and stable modulation bars."""
+    """在头部和稳定转调小节位置注入稀疏的 KEY token。"""
     base_tokens = strip_key_tokens(tokens)
     if not base_tokens or base_tokens[0] != "BOS":
         return list(base_tokens)
@@ -253,10 +253,11 @@ def inject_key_tokens(tokens: Sequence[str]) -> List[str]:
 
 
 def inject_phrase_tokens(tokens: Sequence[str]) -> List[str]:
-    """Inject `PHRASE` structural tokens based on phrase analysis boundaries.
+    """基于乐句分析边界注入 `PHRASE` 结构 token。
 
-    Input must already have KEY tokens injected. PHRASE 在 bar-aligned 位置插在
-    `BAR [TEMPO] [KEY]` 头部之后、首个 POS 之前；mid-bar anchor 插在指定 POS 之前。
+    输入序列必须已经注入 KEY token。
+    若边界对齐小节起点，则把 `PHRASE` 插在 `BAR [TEMPO] [KEY]` 头部之后、首个 `POS` 之前；
+    若边界位于小节内部，则把 `PHRASE` 插在指定 `POS` 之前。
     """
     base_tokens = [str(token) for token in tokens]
     if not base_tokens or base_tokens[0] != "BOS":
@@ -455,9 +456,9 @@ def validate_token_order(tokens: Sequence[str], vocab: Mapping[str, int]) -> Tup
             idx += 1
         if idx < last_index and is_key_token(tokens[idx]):
             idx += 1
-        # Optional bar-head PHRASE: must be followed by a complete event tuple
+        # 可选的小节头 PHRASE，后面必须紧跟一个完整音符事件五元组
         if idx < last_index and tokens[idx] == "PHRASE":
-            # 需要至少 5 个 event token (POS/INST/PITCH/DUR/VEL) 后跟终结
+            # 需要至少 5 个事件 token（POS/INST/PITCH/DUR/VEL）后跟终结
             if idx + 5 >= last_index:
                 return False, oov
             if not tokens[idx + 1].startswith("POS_"):
@@ -476,7 +477,7 @@ def validate_token_order(tokens: Sequence[str], vocab: Mapping[str, int]) -> Tup
                 return False, oov
             idx += 5
             if idx < last_index and tokens[idx] == "PHRASE":
-                # mid-bar PHRASE 后需要至少 5 个 event token 后跟终结
+                # 小节内 PHRASE 后需要至少 5 个事件 token 后跟终结
                 if idx + 5 >= last_index:
                     return False, oov
                 if not tokens[idx + 1].startswith("POS_"):

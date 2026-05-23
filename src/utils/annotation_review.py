@@ -12,11 +12,14 @@ from typing import Any, Iterable, Sequence
 import mido
 
 from src.music_analysis import (
+    BoundaryFeature,
+    HierarchicalBoundaryScore,
     KeyAnalysisConfig,
     KeyFrame,
     KeySegment,
     KeyTimelineAnalysis,
     ModulationPoint,
+    NoteInfo,
     PhraseAnalysis,
     PhraseAnalysisConfig,
     PhraseBoundary,
@@ -268,6 +271,103 @@ def _serialize_phrase_span(span: PhraseSpan, positions_per_bar: int) -> dict[str
     }
 
 
+def _serialize_phrase_note(note: NoteInfo, positions_per_bar: int) -> dict[str, Any]:
+    """序列化乐句分析使用的 note-level 音符信息。"""
+    return {
+        "note_index": int(note.note_index),
+        "start_unit": int(note.start_unit),
+        "end_unit": int(note.end_unit),
+        "duration": int(note.duration),
+        "pitch": int(note.pitch),
+        "bar_index": int(note.bar_index),
+        "pos_in_bar": int(note.pos_in_bar),
+        "start_bar": int(note.start_unit // int(positions_per_bar)),
+        "start_pos": int(note.start_unit % int(positions_per_bar)),
+        "end_bar": int(note.end_unit // int(positions_per_bar)),
+        "end_pos": int(note.end_unit % int(positions_per_bar)),
+        "effective_key_token": note.effective_key_token,
+    }
+
+
+def _serialize_boundary_feature(feature: BoundaryFeature) -> dict[str, Any]:
+    """序列化相邻音符之间的 note-level 边界特征。"""
+    return {
+        "note_index": int(feature.note_index),
+        "left_end_unit": int(feature.left_end_unit),
+        "right_start_unit": int(feature.right_start_unit),
+        "bar_index": int(feature.bar_index),
+        "anchor_pos": int(feature.anchor_pos),
+        "gap": int(feature.gap),
+        "local_gap_mean": float(feature.local_gap_mean),
+        "local_duration_mean": float(feature.local_duration_mean),
+        "gap_break_score": float(feature.gap_break_score),
+        "duration_release_score": float(feature.duration_release_score),
+        "cadence_score": float(feature.cadence_score),
+        "motive_end_score": float(feature.motive_end_score),
+        "repeat_start_score": float(feature.repeat_start_score),
+        "repeat_end_score": float(feature.repeat_end_score),
+        "sequence_stop_score": float(feature.sequence_stop_score),
+        "continuity_penalty": float(feature.continuity_penalty),
+        "bar_hint_score": float(feature.bar_hint_score),
+        "sequence_role": str(feature.sequence_role),
+        "reasons": list(feature.reasons),
+    }
+
+
+def _boundary_display_score(score: HierarchicalBoundaryScore) -> float:
+    """为向后兼容的 review 展示提供单一 score 入口。"""
+    if str(score.boundary_type) == "phrase":
+        return float(score.phrase_score)
+    if str(score.boundary_type) == "subphrase":
+        return float(score.subphrase_score)
+    if str(score.boundary_type) == "motif":
+        return float(score.motif_score)
+    return float(max(score.motif_score, score.subphrase_score, score.phrase_score))
+
+
+def _serialize_boundary_score(score: HierarchicalBoundaryScore) -> dict[str, Any]:
+    """序列化 note-level 三层边界评分，并保留向后兼容字段。"""
+    return {
+        "note_index": int(score.note_index),
+        "unit": int(score.unit),
+        "bar_index": int(score.bar_index),
+        "anchor_pos": int(score.anchor_pos),
+        "motif_score": float(score.motif_score),
+        "subphrase_score": float(score.subphrase_score),
+        "phrase_score": float(score.phrase_score),
+        "boundary_type": str(score.boundary_type),
+        "sequence_role": str(score.sequence_role),
+        "reasons": list(score.reasons),
+        "reason_labels": _phrase_reason_labels(score.reasons, anchor_pos=int(score.anchor_pos)),
+        "score": float(_boundary_display_score(score)),
+    }
+
+
+def _prefer_boundary_score_row(current: dict[str, Any] | None, candidate: dict[str, Any]) -> dict[str, Any]:
+    """同一锚点存在多条评分时，优先保留真正命中的那一条。"""
+
+    if current is None:
+        return dict(candidate)
+
+    current_type = str(current.get("boundary_type", "none"))
+    candidate_type = str(candidate.get("boundary_type", "none"))
+    current_rank = 0 if current_type == "none" else 1
+    candidate_rank = 0 if candidate_type == "none" else 1
+    if candidate_rank != current_rank:
+        return dict(candidate) if candidate_rank > current_rank else dict(current)
+
+    current_score = float(current.get("score", 0.0))
+    candidate_score = float(candidate.get("score", 0.0))
+    if candidate_score != current_score:
+        return dict(candidate) if candidate_score > current_score else dict(current)
+
+    current_reason_count = len(list(current.get("reasons", [])))
+    candidate_reason_count = len(list(candidate.get("reasons", [])))
+    if candidate_reason_count != current_reason_count:
+        return dict(candidate) if candidate_reason_count > current_reason_count else dict(current)
+    return dict(current)
+
+
 def serialize_phrase_analysis(analysis: PhraseAnalysis, positions_per_bar: int) -> dict[str, Any]:
     """把乐句分析结果转换成页面使用的数据格式。"""
     bars = []
@@ -289,18 +389,22 @@ def serialize_phrase_analysis(analysis: PhraseAnalysis, positions_per_bar: int) 
                 "onset_positions": list(bar.onset_positions),
             }
         )
+    notes = [_serialize_phrase_note(note, positions_per_bar) for note in analysis.notes]
+    boundary_features = [
+        _serialize_boundary_feature(feature)
+        for feature in analysis.boundary_features
+    ]
     boundary_scores = [
-        {
-            "bar_index": int(score.bar_index),
-            "score": float(score.score),
-            "reasons": list(score.reasons),
-        }
+        _serialize_boundary_score(score)
         for score in analysis.boundary_scores
     ]
-    boundary_scores_by_bar = {
-        int(score["bar_index"]): dict(score) for score in boundary_scores
-    }
-    candidate_boundary_bars = _candidate_boundary_bars(boundary_scores)
+    boundary_scores_by_anchor: dict[tuple[int, int], dict[str, Any]] = {}
+    for score in boundary_scores:
+        anchor_key = (int(score["bar_index"]), int(score["anchor_pos"]))
+        boundary_scores_by_anchor[anchor_key] = _prefer_boundary_score_row(
+            boundary_scores_by_anchor.get(anchor_key),
+            score,
+        )
     first_content_bar = next(
         (int(index) for index, bar in enumerate(analysis.bars) if int(bar.note_count) > 0),
         None,
@@ -311,8 +415,9 @@ def serialize_phrase_analysis(analysis: PhraseAnalysis, positions_per_bar: int) 
         serialized_boundary.update(
             _describe_phrase_boundary(
                 serialized_boundary,
-                boundary_score=boundary_scores_by_bar.get(int(boundary.bar_index)),
-                candidate_boundary_bars=candidate_boundary_bars,
+                boundary_score=boundary_scores_by_anchor.get(
+                    (int(boundary.bar_index), int(boundary.anchor_pos))
+                ),
                 first_content_bar=first_content_bar,
             )
         )
@@ -328,6 +433,8 @@ def serialize_phrase_analysis(analysis: PhraseAnalysis, positions_per_bar: int) 
     )
     return {
         "bars": bars,
+        "notes": notes,
+        "boundary_features": boundary_features,
         "boundary_scores": boundary_scores,
         "boundaries": boundaries,
         "phrase_spans": phrase_spans,
@@ -394,18 +501,89 @@ def _quantile_threshold(values: Sequence[float], ratio: float) -> float:
 
 
 def _phrase_reason_labels(reasons: Sequence[str], *, anchor_pos: int) -> list[str]:
-    """把内部英文原因映射成面向 review 的中文标签。"""
+    """把内部原因代码映射成面向 review 的中文标签。"""
     label_map = {
+        "adjacent_repeated_bar_span": "长跨度重复",
+        "gap_break": "大空挡",
+        "duration_release": "长时值收束",
+        "cadence": "终止感",
+        "sequence_stop": "模进停止",
+        "sequence_inside": "模进内部",
+        "motive_end": "动机收束",
+        "repeat_start": "重复起点",
+        "repeat_end": "重复结束",
+        "bar_hint": "跨小节提示",
+        "continuity_penalty": "连续性延续",
         "rest_gap": "休止/空拍",
         "note_density_delta": "音符密度变化",
         "onset_density_delta": "起音密度变化",
         "pitch_span_delta": "音域跨度变化",
         "duration_delta": "时值变化",
     }
-    labels = [label_map.get(str(reason), str(reason)) for reason in reasons]
-    if int(anchor_pos) > 0:
+    priority = (
+        "adjacent_repeated_bar_span",
+        "gap_break",
+        "duration_release",
+        "cadence",
+        "sequence_stop",
+        "repeat_end",
+        "motive_end",
+        "repeat_start",
+        "bar_hint",
+        "rest_gap",
+        "note_density_delta",
+        "onset_density_delta",
+        "pitch_span_delta",
+        "duration_delta",
+        "sequence_inside",
+        "continuity_penalty",
+    )
+    normalized = [str(reason) for reason in reasons if str(reason)]
+    ordered_codes: list[str] = []
+    for reason_code in priority:
+        if reason_code in normalized and reason_code not in ordered_codes:
+            ordered_codes.append(reason_code)
+    for reason_code in normalized:
+        if reason_code not in ordered_codes:
+            ordered_codes.append(reason_code)
+
+    labels: list[str] = []
+    for reason in ordered_codes:
+        label = label_map.get(str(reason), str(reason))
+        if label not in labels:
+            labels.append(label)
+    if int(anchor_pos) > 0 and "前置留白锚点" not in labels:
         labels.append("前置留白锚点")
     return labels
+
+
+def _select_primary_phrase_reason(reasons: Sequence[str]) -> str | None:
+    """从真实原因列表中挑出最适合作为主规则名的原因代码。"""
+    priority = (
+        "adjacent_repeated_bar_span",
+        "gap_break",
+        "duration_release",
+        "cadence",
+        "sequence_stop",
+        "repeat_end",
+        "motive_end",
+        "repeat_start",
+        "bar_hint",
+        "rest_gap",
+        "note_density_delta",
+        "onset_density_delta",
+        "pitch_span_delta",
+        "duration_delta",
+        "sequence_inside",
+        "continuity_penalty",
+    )
+    normalized = [str(reason) for reason in reasons if str(reason)]
+    if not normalized:
+        return None
+    for reason_code in priority:
+        if reason_code in normalized:
+            return str(reason_code)
+    return normalized[0]
 
 
 def _compact_boundary_label(reason_labels: Sequence[str], *, fallback: str) -> str:
@@ -421,27 +599,22 @@ def _describe_phrase_boundary(
     boundary: dict[str, Any],
     *,
     boundary_score: dict[str, Any] | None,
-    candidate_boundary_bars: set[int],
     first_content_bar: int | None,
 ) -> dict[str, Any]:
-    """给乐句边界补充来源规则、命中原因和短标签。"""
+    """给乐句边界补充真实来源规则、命中原因和短标签。"""
     bar_index = int(boundary.get("bar_index", -1))
     anchor_pos = int(boundary.get("anchor_pos", 0))
     if first_content_bar is not None and bar_index == int(first_content_bar):
         rule_name = "首句强制"
         reason_labels = ["首句强制"]
         short_label = "首句强制"
-    elif bar_index in candidate_boundary_bars:
-        rule_name = "启发式命中"
-        reason_labels = _phrase_reason_labels(
-            list(boundary_score.get("reasons", [])) if boundary_score is not None else [],
-            anchor_pos=anchor_pos,
-        )
-        short_label = _compact_boundary_label(reason_labels, fallback="启发式命中")
     else:
-        rule_name = "长句补切"
-        reason_labels = ["超过最大句长"]
-        short_label = "长句补切"
+        raw_reasons = list(boundary_score.get("reasons", [])) if boundary_score is not None else []
+        reason_labels = _phrase_reason_labels(raw_reasons, anchor_pos=anchor_pos)
+        primary_reason = _select_primary_phrase_reason(raw_reasons)
+        fallback_rule = str(boundary_score.get("boundary_type", "边界命中")) if boundary_score is not None else "边界命中"
+        rule_name = _phrase_reason_labels([str(primary_reason)], anchor_pos=0)[0] if primary_reason is not None else fallback_rule
+        short_label = _compact_boundary_label(reason_labels, fallback=rule_name)
     return {
         "source_rule": str(rule_name),
         "source_label": str(short_label),

@@ -8,8 +8,14 @@ import unittest
 from pathlib import Path
 
 from src.music_analysis import (
+    BarInfo,
+    HierarchicalBoundaryScore,
     KeyAnalysisConfig,
+    NoteInfo,
+    PhraseAnalysis,
     PhraseAnalysisConfig,
+    PhraseBoundary,
+    PhraseSpan,
     analyze_key_timeline,
     analyze_phrase_candidates,
 )
@@ -17,9 +23,11 @@ from src.tokenizer import TokenizerConfig, tokens_to_midi
 from src.tokenizer.midi_codec import inject_key_tokens, inject_phrase_tokens
 from src.utils.annotation_review import (
     ReviewBuildConfig,
+    _describe_phrase_boundary,
     build_debug_flags,
     build_review_case,
     load_benchmark_cases,
+    serialize_phrase_analysis,
     tokens_to_note_payloads,
     write_review_bundle,
 )
@@ -79,6 +87,115 @@ def _review_config() -> ReviewBuildConfig:
 
 
 class AnnotationReviewTests(unittest.TestCase):
+    def test_serialize_phrase_analysis_prefers_non_none_score_for_same_anchor(self) -> None:
+        """同一锚点存在多条评分时，边界原因应优先使用真实命中而不是后续 none。"""
+
+        analysis = PhraseAnalysis(
+            bars=(
+                BarInfo(
+                    start_token=0,
+                    end_token=10,
+                    note_count=1,
+                    onset_count=1,
+                    rest_ratio=0.0,
+                    pitch_span=0,
+                    mean_duration=4.0,
+                    effective_tempo_token="TEMPO_120",
+                    effective_key_token=None,
+                    onset_positions=(0,),
+                ),
+                BarInfo(
+                    start_token=10,
+                    end_token=20,
+                    note_count=1,
+                    onset_count=1,
+                    rest_ratio=0.0,
+                    pitch_span=0,
+                    mean_duration=4.0,
+                    effective_tempo_token="TEMPO_120",
+                    effective_key_token=None,
+                    onset_positions=(0,),
+                ),
+            ),
+            notes=(
+                NoteInfo(0, 0, 4, 4, 60, 0, 0, None),
+                NoteInfo(1, 32, 36, 4, 62, 1, 0, None),
+            ),
+            boundary_features=tuple(),
+            boundary_scores=(
+                HierarchicalBoundaryScore(
+                    note_index=0,
+                    unit=32,
+                    bar_index=1,
+                    anchor_pos=0,
+                    motif_score=0.42,
+                    subphrase_score=0.56,
+                    phrase_score=0.72,
+                    boundary_type="phrase",
+                    sequence_role="none",
+                    reasons=("adjacent_repeated_bar_span", "repeat_end"),
+                ),
+                HierarchicalBoundaryScore(
+                    note_index=1,
+                    unit=32,
+                    bar_index=1,
+                    anchor_pos=0,
+                    motif_score=0.0,
+                    subphrase_score=0.0,
+                    phrase_score=0.0,
+                    boundary_type="none",
+                    sequence_role="none",
+                    reasons=tuple(),
+                ),
+            ),
+            boundaries=(PhraseBoundary(bar_index=1, anchor_pos=0),),
+            phrase_spans=(
+                PhraseSpan(
+                    start_bar=0,
+                    end_bar=2,
+                    start_token=0,
+                    end_token=20,
+                    tempo_token="TEMPO_120",
+                    key_token=None,
+                    tokens=tuple(),
+                    source_kind="single_phrase",
+                ),
+            ),
+        )
+
+        payload = serialize_phrase_analysis(analysis, positions_per_bar=32)
+
+        self.assertEqual(payload["boundaries"][0]["source_rule"], "长跨度重复")
+        self.assertEqual(payload["boundaries"][0]["source_reasons"], ["长跨度重复", "重复结束"])
+
+    def test_describe_phrase_boundary_uses_real_note_level_reasons(self) -> None:
+        payload = _describe_phrase_boundary(
+            {"bar_index": 9, "anchor_pos": 0},
+            boundary_score={
+                "boundary_type": "phrase",
+                "reasons": ["adjacent_repeated_bar_span", "repeat_end", "motive_end"],
+                "score": 0.88,
+            },
+            first_content_bar=5,
+        )
+        self.assertEqual(payload["source_rule"], "长跨度重复")
+        self.assertEqual(payload["source_label"], "长跨度重复+")
+        self.assertEqual(payload["source_reasons"], ["长跨度重复", "重复结束", "动机收束"])
+
+    def test_describe_phrase_boundary_keeps_first_phrase_as_forced(self) -> None:
+        payload = _describe_phrase_boundary(
+            {"bar_index": 5, "anchor_pos": 0},
+            boundary_score={
+                "boundary_type": "motif",
+                "reasons": ["motive_end", "repeat_start"],
+                "score": 0.48,
+            },
+            first_content_bar=5,
+        )
+        self.assertEqual(payload["source_rule"], "首句强制")
+        self.assertEqual(payload["source_label"], "首句强制")
+        self.assertEqual(payload["source_reasons"], ["首句强制"])
+
     def test_tokens_to_note_payloads_extracts_note_positions(self) -> None:
         tokens = _c_to_g_major_tokens()
         notes = tokens_to_note_payloads(tokens, positions_per_bar=32)
@@ -104,6 +221,9 @@ class AnnotationReviewTests(unittest.TestCase):
         self.assertIn("frames", case["key_analysis"])
         self.assertIn("boundaries", case["phrase_analysis"])
         self.assertIn("phrase_spans", case["phrase_analysis"])
+        self.assertIn("notes", case["phrase_analysis"])
+        self.assertIn("boundary_features", case["phrase_analysis"])
+        self.assertIn("boundary_scores", case["phrase_analysis"])
         self.assertIn("source_rule", case["phrase_analysis"]["boundaries"][0])
         self.assertIn("source_label", case["phrase_analysis"]["boundaries"][0])
         self.assertIn("source_reasons", case["phrase_analysis"]["boundaries"][0])
@@ -117,6 +237,35 @@ class AnnotationReviewTests(unittest.TestCase):
         self.assertEqual(
             case["phrase_analysis"]["boundaries"][0]["anchor_pos"],
             phrase_analysis.boundaries[0].anchor_pos,
+        )
+        self.assertEqual(len(case["phrase_analysis"]["notes"]), len(phrase_analysis.notes))
+        self.assertEqual(
+            case["phrase_analysis"]["notes"][0]["note_index"],
+            phrase_analysis.notes[0].note_index,
+        )
+        self.assertEqual(
+            case["phrase_analysis"]["boundary_features"][0]["sequence_role"],
+            phrase_analysis.boundary_features[0].sequence_role,
+        )
+        self.assertEqual(
+            case["phrase_analysis"]["boundary_scores"][0]["motif_score"],
+            phrase_analysis.boundary_scores[0].motif_score,
+        )
+        self.assertEqual(
+            case["phrase_analysis"]["boundary_scores"][0]["subphrase_score"],
+            phrase_analysis.boundary_scores[0].subphrase_score,
+        )
+        self.assertEqual(
+            case["phrase_analysis"]["boundary_scores"][0]["phrase_score"],
+            phrase_analysis.boundary_scores[0].phrase_score,
+        )
+        self.assertEqual(
+            case["phrase_analysis"]["boundary_scores"][0]["boundary_type"],
+            phrase_analysis.boundary_scores[0].boundary_type,
+        )
+        self.assertEqual(
+            case["phrase_analysis"]["boundary_scores"][0]["sequence_role"],
+            phrase_analysis.boundary_scores[0].sequence_role,
         )
         self.assertEqual(
             case["phrase_analysis"]["boundaries"][0]["source_rule"],
@@ -203,6 +352,17 @@ class AnnotationReviewTests(unittest.TestCase):
         self.assertIn("webkitdirectory", html_text)
         self.assertIn("boundary-label", js_text)
         self.assertIn("source_rule", js_text)
+        self.assertIn("motif_score", js_text)
+        self.assertIn("subphrase_score", js_text)
+        self.assertIn("phrase_score", js_text)
+        self.assertIn("sequence_role", js_text)
+        self.assertIn("buildBoundaryKeyMap", js_text)
+        self.assertIn("finalBoundaryByKey", js_text)
+        self.assertIn("allBoundaryKeys", js_text)
+        self.assertIn(".sort((leftKey, rightKey) => {", js_text)
+        self.assertIn("leftBar - rightBar", js_text)
+        self.assertIn("leftAnchor - rightAnchor", js_text)
+        self.assertEqual(js_text.count('elements.boundaryTable.innerHTML = `'), 1)
 
     def test_load_benchmark_cases_prefers_raw_reconstructed_tokens(self) -> None:
         config = _review_config()

@@ -1,4 +1,4 @@
-"""Music analysis helpers for TuneFlow token sequences."""
+"""TuneFlow token 序列的音乐分析工具。"""
 
 from .key_analysis import (
     KeyAnalysisConfig,
@@ -9,8 +9,12 @@ from .key_analysis import (
     analyze_key_timeline,
 )
 from .phrase_analysis import (
+    AnalysisAnchor,
     BarInfo,
+    BoundaryFeature,
     BoundaryScore,
+    HierarchicalBoundaryScore,
+    NoteInfo,
     PhraseAnalysis,
     PhraseAnalysisConfig,
     PhraseBoundary,
@@ -19,13 +23,17 @@ from .phrase_analysis import (
 )
 
 __all__ = [
+    "AnalysisAnchor",
     "BarInfo",
+    "BoundaryFeature",
     "BoundaryScore",
+    "HierarchicalBoundaryScore",
     "KeyAnalysisConfig",
     "KeyFrame",
     "KeySegment",
     "KeyTimelineAnalysis",
     "ModulationPoint",
+    "NoteInfo",
     "PhraseAnalysis",
     "PhraseAnalysisConfig",
     "PhraseBoundary",

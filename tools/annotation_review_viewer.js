@@ -349,6 +349,22 @@
     updateDecisionBadge(summary);
   }
 
+  // 按 bar_index + anchor_pos 建立映射，兼容 note-level 评分和最终边界说明的关联。
+  function buildBoundaryKeyMap(items) {
+    const map = new Map();
+    for (const item of items || []) {
+      map.set(`${Number(item.bar_index) || 0}:${Number(item.anchor_pos) || 0}`, item);
+    }
+    return map;
+  }
+
+  // 统一格式化分数字段，避免表格里出现 NaN。
+  function formatScore(value) {
+    return value === null || value === undefined || Number.isNaN(Number(value))
+      ? "-"
+      : Number(value).toFixed(3);
+  }
+
   function renderTables(detail) {
     const frameRows = (detail.key_analysis?.frames || []).map((frame) => `
       <tr>
@@ -378,16 +394,40 @@
       </table>
     `;
 
-    const scoreByBar = new Map((detail.phrase_analysis?.boundary_scores || []).map((item) => [Number(item.bar_index), item]));
-    const boundaryRows = (detail.phrase_analysis?.boundaries || []).map((boundary) => {
-      const scoreItem = scoreByBar.get(Number(boundary.bar_index));
+    const scoreItems = detail.phrase_analysis?.boundary_scores || [];
+    const scoreByKey = buildBoundaryKeyMap(scoreItems);
+    const finalBoundaryByKey = buildBoundaryKeyMap(detail.phrase_analysis?.boundaries || []);
+    const allBoundaryKeys = new Set([
+      ...scoreByKey.keys(),
+      ...finalBoundaryByKey.keys(),
+    ]);
+    const boundaryRows = Array.from(allBoundaryKeys).sort((leftKey, rightKey) => {
+      const [leftBarText, leftAnchorText] = String(leftKey).split(":");
+      const [rightBarText, rightAnchorText] = String(rightKey).split(":");
+      const leftBar = Number(leftBarText) || 0;
+      const rightBar = Number(rightBarText) || 0;
+      if (leftBar !== rightBar) {
+        return leftBar - rightBar;
+      }
+      const leftAnchor = Number(leftAnchorText) || 0;
+      const rightAnchor = Number(rightAnchorText) || 0;
+      return leftAnchor - rightAnchor;
+    }).map((boundaryKey) => {
+      const scoreItem = scoreByKey.get(boundaryKey) || null;
+      const boundary = finalBoundaryByKey.get(boundaryKey) || null;
+      const [barIndexText, anchorPosText] = String(boundaryKey).split(":");
+      const reasons = boundary?.source_reasons || scoreItem?.reason_labels || scoreItem?.reasons || [];
       return `
         <tr>
-          <td><code>${escapeHtml(boundary.bar_index)}</code></td>
-          <td><code>${escapeHtml(boundary.anchor_pos)}</code></td>
-          <td><code>${escapeHtml(boundary.source_rule || "-")}</code></td>
-          <td>${boundary.score !== null && boundary.score !== undefined ? Number(boundary.score).toFixed(3) : (scoreItem ? Number(scoreItem.score).toFixed(3) : "-")}</td>
-          <td>${escapeHtml((boundary.source_reasons || (scoreItem ? scoreItem.reasons : []) || []).join(", ")) || "-"}</td>
+          <td><code>${escapeHtml(barIndexText)}</code></td>
+          <td><code>${escapeHtml(anchorPosText)}</code></td>
+          <td>${formatScore(scoreItem?.motif_score)}</td>
+          <td>${formatScore(scoreItem?.subphrase_score)}</td>
+          <td>${formatScore(scoreItem?.phrase_score)}</td>
+          <td><code>${escapeHtml(scoreItem?.boundary_type || "-")}</code></td>
+          <td><code>${escapeHtml(scoreItem?.sequence_role || "-")}</code></td>
+          <td><code>${escapeHtml(boundary?.source_rule || "-")}</code></td>
+          <td>${escapeHtml(reasons.join(", ")) || "-"}</td>
         </tr>
       `;
     }).join("");
@@ -397,12 +437,16 @@
           <tr>
             <th>边界 bar</th>
             <th>anchor_pos</th>
-            <th>规则</th>
-            <th>score</th>
+            <th>motif_score</th>
+            <th>subphrase_score</th>
+            <th>phrase_score</th>
+            <th>boundary_type</th>
+            <th>sequence_role</th>
+            <th>source_rule</th>
             <th>reasons</th>
           </tr>
         </thead>
-        <tbody>${boundaryRows || '<tr><td colspan="5">无乐句边界</td></tr>'}</tbody>
+        <tbody>${boundaryRows || '<tr><td colspan="9">无乐句边界</td></tr>'}</tbody>
       </table>
     `;
   }
