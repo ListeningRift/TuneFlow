@@ -152,6 +152,79 @@ uv run eval-export-midi \
   --output outputs/debug/sample_case_0_raw.mid
 ```
 
+## 标注复核
+
+如果你想人工复核原始 MIDI 的调性、乐句边界或可疑脏样本，可以先用 `eval-annotation-review` 生成 viewer 数据包，再用 `eval-annotation-apply` 把人工决策回写到 split 或原始数据目录。
+
+### `eval-annotation-review`
+
+用途：构建一个供 `tools/annotation_review_viewer.html` 打开的复核数据目录。
+
+最常见的是对原始 MIDI 数据集抽样复核，例如：
+
+```bash
+uv run eval-annotation-review --midi-root data/clean --midi-list-jsonl data/base/train.jsonl --output-dir outputs/debug/review_train --limit 10
+```
+
+如果要复核 benchmark 导出的样本，也可以直接读取 sample JSON：
+
+```bash
+uv run eval-annotation-review --benchmark-json outputs/benchmark/base_full/samples/final_top3/step_100000/continuation.json --output-dir outputs/debug/review_benchmark
+```
+
+运行完成后，主要会得到：
+
+- `output-dir/index.json`
+- `output-dir/cases/`
+- `tools/annotation_review_viewer.html`
+
+使用流程：
+
+1. 打开 `tools/annotation_review_viewer.html`
+2. 点击“选择数据目录”，选择刚才生成的 `output-dir`
+3. 在页面里逐条标记 `keep` 或 `drop`
+4. 点击“导出决策”，保存 `annotation_review_decisions.json`
+
+常用参数：
+
+- `--midi-root`：原始 MIDI 根目录。和 `--benchmark-json` 二选一。
+- `--midi-list-jsonl`：原始 MIDI 清单 JSONL。通常和 `--midi-root` 一起用，便于按相对路径定位样本。
+- `--benchmark-json`：直接从 benchmark sample JSON 构建复核包。
+- `--output-dir`：复核数据输出目录。
+- `--limit`：只处理前 N 条样本，适合先做小批量抽查。
+- `--only-suspicious`：输出时只保留命中可疑规则的样本。
+- `--copy-midi`：把原始 MIDI 复制到输出目录下的 `copied_midi/`，方便单独整理。
+- `--include-tokens`：把完整 token 一起写入详情 JSON，便于深挖，但产物会更大。
+
+### `eval-annotation-apply`
+
+用途：读取 viewer 导出的 `annotation_review_decisions.json`，把人工判定应用到 split JSONL，或者把被判定为 `drop` 的 MIDI 移到隔离目录。
+
+只过滤 split 的例子：
+
+```bash
+uv run eval-annotation-apply --decisions-json outputs/debug/review_train/annotation_review_decisions.json --midi-root data/clean --split-jsonl data/base/train.jsonl --output-jsonl data/base/train.filtered.jsonl
+```
+
+把被剔除的 MIDI 移到隔离目录：
+
+```bash
+uv run eval-annotation-apply --decisions-json outputs/debug/review_train/annotation_review_decisions.json --midi-root data/clean --move-rejected-to data/quarantine
+```
+
+也可以两个动作一次同时执行：
+
+```bash
+uv run eval-annotation-apply --decisions-json outputs/debug/review_train/annotation_review_decisions.json --midi-root data/clean --split-jsonl data/base/train.jsonl --output-jsonl data/base/train.filtered.jsonl --move-rejected-to data/quarantine
+```
+
+使用约束：
+
+- `--decisions-json` 必填。
+- `--split-jsonl` 和 `--output-jsonl` 必须同时提供。
+- 使用 `--move-rejected-to` 时必须同时提供 `--midi-root`。
+- 至少要执行一种动作：过滤 split，或者移动被剔除的 MIDI。
+
 ## 常用参数
 
 - `--config <train-yaml>`
