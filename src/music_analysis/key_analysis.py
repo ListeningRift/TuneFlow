@@ -13,6 +13,8 @@ _MAJOR_PROFILE = (6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.
 _MINOR_PROFILE = (6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17)
 _UNCERTAIN_KEY = "uncertain"
 _ALL_KEY_NAMES = tuple([f"{name}:maj" for name in _PITCH_CLASS_NAMES] + [f"{name}:min" for name in _PITCH_CLASS_NAMES])
+_MAJOR_SCALE_INTERVALS = (0, 2, 4, 5, 7, 9, 11)
+_NATURAL_MINOR_SCALE_INTERVALS = (0, 2, 3, 5, 7, 8, 10)
 
 
 @dataclass(frozen=True)
@@ -33,6 +35,14 @@ class KeyAnalysisConfig:
     modulation_confirmation_frames: int = 2
     global_key_bias: float = 0.18
     key_change_penalty: float = 0.45
+    stable_key_min_support: float = 0.30
+    challenger_min_lead: float = 0.12
+    initial_stable_window_frames: int = 2
+    modulation_min_run_frames: int = 3
+    modulation_min_accumulated_lead: float = 0.60
+    modulation_min_newkey_support: float = 0.45
+    stable_key_max_decay_frames: int = 3
+    modulation_release_frames: int = 2
 
 
 @dataclass(frozen=True)
@@ -108,6 +118,20 @@ class _RawFrame:
     margin_to_second: float
     is_uncertain: bool
     score_by_key: tuple[tuple[str, float], ...]
+
+
+@dataclass(frozen=True)
+class _PreprocessedFrame:
+    """状态机使用的前处理帧。"""
+
+    start_unit: int
+    end_unit: int
+    raw_key: str
+    hmm_key: str
+    best_score: float
+    margin_to_second: float
+    is_uncertain: bool
+    support_by_key: tuple[tuple[str, float], ...]
 
 
 def _parse_prefixed_int(token: str, prefix: str) -> int | None:
@@ -406,6 +430,178 @@ def _decode_hmm_key_path(
     return tuple(decoded)
 
 
+def _build_preprocessed_frames(
+    raw_frames: Sequence[_RawFrame],
+    *,
+    global_scores: dict[str, float],
+    config: KeyAnalysisConfig,
+) -> tuple[_PreprocessedFrame, ...]:
+    """构造供结构中心状态机使用的前处理帧。"""
+
+    if not raw_frames:
+        return tuple()
+
+    hmm_path = _decode_hmm_key_path(raw_frames, global_scores=global_scores, config=config)
+    radius = max(0, int(config.neighborhood_radius_frames))
+    items: list[_PreprocessedFrame] = []
+    for frame_index, raw_frame in enumerate(raw_frames):
+        support_by_key: dict[str, float] = defaultdict(float)
+        for neighbor_index in range(max(0, frame_index - radius), min(len(raw_frames), frame_index + radius + 1)):
+            neighbor = raw_frames[neighbor_index]
+            distance = abs(neighbor_index - frame_index)
+            decay = float(config.neighborhood_decay) ** distance
+            for key_name, score in neighbor.score_by_key:
+                support_by_key[str(key_name)] += max(0.0, float(score)) * decay
+        for key_name in _ALL_KEY_NAMES:
+            support_by_key[str(key_name)] += float(config.global_key_bias) * max(0.0, float(global_scores.get(key_name, 0.0)))
+        ranked = sorted(support_by_key.items(), key=lambda item: (-float(item[1]), str(item[0])))
+        items.append(
+            _PreprocessedFrame(
+                start_unit=raw_frame.start_unit,
+                end_unit=raw_frame.end_unit,
+                raw_key=raw_frame.raw_key,
+                hmm_key=hmm_path[frame_index] if frame_index < len(hmm_path) else raw_frame.raw_key,
+                best_score=float(raw_frame.best_score),
+                margin_to_second=float(raw_frame.margin_to_second),
+                is_uncertain=bool(raw_frame.is_uncertain),
+                support_by_key=tuple((str(key_name), float(score)) for key_name, score in ranked),
+            )
+        )
+    return tuple(items)
+
+
+def _is_low_confidence_frame(frame: _PreprocessedFrame, config: KeyAnalysisConfig) -> bool:
+    """判断当前前处理帧是否应在状态机中冻结处理。"""
+
+    if frame.is_uncertain or not frame.support_by_key:
+        return True
+    top_support = max(0.0, float(frame.support_by_key[0][1]))
+    second_support = max(0.0, float(frame.support_by_key[1][1])) if len(frame.support_by_key) > 1 else 0.0
+    return (
+        top_support < float(config.stable_key_min_support)
+        or (top_support - second_support) < float(config.challenger_min_lead)
+    )
+
+
+def _initialize_stable_key(
+    frames: Sequence[_PreprocessedFrame],
+    config: KeyAnalysisConfig,
+) -> str | None:
+    """根据开头的高置信帧初始化结构中心。"""
+
+    start_index = next((index for index, frame in enumerate(frames) if not _is_low_confidence_frame(frame, config)), None)
+    if start_index is None:
+        return None
+
+    end_index = min(len(frames), start_index + max(1, int(config.initial_stable_window_frames)))
+    support_totals: dict[str, float] = defaultdict(float)
+    for frame in frames[start_index:end_index]:
+        if _is_low_confidence_frame(frame, config):
+            continue
+        for key_name, score in frame.support_by_key:
+            support_totals[str(key_name)] += max(0.0, float(score))
+    if not support_totals:
+        return None
+    return min(support_totals, key=lambda key_name: (-float(support_totals[key_name]), str(key_name)))
+
+
+def _publish_structural_key_frames(
+    frames: Sequence[_PreprocessedFrame],
+    published_keys: Sequence[str],
+    config: KeyAnalysisConfig,
+) -> tuple[KeyFrame, ...]:
+    """把状态机结果映射回对外发布的 KeyFrame。"""
+
+    positions_per_bar = max(1, config.positions_per_bar)
+    items: list[KeyFrame] = []
+    for frame, best_key in zip(frames, published_keys, strict=True):
+        start_bar, start_pos = _unit_to_bar_pos(frame.start_unit, positions_per_bar)
+        end_bar, end_pos = _unit_to_bar_pos(frame.end_unit, positions_per_bar)
+        support_lookup = {str(key_name): float(score) for key_name, score in frame.support_by_key}
+        items.append(
+            KeyFrame(
+                start_bar=start_bar,
+                start_pos=start_pos,
+                end_bar=end_bar,
+                end_pos=end_pos,
+                best_key=str(best_key),
+                best_score=float(frame.best_score),
+                margin_to_second=float(frame.margin_to_second),
+                is_uncertain=bool(frame.is_uncertain),
+                raw_key=str(frame.raw_key),
+                smoothed_support=max(0.0, float(support_lookup.get(str(best_key), 0.0))),
+            )
+        )
+    return tuple(items)
+
+
+def _resolve_structural_frames(
+    frames: Sequence[_PreprocessedFrame],
+    config: KeyAnalysisConfig,
+    *,
+    initial_stable_key: str | None = None,
+) -> tuple[KeyFrame, ...]:
+    """用结构中心状态机把前处理帧发布为稳定帧。"""
+
+    if not frames:
+        return tuple()
+
+    stable_key = initial_stable_key if initial_stable_key is not None else _initialize_stable_key(frames, config)
+    if stable_key is None:
+        return _publish_structural_key_frames(frames, [_UNCERTAIN_KEY for _ in frames], config)
+
+    challenger_key: str | None = None
+    challenger_run_frames = 0
+    challenger_accumulated_lead = 0.0
+    stable_key_decay_frames = 0
+    published_keys: list[str] = []
+
+    for frame in frames:
+        if _is_low_confidence_frame(frame, config):
+            published_keys.append(stable_key)
+            continue
+
+        support_map = {str(key_name): float(score) for key_name, score in frame.support_by_key}
+        candidate_key = str(frame.hmm_key)
+        candidate_support = max(0.0, float(support_map.get(candidate_key, 0.0)))
+        stable_support = max(0.0, float(support_map.get(stable_key, 0.0)))
+        lead = candidate_support - stable_support
+
+        if candidate_key == stable_key or lead < float(config.challenger_min_lead):
+            challenger_key = None
+            challenger_run_frames = 0
+            challenger_accumulated_lead = 0.0
+            stable_key_decay_frames = 0
+            published_keys.append(stable_key)
+            continue
+
+        if challenger_key != candidate_key:
+            challenger_key = candidate_key
+            challenger_run_frames = 1
+            challenger_accumulated_lead = lead
+            stable_key_decay_frames = 1
+        else:
+            challenger_run_frames += 1
+            challenger_accumulated_lead += lead
+            stable_key_decay_frames += 1
+
+        if (
+            challenger_run_frames >= int(config.modulation_min_run_frames)
+            and challenger_accumulated_lead >= float(config.modulation_min_accumulated_lead)
+            and stable_key_decay_frames >= int(config.stable_key_max_decay_frames)
+            and candidate_support >= float(config.modulation_min_newkey_support)
+        ):
+            stable_key = str(challenger_key)
+            challenger_key = None
+            challenger_run_frames = 0
+            challenger_accumulated_lead = 0.0
+            stable_key_decay_frames = 0
+
+        published_keys.append(stable_key)
+
+    return _publish_structural_key_frames(frames, published_keys, config)
+
+
 def _smooth_frames(
     raw_frames: Sequence[_RawFrame],
     config: KeyAnalysisConfig,
@@ -462,6 +658,30 @@ def _frame_label(frame: KeyFrame) -> str:
     return _UNCERTAIN_KEY if frame.is_uncertain else str(frame.best_key)
 
 
+def _key_name_to_pitch_classes(key_name: str) -> frozenset[int]:
+    """把调名转换成自然大小调音级集合。"""
+
+    if key_name == _UNCERTAIN_KEY or ":" not in key_name:
+        return frozenset()
+    root_name, mode = key_name.split(":", 1)
+    try:
+        root_index = _PITCH_CLASS_NAMES.index(root_name)
+    except ValueError:
+        return frozenset()
+    intervals = _MAJOR_SCALE_INTERVALS if mode == "maj" else _NATURAL_MINOR_SCALE_INTERVALS
+    return frozenset((root_index + interval) % 12 for interval in intervals)
+
+
+def _are_close_family_keys(left_key: str, right_key: str) -> bool:
+    """判断两个调是否属于高度近亲、易互相混淆的一组。"""
+
+    left_pcs = _key_name_to_pitch_classes(left_key)
+    right_pcs = _key_name_to_pitch_classes(right_key)
+    if not left_pcs or not right_pcs:
+        return False
+    return len(left_pcs & right_pcs) >= 6
+
+
 def _segment_mean_score(frames: Sequence[KeyFrame], key_name: str) -> float:
     matching_scores = [float(frame.best_score) for frame in frames if not frame.is_uncertain and frame.best_key == key_name]
     if not matching_scores:
@@ -484,7 +704,6 @@ def _build_segments(
         return tuple()
 
     positions_per_bar = max(1, config.positions_per_bar)
-    confirmation_frames = max(1, int(config.modulation_confirmation_frames))
     segments: list[tuple[str, int, int]] = []
 
     current_key = labels[first_stable_index]
@@ -499,18 +718,10 @@ def _build_segments(
             index += 1
             continue
 
-        run_end = index
-        while run_end < len(frames) and labels[run_end] == label:
-            run_end += 1
-
-        if (run_end - index) >= confirmation_frames:
-            segments.append((current_key, segment_start, index))
-            current_key = label
-            segment_start = index
-            index = run_end
-            continue
-
-        index = run_end
+        segments.append((current_key, segment_start, index))
+        current_key = label
+        segment_start = index
+        index += 1
 
     segments.append((current_key, segment_start, len(frames)))
 
@@ -533,6 +744,80 @@ def _build_segments(
             )
         )
     return tuple(published_segments)
+
+
+def _segment_length_units(segment: KeySegment, positions_per_bar: int) -> int:
+    """计算稳定调性段的时值长度。"""
+
+    start_unit = (int(segment.start_bar) * int(positions_per_bar)) + int(segment.start_pos)
+    end_unit = (int(segment.end_bar) * int(positions_per_bar)) + int(segment.end_pos)
+    return max(0, end_unit - start_unit)
+
+
+def _merge_family_cycle_segments(
+    segments: Sequence[KeySegment],
+    config: KeyAnalysisConfig,
+) -> tuple[KeySegment, ...]:
+    """合并反复在近关系调之间摆动的长循环段。"""
+
+    if len(segments) < 5:
+        return tuple(segments)
+
+    positions_per_bar = max(1, int(config.positions_per_bar))
+    merged: list[KeySegment] = []
+    index = 0
+    while index < len(segments):
+        run_end = index + 1
+        run_keys = {segments[index].key}
+        while run_end < len(segments):
+            candidate_key = segments[run_end].key
+            if not all(_are_close_family_keys(candidate_key, existing_key) for existing_key in run_keys):
+                break
+            run_keys.add(candidate_key)
+            run_end += 1
+
+        run = list(segments[index:run_end])
+        if len(run) >= 5 and len(run_keys) >= 3:
+            length_by_key: dict[str, int] = defaultdict(int)
+            score_by_key: dict[str, float] = defaultdict(float)
+            count_by_key: dict[str, int] = defaultdict(int)
+            total_length = 0
+            for segment in run:
+                segment_length = _segment_length_units(segment, positions_per_bar)
+                length_by_key[segment.key] += segment_length
+                score_by_key[segment.key] += float(segment.mean_score) * float(segment_length)
+                count_by_key[segment.key] += 1
+                total_length += segment_length
+
+            ordered_keys = sorted(length_by_key, key=lambda key_name: (-length_by_key[key_name], str(key_name)))
+            canonical_key = ordered_keys[0]
+            canonical_length = int(length_by_key[canonical_key])
+            runner_up_length = int(length_by_key[ordered_keys[1]]) if len(ordered_keys) > 1 else 0
+            canonical_ratio = (float(canonical_length) / float(total_length)) if total_length > 0 else 0.0
+
+            if (
+                count_by_key[canonical_key] >= 2
+                and canonical_ratio >= 0.45
+                and canonical_length >= int(round(float(runner_up_length) * 1.2))
+            ):
+                total_score_weight = sum(float(segment.mean_score) * float(_segment_length_units(segment, positions_per_bar)) for segment in run)
+                merged.append(
+                    KeySegment(
+                        key=canonical_key,
+                        start_bar=run[0].start_bar,
+                        start_pos=run[0].start_pos,
+                        end_bar=run[-1].end_bar,
+                        end_pos=run[-1].end_pos,
+                        mean_score=(total_score_weight / float(total_length)) if total_length > 0 else run[0].mean_score,
+                    )
+                )
+                index = run_end
+                continue
+
+        merged.append(segments[index])
+        index += 1
+
+    return tuple(merged)
 
 
 def _modulation_support(
@@ -593,8 +878,18 @@ def analyze_key_timeline(
     parsed = _parse_token_events(tokens, config)
     raw_frames = _build_raw_frames(parsed, config)
     global_scores = _score_lookup(_global_ranked_scores(parsed, config))
-    frames = _smooth_frames(raw_frames, config, global_scores=global_scores)
+    preprocessed_frames = _build_preprocessed_frames(raw_frames, global_scores=global_scores, config=config)
+    initial_stable_key = next(
+        (str(frame.raw_key) for frame in preprocessed_frames if not frame.is_uncertain),
+        None,
+    )
+    frames = _resolve_structural_frames(
+        preprocessed_frames,
+        config,
+        initial_stable_key=initial_stable_key,
+    )
     segments = _build_segments(frames, total_units=parsed.total_units, config=config)
+    segments = _merge_family_cycle_segments(segments, config)
     modulation_points = _build_modulation_points(frames, segments, config)
     initial_key = segments[0].key if segments else _UNCERTAIN_KEY
     return KeyTimelineAnalysis(

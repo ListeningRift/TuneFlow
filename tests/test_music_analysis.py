@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import random
 import unittest
+from pathlib import Path
+
+import mido
 
 from src.music_analysis import (
     KeyAnalysisConfig,
@@ -10,6 +13,7 @@ from src.music_analysis import (
     analyze_key_timeline,
     analyze_phrase_candidates,
 )
+from src.tokenizer import TokenizerConfig, tokenize_midi
 from src.music_analysis.phrase_analysis import (
     AnalysisAnchor,
     BarInfo,
@@ -25,6 +29,11 @@ from src.music_analysis.phrase_analysis import (
     _postprocess_boundary_scores,
     _promote_salient_gap_boundaries,
     _score_boundary_features,
+)
+from src.music_analysis.key_analysis import (
+    _PreprocessedFrame,
+    _initialize_stable_key,
+    _resolve_structural_frames,
 )
 from src.tokenizer.midi_codec import inject_key_tokens
 from src.utils.eval_windows import sample_phrase_aligned_subsequence
@@ -96,6 +105,31 @@ def _bars_to_tokens(bar_specs: list[list[tuple[int, int, int]]], *, append_eos: 
     return tokens
 
 
+def _preprocessed_frame(
+    frame_index: int,
+    support_map: dict[str, float],
+    *,
+    raw_key: str,
+    hmm_key: str | None = None,
+    is_uncertain: bool = False,
+) -> _PreprocessedFrame:
+    """构造状态机测试使用的前处理帧。"""
+
+    ranked = sorted(support_map.items(), key=lambda item: (-float(item[1]), str(item[0])))
+    best_score = float(ranked[0][1])
+    second_score = float(ranked[1][1]) if len(ranked) > 1 else float("-inf")
+    return _PreprocessedFrame(
+        start_unit=frame_index * 16,
+        end_unit=(frame_index + 1) * 16,
+        raw_key=raw_key,
+        hmm_key=raw_key if hmm_key is None else hmm_key,
+        best_score=best_score,
+        margin_to_second=0.0 if second_score == float("-inf") else max(0.0, best_score - second_score),
+        is_uncertain=is_uncertain,
+        support_by_key=tuple((key_name, float(score)) for key_name, score in ranked),
+    )
+
+
 def _no_clear_first_phrase_tokens() -> list[str]:
     """构造首句缺少强结构证据的连续上行片段。"""
 
@@ -163,6 +197,70 @@ def _single_misleading_bar_tokens() -> list[str]:
 def _ambiguous_tokens() -> list[str]:
     chromatic_bar = [(index * 2, 60 + index, 1) for index in range(12)]
     return _bars_to_tokens([chromatic_bar, chromatic_bar, chromatic_bar, chromatic_bar])
+
+
+def _c_major_with_secondary_dominant_tokens() -> list[str]:
+    """构造包含次属和弦色彩，但整体仍保持 C 大调中心的片段。"""
+
+    return _bars_to_tokens(
+        [
+            [(0, 60, 12), (8, 64, 8), (16, 67, 12)],
+            [(0, 57, 12), (8, 60, 8), (16, 64, 12)],
+            [(0, 62, 12), (8, 66, 8), (16, 69, 12)],
+            [(0, 67, 12), (8, 71, 8), (16, 74, 12)],
+            [(0, 60, 12), (8, 64, 8), (16, 67, 12)],
+            [(0, 57, 12), (8, 60, 8), (16, 64, 12)],
+        ]
+    )
+
+
+def _c_major_with_modal_mixture_tokens() -> list[str]:
+    """构造带平行小调借和弦色彩，但不应触发转调的片段。"""
+
+    return _bars_to_tokens(
+        [
+            [(0, 60, 12), (8, 64, 8), (16, 67, 12)],
+            [(0, 60, 12), (8, 63, 8), (16, 67, 12)],
+            [(0, 58, 12), (8, 63, 8), (16, 67, 12)],
+            [(0, 60, 12), (8, 64, 8), (16, 67, 12)],
+            [(0, 57, 12), (8, 60, 8), (16, 64, 12)],
+            [(0, 60, 12), (8, 64, 8), (16, 67, 12)],
+        ]
+    )
+
+
+def _c_major_with_brief_dominant_excursion_tokens() -> list[str]:
+    """构造短暂偏向属调，但很快回归原调中心的片段。"""
+
+    return _bars_to_tokens(
+        [
+            [(0, 60, 12), (8, 64, 8), (16, 67, 12)],
+            [(0, 57, 12), (8, 60, 8), (16, 64, 12)],
+            [(0, 67, 12), (8, 71, 8), (16, 74, 12)],
+            [(0, 64, 12), (8, 67, 8), (16, 71, 12)],
+            [(0, 60, 12), (8, 64, 8), (16, 67, 12)],
+            [(0, 57, 12), (8, 60, 8), (16, 64, 12)],
+        ]
+    )
+
+
+def _c_major_with_confirmed_g_major_modulation_tokens() -> list[str]:
+    """构造由 C 大调稳定转入 G 大调的较长片段。"""
+
+    return _bars_to_tokens(
+        [
+            [(0, 60, 12), (8, 64, 8), (16, 67, 12)],
+            [(0, 57, 12), (8, 60, 8), (16, 64, 12)],
+            [(0, 65, 12), (8, 69, 8), (16, 72, 12)],
+            [(0, 60, 12), (8, 64, 8), (16, 67, 12)],
+            [(0, 67, 12), (8, 71, 8), (16, 74, 12)],
+            [(0, 64, 12), (8, 67, 8), (16, 71, 12)],
+            [(0, 62, 12), (8, 66, 8), (16, 69, 12)],
+            [(0, 67, 12), (8, 71, 8), (16, 74, 12)],
+            [(0, 64, 12), (8, 67, 8), (16, 71, 12)],
+            [(0, 67, 12), (8, 71, 8), (16, 74, 12)],
+        ]
+    )
 
 
 def _mid_bar_anchor_tokens() -> list[str]:
@@ -1055,6 +1153,94 @@ class MusicAnalysisTests(unittest.TestCase):
         analysis = analyze_key_timeline(inject_key_tokens(_c_to_g_major_tokens()))
         self.assertEqual(analysis.initial_key, "C:maj")
         self.assertEqual([segment.key for segment in analysis.segments], ["C:maj", "G:maj"])
+
+    def test_key_timeline_ignores_secondary_dominant_excursion(self) -> None:
+        analysis = analyze_key_timeline(_c_major_with_secondary_dominant_tokens())
+        self.assertEqual(analysis.initial_key, "C:maj")
+        self.assertEqual([segment.key for segment in analysis.segments], ["C:maj"])
+        self.assertEqual(len(analysis.modulation_points), 0)
+
+    def test_key_timeline_ignores_modal_mixture(self) -> None:
+        analysis = analyze_key_timeline(_c_major_with_modal_mixture_tokens())
+        self.assertEqual(analysis.initial_key, "C:maj")
+        self.assertEqual([segment.key for segment in analysis.segments], ["C:maj"])
+        self.assertEqual(len(analysis.modulation_points), 0)
+
+    def test_key_timeline_ignores_brief_dominant_excursion(self) -> None:
+        analysis = analyze_key_timeline(_c_major_with_brief_dominant_excursion_tokens())
+        self.assertEqual(analysis.initial_key, "C:maj")
+        self.assertEqual([segment.key for segment in analysis.segments], ["C:maj"])
+        self.assertEqual(len(analysis.modulation_points), 0)
+
+    def test_key_timeline_detects_confirmed_modulation_without_backfill(self) -> None:
+        analysis = analyze_key_timeline(_c_major_with_confirmed_g_major_modulation_tokens())
+        self.assertEqual(analysis.initial_key, "C:maj")
+        self.assertEqual([segment.key for segment in analysis.segments], ["C:maj", "G:maj"])
+        self.assertEqual(len(analysis.modulation_points), 1)
+        point = analysis.modulation_points[0]
+        self.assertEqual(
+            (point.bar_index, point.pos_in_bar),
+            (analysis.segments[1].start_bar, analysis.segments[1].start_pos),
+        )
+        self.assertGreaterEqual(point.bar_index, 4)
+
+    def test_initialize_stable_key_skips_uncertain_opening_frames(self) -> None:
+        config = KeyAnalysisConfig(initial_stable_window_frames=2)
+        frames = (
+            _preprocessed_frame(0, {"G:maj": 0.56, "C:maj": 0.55}, raw_key="G:maj", is_uncertain=True),
+            _preprocessed_frame(1, {"C:maj": 0.72, "G:maj": 0.30}, raw_key="C:maj"),
+            _preprocessed_frame(2, {"C:maj": 0.69, "G:maj": 0.35}, raw_key="C:maj"),
+        )
+        self.assertEqual(_initialize_stable_key(frames, config), "C:maj")
+
+    def test_structural_frames_freeze_on_uncertain_frame(self) -> None:
+        config = KeyAnalysisConfig(
+            stable_key_min_support=0.30,
+            challenger_min_lead=0.12,
+            modulation_min_run_frames=3,
+            modulation_min_accumulated_lead=0.45,
+            modulation_min_newkey_support=0.45,
+        )
+        frames = (
+            _preprocessed_frame(0, {"C:maj": 0.74, "G:maj": 0.18}, raw_key="C:maj"),
+            _preprocessed_frame(1, {"G:maj": 0.70, "C:maj": 0.46}, raw_key="G:maj"),
+            _preprocessed_frame(2, {"G:maj": 0.52, "C:maj": 0.50}, raw_key="G:maj", is_uncertain=True),
+            _preprocessed_frame(3, {"C:maj": 0.73, "G:maj": 0.28}, raw_key="C:maj"),
+        )
+        resolved = _resolve_structural_frames(frames, config)
+        self.assertTrue(all(frame.best_key == "C:maj" for frame in resolved))
+
+    def test_structural_frames_reset_when_challenger_changes(self) -> None:
+        config = KeyAnalysisConfig(
+            stable_key_min_support=0.30,
+            challenger_min_lead=0.12,
+            modulation_min_run_frames=3,
+            modulation_min_accumulated_lead=0.45,
+            modulation_min_newkey_support=0.45,
+        )
+        frames = (
+            _preprocessed_frame(0, {"C:maj": 0.75, "G:maj": 0.15}, raw_key="C:maj"),
+            _preprocessed_frame(1, {"G:maj": 0.72, "C:maj": 0.44}, raw_key="G:maj"),
+            _preprocessed_frame(2, {"D:maj": 0.74, "C:maj": 0.43, "G:maj": 0.42}, raw_key="D:maj"),
+            _preprocessed_frame(3, {"D:maj": 0.73, "C:maj": 0.45}, raw_key="D:maj"),
+        )
+        resolved = _resolve_structural_frames(frames, config)
+        self.assertTrue(all(frame.best_key == "C:maj" for frame in resolved))
+
+    @unittest.skipUnless(
+        Path(r"D:\Project\TuneFlow\data\clean\clean_midi\.38 Special\Caught Up In You.mid").exists(),
+        "需要本地样本 MIDI 才能运行这条回归测试。",
+    )
+    def test_key_timeline_stabilizes_caught_up_in_you_family_cycle(self) -> None:
+        midi_path = Path(r"D:\Project\TuneFlow\data\clean\clean_midi\.38 Special\Caught Up In You.mid")
+        midi = mido.MidiFile(str(midi_path), clip=True)
+        tokens = tokenize_midi(midi, TokenizerConfig())
+        analysis = analyze_key_timeline(tokens)
+        self.assertLessEqual(len(analysis.modulation_points), 1)
+        self.assertIn(
+            [segment.key for segment in analysis.segments],
+            (["C#:min"], ["B:maj", "C#:min"]),
+        )
 
 
 if __name__ == "__main__":
