@@ -5,14 +5,17 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 
 import mido
 
+from scripts.data.build_data import PipelineArgs, build_commands
 from src.tokenizer import TokenizerConfig, build_vocab, tokenize_midi, tokens_to_midi
 from src.tokenizer.common import collect_tempo_changes
 from src.tokenizer.midi_codec import inject_key_tokens, inject_phrase_tokens
-from src.tokenizer.tokenize_dataset import process as tokenize_dataset_process
+from src.tokenizer.tokenize_dataset import _compute_parallel_batch_size, process as tokenize_dataset_process
 
 
 def _roundtrip_tokens() -> list[str]:
@@ -566,6 +569,118 @@ class TokenizerMidiCodecTests(unittest.TestCase):
             self.assertEqual(int(key_token_stats["counts_by_token"]["KEY_C_MAJ"]), 1)
             self.assertEqual(int(split_key_token_stats["counts_by_token"]["KEY_C_MAJ"]), 1)
 
+    def test_tokenize_dataset_workers_preserves_output_and_stats(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            midi_root = tmp_path / "midi"
+            midi_root.mkdir(parents=True, exist_ok=True)
+            split_path = tmp_path / "train.jsonl"
+            serial_output_dir = tmp_path / "serial"
+            parallel_output_dir = tmp_path / "parallel"
+            serial_vocab_path = serial_output_dir / "tokenizer_vocab.json"
+            parallel_vocab_path = parallel_output_dir / "tokenizer_vocab.json"
+            serial_stats_path = serial_output_dir / "token_stats.json"
+            parallel_stats_path = parallel_output_dir / "token_stats.json"
+
+            midi_specs = [
+                ("sample_a.mid", _c_major_roundtrip_tokens()),
+                ("sample_b.mid", _roundtrip_tokens()),
+            ]
+            split_lines: list[str] = []
+            for midi_name, tokens in midi_specs:
+                midi = tokens_to_midi(tokens, TokenizerConfig(), ticks_per_beat=480)
+                midi.save(str(midi_root / midi_name))
+                split_lines.append(json.dumps({"midi_path": midi_name}, ensure_ascii=False))
+            split_path.write_text("\n".join(split_lines) + "\n", encoding="utf-8")
+
+            config = TokenizerConfig(
+                midi_root_dir=str(midi_root),
+                train_transpose_offsets=[],
+                split_files={"train": str(split_path)},
+            )
+            tokenize_dataset_process(
+                config=config,
+                output_dir=serial_output_dir,
+                vocab_path=serial_vocab_path,
+                stats_path=serial_stats_path,
+                limit_per_split=None,
+                workers=1,
+            )
+            tokenize_dataset_process(
+                config=config,
+                output_dir=parallel_output_dir,
+                vocab_path=parallel_vocab_path,
+                stats_path=parallel_stats_path,
+                limit_per_split=None,
+                workers=2,
+            )
+
+            self.assertEqual(
+                (serial_output_dir / "train.tok").read_text(encoding="utf-8"),
+                (parallel_output_dir / "train.tok").read_text(encoding="utf-8"),
+            )
+            self.assertEqual(
+                json.loads(serial_vocab_path.read_text(encoding="utf-8")),
+                json.loads(parallel_vocab_path.read_text(encoding="utf-8")),
+            )
+            serial_stats = json.loads(serial_stats_path.read_text(encoding="utf-8"))
+            parallel_stats = json.loads(parallel_stats_path.read_text(encoding="utf-8"))
+            serial_stats["split_stats"]["train"]["output_file"] = "<normalized>"
+            parallel_stats["split_stats"]["train"]["output_file"] = "<normalized>"
+            self.assertEqual(
+                serial_stats,
+                parallel_stats,
+            )
+
+    def test_tokenize_dataset_parallel_workers_prints_live_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            midi_root = tmp_path / "midi"
+            midi_root.mkdir(parents=True, exist_ok=True)
+            split_path = tmp_path / "train.jsonl"
+            output_dir = tmp_path / "parallel"
+            vocab_path = output_dir / "tokenizer_vocab.json"
+            stats_path = output_dir / "token_stats.json"
+
+            midi_specs = [
+                ("sample_a.mid", _c_major_roundtrip_tokens()),
+                ("sample_b.mid", _roundtrip_tokens()),
+            ]
+            split_lines: list[str] = []
+            for midi_name, tokens in midi_specs:
+                midi = tokens_to_midi(tokens, TokenizerConfig(), ticks_per_beat=480)
+                midi.save(str(midi_root / midi_name))
+                split_lines.append(json.dumps({"midi_path": midi_name}, ensure_ascii=False))
+            split_path.write_text("\n".join(split_lines) + "\n", encoding="utf-8")
+
+            config = TokenizerConfig(
+                midi_root_dir=str(midi_root),
+                train_transpose_offsets=[],
+                split_files={"train": str(split_path)},
+            )
+            stdout_buffer = StringIO()
+            with redirect_stdout(stdout_buffer):
+                tokenize_dataset_process(
+                    config=config,
+                    output_dir=output_dir,
+                    vocab_path=vocab_path,
+                    stats_path=stats_path,
+                    limit_per_split=None,
+                    workers=2,
+                )
+
+            output = stdout_buffer.getvalue()
+            self.assertIn("[tokenize] start", output)
+            self.assertIn("split=train start", output)
+            self.assertIn("dispatch workers=2", output)
+            self.assertIn("remaining=", output)
+            self.assertIn("total_progress=", output)
+
+    def test_compute_parallel_batch_size_uses_larger_batches_for_large_parallel_runs(self) -> None:
+        self.assertEqual(_compute_parallel_batch_size(12760, 8), 128)
+        self.assertEqual(_compute_parallel_batch_size(100, 8), 100)
+        self.assertEqual(_compute_parallel_batch_size(1, 8), 1)
+
     def test_tokens_to_midi_rejects_invalid_or_incomplete_sequences(self) -> None:
         config = TokenizerConfig()
         invalid_cases = [
@@ -581,6 +696,37 @@ class TokenizerMidiCodecTests(unittest.TestCase):
 
 
 class ExportTokensToMidiCliTests(unittest.TestCase):
+    def test_build_data_includes_tokenize_workers_argument(self) -> None:
+        args = PipelineArgs(
+            python_exec=sys.executable,
+            clean_config=Path("configs/data/cleaning.yaml"),
+            split_config=Path("configs/data/split.yaml"),
+            tokenizer_config=Path("configs/tokenizer/tokenizer.yaml"),
+            build_config=Path("configs/data/build_training.yaml"),
+            validate_report_path=Path("outputs/reports/data/validate_data_report.json"),
+            start_from="clean",
+            stop_after="validate",
+            clean_limit=None,
+            split_limit=None,
+            tokenize_limit_per_split=16,
+            tokenize_workers=8,
+        )
+
+        commands = build_commands(args)
+        self.assertEqual(
+            commands["tokenize"],
+            [
+                sys.executable,
+                "scripts/data/tokenize_dataset.py",
+                "--config",
+                str(Path("configs/tokenizer/tokenizer.yaml")),
+                "--limit-per-split",
+                "16",
+                "--workers",
+                "8",
+            ],
+        )
+
     def test_cli_exports_all_cases_by_default(self) -> None:
         project_root = Path(__file__).resolve().parents[1]
         script_path = project_root / "scripts" / "eval" / "export_tokens_to_midi.py"

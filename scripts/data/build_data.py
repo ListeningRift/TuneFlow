@@ -29,6 +29,7 @@ class PipelineArgs:
     clean_limit: Optional[int]
     split_limit: Optional[int]
     tokenize_limit_per_split: Optional[int]
+    tokenize_workers: int
 
 
 def parse_args() -> PipelineArgs:
@@ -82,25 +83,31 @@ def parse_args() -> PipelineArgs:
         type=str,
         choices=STEP_ORDER,
         default="validate",
-        help="执行到哪个阶段结束（包含该阶段）。",
+        help="执行到哪个阶段结束，包含该阶段。",
     )
     parser.add_argument(
         "--clean-limit",
         type=int,
         default=None,
-        help="clean 阶段限制文件数量（用于冒烟测试）。",
+        help="clean 阶段限制文件数量，用于烟雾测试。",
     )
     parser.add_argument(
         "--split-limit",
         type=int,
         default=None,
-        help="split 阶段限制文件数量（用于冒烟测试）。",
+        help="split 阶段限制文件数量，用于烟雾测试。",
     )
     parser.add_argument(
         "--tokenize-limit-per-split",
         type=int,
         default=None,
-        help="tokenize 阶段每个 split 的样本上限（用于冒烟测试）。",
+        help="tokenize 阶段每个 split 的样本上限，用于烟雾测试。",
+    )
+    parser.add_argument(
+        "--tokenize-workers",
+        type=int,
+        default=1,
+        help="tokenize 阶段的工作进程数；1 表示单进程。",
     )
     ns = parser.parse_args()
     start_idx = STEP_ORDER.index(ns.start_from)
@@ -119,6 +126,7 @@ def parse_args() -> PipelineArgs:
         clean_limit=ns.clean_limit,
         split_limit=ns.split_limit,
         tokenize_limit_per_split=ns.tokenize_limit_per_split,
+        tokenize_workers=max(1, int(ns.tokenize_workers)),
     )
 
 
@@ -162,6 +170,8 @@ def build_commands(args: PipelineArgs) -> Dict[str, List[str]]:
     ]
     if args.tokenize_limit_per_split is not None:
         tokenize_cmd += ["--limit-per-split", str(args.tokenize_limit_per_split)]
+    if int(args.tokenize_workers) > 1:
+        tokenize_cmd += ["--workers", str(args.tokenize_workers)]
     commands["tokenize"] = tokenize_cmd
 
     commands["build"] = [
