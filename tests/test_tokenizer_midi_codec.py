@@ -12,6 +12,7 @@ from pathlib import Path
 import mido
 
 from scripts.data.build_data import PipelineArgs, build_commands
+from scripts.eval.export_tokens_to_midi import _build_structure_only_prefix
 from src.tokenizer import TokenizerConfig, build_vocab, tokenize_midi, tokens_to_midi
 from src.tokenizer.common import collect_tempo_changes
 from src.tokenizer.midi_codec import inject_key_tokens, inject_phrase_tokens
@@ -90,6 +91,43 @@ def _continuation_prompt_tokens() -> list[str]:
         "DUR_4",
         "VEL_8",
         "BAR",
+    ]
+
+
+def _continuation_prompt_tokens_with_phrase() -> list[str]:
+    return [
+        "BOS",
+        "TEMPO_120",
+        "KEY_UNCERTAIN",
+        "BAR",
+        "PHRASE",
+        "POS_0",
+        "INST_PIANO",
+        "PITCH_60",
+        "DUR_4",
+        "VEL_8",
+        "PHRASE",
+        "POS_4",
+        "INST_PIANO",
+        "PITCH_62",
+        "DUR_4",
+        "VEL_8",
+        "BAR",
+    ]
+
+
+def _continuation_prompt_tokens_ending_with_phrase() -> list[str]:
+    return [
+        "BOS",
+        "TEMPO_120",
+        "KEY_UNCERTAIN",
+        "BAR",
+        "POS_0",
+        "INST_PIANO",
+        "PITCH_60",
+        "DUR_4",
+        "VEL_8",
+        "PHRASE",
     ]
 
 
@@ -727,6 +765,32 @@ class ExportTokensToMidiCliTests(unittest.TestCase):
             ],
         )
 
+    def test_structure_only_prefix_skips_phrase_prefixed_events(self) -> None:
+        prefix = _build_structure_only_prefix(_continuation_prompt_tokens_with_phrase(), stop_at_hole=False)
+        self.assertEqual(
+            prefix,
+            [
+                "BOS",
+                "TEMPO_120",
+                "KEY_UNCERTAIN",
+                "BAR",
+                "BAR",
+            ],
+        )
+
+    def test_structure_only_prefix_preserves_trailing_phrase_boundary(self) -> None:
+        prefix = _build_structure_only_prefix(_continuation_prompt_tokens_ending_with_phrase(), stop_at_hole=False)
+        self.assertEqual(
+            prefix,
+            [
+                "BOS",
+                "TEMPO_120",
+                "KEY_UNCERTAIN",
+                "BAR",
+                "PHRASE",
+            ],
+        )
+
     def test_cli_exports_all_cases_by_default(self) -> None:
         project_root = Path(__file__).resolve().parents[1]
         script_path = project_root / "scripts" / "eval" / "export_tokens_to_midi.py"
@@ -846,6 +910,54 @@ class ExportTokensToMidiCliTests(unittest.TestCase):
             self.assertEqual(tokenize_midi(partial_midi, config), _continuation_partial_expected_tokens())
             self.assertEqual(tokenize_midi(target_midi, config), _continuation_target_expected_tokens())
             self.assertEqual(tokenize_midi(reference_midi, config), _continuation_reference_full_tokens())
+
+    def test_cli_accepts_phrase_tokens_inside_continuation_prompt(self) -> None:
+        project_root = Path(__file__).resolve().parents[1]
+        script_path = project_root / "scripts" / "eval" / "export_tokens_to_midi.py"
+        config = TokenizerConfig()
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            input_json = tmp_path / "continuation.json"
+            output_midi = tmp_path / "case.mid"
+            payload = {
+                "task": "continuation",
+                "cases": [
+                    {
+                        "prompt_tokens": _continuation_prompt_tokens_with_phrase(),
+                        "fsm_reconstructed_tokens": _continuation_full_tokens(),
+                        "fsm_output_tokens": _continuation_output_tokens(),
+                        "target_tokens": _continuation_target_tokens(),
+                    }
+                ]
+            }
+            input_json.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(script_path),
+                    "--input-json",
+                    str(input_json),
+                    "--case-index",
+                    "0",
+                    "--output",
+                    str(output_midi),
+                ],
+                cwd=project_root,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            partial_midi = mido.MidiFile(tmp_path / "case_continuation.mid", clip=True)
+            target_midi = mido.MidiFile(tmp_path / "case_target.mid", clip=True)
+            self.assertEqual(tokenize_midi(partial_midi, config), _continuation_partial_expected_tokens())
+            self.assertEqual(tokenize_midi(target_midi, config), _continuation_target_expected_tokens())
 
     def test_cli_exports_infilling_partial_midi(self) -> None:
         project_root = Path(__file__).resolve().parents[1]
@@ -1012,6 +1124,45 @@ class ExportTokensToMidiCliTests(unittest.TestCase):
 
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("only complete sequence fields are supported", result.stderr)
+
+    def test_cli_reports_available_checkpoints_when_input_json_is_missing(self) -> None:
+        """缺失输入 JSON 时应提示同目录可用的 checkpoint。"""
+        project_root = Path(__file__).resolve().parents[1]
+        script_path = project_root / "scripts" / "eval" / "export_tokens_to_midi.py"
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            final_top3_dir = tmp_path / "outputs" / "benchmark" / "base_small" / "samples" / "final_top3"
+            for step_name in ("step_750", "step_1000", "step_3000"):
+                step_dir = final_top3_dir / step_name
+                step_dir.mkdir(parents=True, exist_ok=True)
+                (step_dir / "continuation.json").write_text(
+                    json.dumps({"task": "continuation", "cases": []}, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+
+            missing_input_json = final_top3_dir / "step_4000" / "continuation.json"
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(script_path),
+                    "--input-json",
+                    str(missing_input_json),
+                    "--output",
+                    str(tmp_path / "case.mid"),
+                ],
+                cwd=project_root,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("benchmark sample json不存在", result.stderr)
+            self.assertIn("final_top3", result.stderr)
+            self.assertIn("step_750", result.stderr)
+            self.assertIn("step_1000", result.stderr)
+            self.assertIn("step_3000", result.stderr)
 
 
 class PhraseTokenTests(unittest.TestCase):

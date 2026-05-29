@@ -14,7 +14,12 @@ except ModuleNotFoundError:  # pragma: no cover - 取决于本地测试环境
 
 from src.decoding import TuneFlowGrammarFSM
 from src.utils.benchmark_decode import discover_checkpoints, generate_continuation_tokens, generate_middle_tokens
-from src.utils.benchmarking import analyze_token_sequence, build_benchmark_manifest
+from src.utils.benchmarking import (
+    _extract_first_unit,
+    _infilling_boundary_time_order_stats,
+    analyze_token_sequence,
+    build_benchmark_manifest,
+)
 
 
 def _long_sequence() -> list[str]:
@@ -184,6 +189,110 @@ class BenchmarkingTests(unittest.TestCase):
         self.assertFalse(payload["time_order_valid"])
         self.assertEqual(payload["empty_bar_count"], 2)
         self.assertTrue(payload["has_multi_empty_bar_run"])
+
+    def test_extract_first_unit_accepts_phrase_prefixed_event(self) -> None:
+        unit = _extract_first_unit(
+            [
+                "BOS",
+                "TEMPO_120",
+                "KEY_UNCERTAIN",
+                "PHRASE",
+                "POS_8",
+                "INST_PIANO",
+                "PITCH_64",
+                "DUR_4",
+                "VEL_8",
+                "EOS",
+            ]
+        )
+        self.assertEqual(
+            unit,
+            ("PHRASE", "POS_8", "INST_PIANO", "PITCH_64", "DUR_4", "VEL_8"),
+        )
+
+    def test_analyze_token_sequence_keeps_parsing_bar_head_phrase(self) -> None:
+        payload = analyze_token_sequence(
+            [
+                "BOS",
+                "BAR",
+                "PHRASE",
+                "POS_0",
+                "INST_PIANO",
+                "PITCH_60",
+                "DUR_4",
+                "VEL_8",
+                "BAR",
+                "POS_4",
+                "INST_PIANO",
+                "PITCH_62",
+                "DUR_4",
+                "VEL_8",
+                "EOS",
+            ]
+        )
+        self.assertEqual(payload["bar_count"], 2)
+        self.assertEqual(payload["event_count"], 2)
+        self.assertTrue(payload["time_order_valid"])
+
+    def test_analyze_token_sequence_keeps_parsing_mid_bar_phrase(self) -> None:
+        payload = analyze_token_sequence(
+            [
+                "BOS",
+                "BAR",
+                "POS_0",
+                "INST_PIANO",
+                "PITCH_60",
+                "DUR_4",
+                "VEL_8",
+                "PHRASE",
+                "POS_8",
+                "INST_PIANO",
+                "PITCH_64",
+                "DUR_4",
+                "VEL_8",
+                "EOS",
+            ]
+        )
+        self.assertEqual(payload["bar_count"], 1)
+        self.assertEqual(payload["event_count"], 2)
+        self.assertTrue(payload["time_order_valid"])
+
+    def test_infilling_boundary_time_order_stats_detect_phrase_prefixed_boundaries(self) -> None:
+        stats = _infilling_boundary_time_order_stats(
+            prefix_tokens=[
+                "BOS",
+                "BAR",
+                "POS_12",
+                "INST_PIANO",
+                "PITCH_60",
+                "DUR_4",
+                "VEL_8",
+            ],
+            generated_middle_tokens=[
+                "PHRASE",
+                "POS_8",
+                "INST_PIANO",
+                "PITCH_62",
+                "DUR_4",
+                "VEL_8",
+                "POS_28",
+                "INST_PIANO",
+                "PITCH_64",
+                "DUR_4",
+                "VEL_8",
+            ],
+            suffix_tokens=[
+                "PHRASE",
+                "POS_20",
+                "INST_PIANO",
+                "PITCH_65",
+                "DUR_4",
+                "VEL_8",
+            ],
+        )
+        self.assertEqual(stats["prefix_to_middle_violation_count"], 1)
+        self.assertEqual(stats["middle_to_suffix_violation_count"], 1)
+        self.assertEqual(stats["boundary_violation_count"], 2)
 
     def test_analyze_token_sequence_detects_most_common_pitch_ratio(self) -> None:
         payload = analyze_token_sequence(_sequence_with_pitches([60, 60, 60, 60, 60, 64, 67, 69]))

@@ -77,6 +77,39 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _build_missing_input_json_message(input_json: Path) -> str:
+    """为缺失的 benchmark sample JSON 生成更可操作的错误提示。"""
+    message = f"benchmark sample json不存在: {input_json}"
+    step_dir = input_json.parent
+    group_dir = step_dir.parent
+
+    if group_dir.exists():
+        available_steps = sorted(
+            child.name
+            for child in group_dir.iterdir()
+            if child.is_dir() and (child / input_json.name).is_file()
+        )
+        if available_steps:
+            message += (
+                f"；目录 `{group_dir}` 下可用的 `{input_json.name}` checkpoint: "
+                + ", ".join(available_steps)
+            )
+            if group_dir.name == "final_top3":
+                message += "；`final_top3` 只保留最终导出的 Top 3 样本"
+            return message
+
+    if step_dir.exists():
+        available_jsons = sorted(
+            child.name
+            for child in step_dir.iterdir()
+            if child.is_file() and child.suffix.lower() == ".json"
+        )
+        if available_jsons:
+            message += f"；目录 `{step_dir}` 下可用 JSON: " + ", ".join(available_jsons)
+
+    return message
+
+
 def _resolve_case_tokens(case: dict[str, Any], token_field: str) -> list[str]:
     if token_field not in _ALLOWED_COMPLETE_FIELDS:
         supported = ", ".join(sorted(_ALLOWED_COMPLETE_FIELDS))
@@ -138,6 +171,34 @@ def _build_structure_only_prefix(prompt_tokens: list[str], *, stop_at_hole: bool
             if idx < len(normalized) and normalized[idx].startswith("KEY_"):
                 prefix.append(normalized[idx])
                 idx += 1
+            continue
+        if token == "PHRASE":
+            # PHRASE 只作为结构标记存在，导出结构前缀时需要连同后继完整 event 一起跳过。
+            if idx == len(normalized) - 1:
+                prefix.append(token)
+                idx += 1
+                continue
+            if stop_at_hole and normalized[idx + 1] == "FIM_HOLE":
+                prefix.append(token)
+                idx += 1
+                continue
+            if normalized[idx + 1] == "EOS":
+                prefix.append(token)
+                idx += 1
+                continue
+            if idx + 5 >= len(normalized):
+                raise ValueError("prompt_tokens contains an incomplete phrase-prefixed note event")
+            if not normalized[idx + 1].startswith("POS_"):
+                raise ValueError("prompt_tokens contains an invalid phrase-prefixed note event")
+            if not normalized[idx + 2].startswith("INST_"):
+                raise ValueError("prompt_tokens contains an invalid phrase-prefixed note event")
+            if not normalized[idx + 3].startswith("PITCH_"):
+                raise ValueError("prompt_tokens contains an invalid phrase-prefixed note event")
+            if not normalized[idx + 4].startswith("DUR_"):
+                raise ValueError("prompt_tokens contains an invalid phrase-prefixed note event")
+            if not normalized[idx + 5].startswith("VEL_"):
+                raise ValueError("prompt_tokens contains an invalid phrase-prefixed note event")
+            idx += 6
             continue
         if token.startswith("POS_"):
             if idx + 4 >= len(normalized):
@@ -293,6 +354,8 @@ def main(argv: list[str] | None = None) -> int:
         config_path = args.config
         if not config_path.is_absolute():
             config_path = (project_root / config_path).resolve()
+        if not input_json.exists():
+            raise FileNotFoundError(_build_missing_input_json_message(input_json))
 
         payload = load_json_file(input_json, "benchmark sample json")
         cases = payload.get("cases")

@@ -475,6 +475,16 @@ def _extract_first_unit(tokens: Sequence[str]) -> tuple[str, ...] | None:
         return None
     if filtered[idx] == "BAR":
         return ("BAR",)
+    if filtered[idx] == "PHRASE" and idx + 5 < len(filtered):
+        unit = filtered[idx : idx + 6]
+        if (
+            unit[1].startswith("POS_")
+            and unit[2].startswith("INST_")
+            and unit[3].startswith("PITCH_")
+            and unit[4].startswith("DUR_")
+            and unit[5].startswith("VEL_")
+        ):
+            return tuple(unit)
     if filtered[idx].startswith("POS_") and idx + 4 < len(filtered):
         unit = filtered[idx : idx + 5]
         if (
@@ -785,16 +795,27 @@ def analyze_token_sequence(tokens: Sequence[str]) -> dict[str, Any]:
             current_bar_index += 1
             idx += 1
             continue
-        if token.startswith("POS_"):
+        phrase_prefixed = token == "PHRASE"
+        event_start_idx = idx + 1 if phrase_prefixed else idx
+        if phrase_prefixed or token.startswith("POS_"):
+            if phrase_prefixed and idx + 5 >= len(values):
+                break
+            if event_start_idx >= len(values):
+                break
+            pos_token = str(values[event_start_idx])
+            if not pos_token.startswith("POS_"):
+                break
             ensure_bar()
-            pos_value = _parse_prefixed_int(token, "POS_")
+            pos_value = _parse_prefixed_int(pos_token, "POS_")
             if current_bar_last_pos is not None and pos_value is not None and pos_value < current_bar_last_pos:
                 time_order_violation_count += 1
             if pos_value is not None:
                 current_bar_last_pos = pos_value
-            if idx + 4 >= len(values):
+            if event_start_idx + 4 >= len(values):
                 break
-            inst_token, pitch_token, dur_token, vel_token = [str(item) for item in values[idx + 1 : idx + 5]]
+            inst_token, pitch_token, dur_token, vel_token = [
+                str(item) for item in values[event_start_idx + 1 : event_start_idx + 5]
+            ]
             if not inst_token.startswith("INST_"):
                 break
             if not pitch_token.startswith("PITCH_"):
@@ -828,7 +849,7 @@ def analyze_token_sequence(tokens: Sequence[str]) -> dict[str, Any]:
             duration_counts[dur_token] += 1
             parsed_event_count += 1
             current_bar_events = 0 if current_bar_events is None else (current_bar_events + 1)
-            idx += 5
+            idx += 6 if phrase_prefixed else 5
             continue
         break
 
@@ -907,13 +928,24 @@ def _last_pos_in_active_bar(tokens: Sequence[str]) -> int | None:
             current_bar_last_pos = None
             idx += 1
             continue
-        if token.startswith("POS_"):
-            pos_value = _parse_prefixed_int(token, "POS_")
+        phrase_prefixed = token == "PHRASE"
+        event_start_idx = idx + 1 if phrase_prefixed else idx
+        if phrase_prefixed or token.startswith("POS_"):
+            if phrase_prefixed and idx + 5 >= len(values):
+                break
+            if event_start_idx >= len(values):
+                break
+            pos_token = str(values[event_start_idx])
+            if not pos_token.startswith("POS_"):
+                break
+            pos_value = _parse_prefixed_int(pos_token, "POS_")
             if pos_value is not None:
                 current_bar_last_pos = pos_value
-            if idx + 4 >= len(values):
+            if event_start_idx + 4 >= len(values):
                 break
-            inst_token, pitch_token, dur_token, vel_token = [str(item) for item in values[idx + 1 : idx + 5]]
+            inst_token, pitch_token, dur_token, vel_token = [
+                str(item) for item in values[event_start_idx + 1 : event_start_idx + 5]
+            ]
             if (
                 not inst_token.startswith("INST_")
                 or not pitch_token.startswith("PITCH_")
@@ -921,7 +953,7 @@ def _last_pos_in_active_bar(tokens: Sequence[str]) -> int | None:
                 or not vel_token.startswith("VEL_")
             ):
                 break
-            idx += 5
+            idx += 6 if phrase_prefixed else 5
             continue
         break
 
@@ -942,6 +974,20 @@ def _first_pos_before_bar(tokens: Sequence[str]) -> int | None:
             continue
         if token == "BAR":
             return None
+        if token == "PHRASE":
+            if idx + 5 >= len(values):
+                break
+            pos_token = str(values[idx + 1])
+            inst_token, pitch_token, dur_token, vel_token = [str(item) for item in values[idx + 2 : idx + 6]]
+            if (
+                pos_token.startswith("POS_")
+                and inst_token.startswith("INST_")
+                and pitch_token.startswith("PITCH_")
+                and dur_token.startswith("DUR_")
+                and vel_token.startswith("VEL_")
+            ):
+                return _parse_prefixed_int(pos_token, "POS_")
+            break
         if token.startswith("POS_"):
             return _parse_prefixed_int(token, "POS_")
         break
