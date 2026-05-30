@@ -94,6 +94,11 @@ def _artifact_file_names(task_scope: str) -> tuple[str, str]:
     return f"{label}_fast_manifest.json", f"{label}_formal_manifest.json"
 
 
+def _task_capability_plot_filename(task_scope: str) -> str:
+    """返回任务型能力面板图的统一文件名。"""
+    return f"{_TASK_LABELS[task_scope]}_task_capability_panel.png"
+
+
 def _default_prefilter_top_k(*, preset: str | None, config_path: Path | None) -> int:
     if preset == "full":
         return 16
@@ -116,6 +121,7 @@ def _clean_benchmark_outputs(benchmark_root: Path, task_scope: str) -> None:
         benchmark_root / formal_manifest_name,
         benchmark_root / f"{_TASK_LABELS[task_scope]}_core_metrics.png",
         benchmark_root / f"{_TASK_LABELS[task_scope]}_diagnostics.png",
+        benchmark_root / _task_capability_plot_filename(task_scope),
         benchmark_root / f"{_TASK_LABELS[task_scope]}_absolute_capabilities.png",
         benchmark_root / f"{_TASK_LABELS[task_scope]}_training_health.png",
     ]
@@ -337,6 +343,16 @@ def _parse_args(*, task_scope: str, argv: list[str] | None = None) -> argparse.N
             "例子：--prefilter-preserve-earliest 4"
         ),
     )
+    parser.add_argument(
+        "--baseline-checkpoint",
+        type=str,
+        default=None,
+        help=(
+            "鍩虹嚎 checkpoint 鍚嶇О銆備綔鐢細鐢ㄤ簬璁＄畻 `vs_baseline_win_rate`銆俓n"
+            "涓嶅～鏃朵細鑷姩閫夋嫨褰撳墠鍊欓€夐泦鍚堥噷 step 链€灏忕殑 checkpoint銆俓n"
+            "渚嬪瓙锛?-baseline-checkpoint step_100.pt"
+        ),
+    )
     args = parser.parse_args(argv)
     if float(args.temperature) < 0.0:
         parser.error("--temperature must be >= 0.")
@@ -449,7 +465,104 @@ def _append_if_finite(values: list[float], value: Any) -> bool:
     return True
 
 
+def _resolve_baseline_checkpoint_name(
+    results: list[dict[str, Any]],
+    *,
+    requested_baseline: str | None,
+) -> str | None:
+    """解析用于基线对比的 checkpoint 名称。"""
+    if requested_baseline:
+        requested_name = str(requested_baseline)
+        if any(str(result.get("checkpoint_name")) == requested_name for result in results):
+            return requested_name
+        return requested_name
+    candidates = [
+        result
+        for result in results
+        if result.get("checkpoint_name") is not None and result.get("step") is not None
+    ]
+    if not candidates:
+        return None
+    earliest = min(candidates, key=lambda item: int(item["step"]))
+    return str(earliest["checkpoint_name"])
+
+
+def _attach_baseline_win_rates(
+    results: list[dict[str, Any]],
+    *,
+    baseline_checkpoint_name: str | None,
+    stage_name: str,
+) -> list[dict[str, Any]]:
+    """按任务维度对战率代理为结果补充相对基线胜率字段。"""
+    battle_metric_keys = (
+        "task_capability_score",
+        "task_control_score",
+        "task_realization_score",
+        "structure_control_score",
+        "local_development_score",
+        "long_context_coherence_score",
+        "infilling_consistency_score",
+    )
+    baseline_result = None
+    if baseline_checkpoint_name is not None:
+        for result in results:
+            if str(result.get("checkpoint_name")) == baseline_checkpoint_name:
+                baseline_result = result
+                break
+        if baseline_result is None:
+            raise ValueError(
+                f"Current {stage_name} results do not contain baseline checkpoint `{baseline_checkpoint_name}`."
+            )
+
+    enriched_results: list[dict[str, Any]] = []
+    for result in results:
+        enriched = dict(result)
+        duel_scores: list[float] = []
+        if baseline_result is not None:
+            for metric_key in battle_metric_keys:
+                current_score = _finite_float_or_none(enriched.get(metric_key))
+                baseline_score = _finite_float_or_none(baseline_result.get(metric_key))
+                if current_score is None or baseline_score is None:
+                    continue
+                if current_score > baseline_score:
+                    duel_scores.append(1.0)
+                elif current_score < baseline_score:
+                    duel_scores.append(0.0)
+                else:
+                    duel_scores.append(0.5)
+        if not duel_scores:
+            enriched["vs_baseline_win_rate"] = None
+        else:
+            enriched["vs_baseline_win_rate"] = sum(duel_scores) / float(len(duel_scores))
+        enriched_results.append(enriched)
+    return enriched_results
+
+
 def _to_jsonable_result(result: dict[str, Any]) -> dict[str, Any]:
+    legacy_source = dict(result.get("legacy_score_fields", {}))
+    compatibility_fields = {
+        "balanced_score": result.get("balanced_score", legacy_source.get("balanced_score")),
+        "balanced_rank": result.get("balanced_rank", legacy_source.get("balanced_rank")),
+        "balanced_score_coverage": result.get("balanced_score_coverage", legacy_source.get("balanced_score_coverage")),
+        "balanced_score_breakdown": result.get("balanced_score_breakdown", legacy_source.get("balanced_score_breakdown")),
+        "absolute_score_version": result.get("absolute_score_version", legacy_source.get("absolute_score_version")),
+        "absolute_score": result.get("absolute_score", legacy_source.get("absolute_score")),
+        "absolute_score_coverage": result.get("absolute_score_coverage", legacy_source.get("absolute_score_coverage")),
+        "absolute_score_proxy_dimension_count": result.get(
+            "absolute_score_proxy_dimension_count",
+            legacy_source.get("absolute_score_proxy_dimension_count"),
+        ),
+        "absolute_score_proxy_dimensions": result.get(
+            "absolute_score_proxy_dimensions",
+            legacy_source.get("absolute_score_proxy_dimensions"),
+        ),
+        "absolute_score_missing_dimensions": result.get(
+            "absolute_score_missing_dimensions",
+            legacy_source.get("absolute_score_missing_dimensions"),
+        ),
+        "absolute_score_breakdown": result.get("absolute_score_breakdown", legacy_source.get("absolute_score_breakdown")),
+    }
+    legacy_score_fields_present = any(value is not None for value in compatibility_fields.values())
     return {
         "checkpoint_name": result.get("checkpoint_name"),
         "checkpoint_path": result.get("checkpoint_path"),
@@ -475,6 +588,19 @@ def _to_jsonable_result(result: dict[str, Any]) -> dict[str, Any]:
         "continuation_event_ngram_repeat_ratio": result.get("continuation_event_ngram_repeat_ratio"),
         "continuation_rhythm_ngram_repeat_ratio": result.get("continuation_rhythm_ngram_repeat_ratio"),
         "continuation_repetition_metric_coverage": result.get("continuation_repetition_metric_coverage"),
+        "structure_control_boundary_type_hit_rate": result.get("structure_control_boundary_type_hit_rate"),
+        "structure_control_boundary_timing_hit_rate": result.get("structure_control_boundary_timing_hit_rate"),
+        "structure_control_post_boundary_realization_score": result.get(
+            "structure_control_post_boundary_realization_score"
+        ),
+        "local_development_motif_relation_hit_rate": result.get("local_development_motif_relation_hit_rate"),
+        "local_development_copy_overuse_penalty": result.get("local_development_copy_overuse_penalty"),
+        "local_development_unrelated_drift_penalty": result.get("local_development_unrelated_drift_penalty"),
+        "local_development_quality_score": result.get("local_development_quality_score"),
+        "long_context_completion_rate": result.get("long_context_completion_rate"),
+        "long_context_theme_retention_score": result.get("long_context_theme_retention_score"),
+        "long_context_section_continuity_score": result.get("long_context_section_continuity_score"),
+        "long_context_degeneration_penalty": result.get("long_context_degeneration_penalty"),
         "infilling_most_common_pitch_ratio": result.get("infilling_most_common_pitch_ratio"),
         "infilling_longest_same_pitch_run_ratio": result.get("infilling_longest_same_pitch_run_ratio"),
         "infilling_pitch_diversity_score": result.get("infilling_pitch_diversity_score"),
@@ -489,6 +615,11 @@ def _to_jsonable_result(result: dict[str, Any]) -> dict[str, Any]:
         "infilling_event_ngram_repeat_ratio": result.get("infilling_event_ngram_repeat_ratio"),
         "infilling_rhythm_ngram_repeat_ratio": result.get("infilling_rhythm_ngram_repeat_ratio"),
         "infilling_repetition_metric_coverage": result.get("infilling_repetition_metric_coverage"),
+        "infilling_bridge_validity_rate": result.get("infilling_bridge_validity_rate"),
+        "infilling_boundary_compatibility_hit_rate": result.get("infilling_boundary_compatibility_hit_rate"),
+        "infilling_rhythmic_connection_score": result.get("infilling_rhythmic_connection_score"),
+        "infilling_pitch_connection_score": result.get("infilling_pitch_connection_score"),
+        "infilling_structural_fit_score": result.get("infilling_structural_fit_score"),
         "overall_most_common_pitch_ratio": result.get("overall_most_common_pitch_ratio"),
         "overall_longest_same_pitch_run_ratio": result.get("overall_longest_same_pitch_run_ratio"),
         "overall_pitch_diversity_score": result.get("overall_pitch_diversity_score"),
@@ -503,19 +634,26 @@ def _to_jsonable_result(result: dict[str, Any]) -> dict[str, Any]:
         "overall_event_ngram_repeat_ratio": result.get("overall_event_ngram_repeat_ratio"),
         "overall_rhythm_ngram_repeat_ratio": result.get("overall_rhythm_ngram_repeat_ratio"),
         "overall_repetition_metric_coverage": result.get("overall_repetition_metric_coverage"),
-        "balanced_score": result.get("balanced_score"),
-        "balanced_rank": result.get("balanced_rank"),
-        "balanced_score_coverage": result.get("balanced_score_coverage"),
+        "primary_score": result.get("primary_score"),
+        "primary_score_coverage": result.get("primary_score_coverage"),
+        "primary_score_breakdown": result.get("primary_score_breakdown"),
+        "selection_breakdown": result.get("selection_breakdown"),
+        "task_capability_score": result.get("task_capability_score"),
+        "task_capability_score_coverage": result.get("task_capability_score_coverage"),
+        "task_control_score": result.get("task_control_score"),
+        "task_realization_score": result.get("task_realization_score"),
+        "structure_control_score": result.get("structure_control_score"),
+        "local_development_score": result.get("local_development_score"),
+        "long_context_coherence_score": result.get("long_context_coherence_score"),
+        "infilling_consistency_score": result.get("infilling_consistency_score"),
+        "task_capability_score_breakdown": result.get("task_capability_score_breakdown"),
+        "vs_baseline_win_rate": result.get("vs_baseline_win_rate"),
         "gate_passed": result.get("gate_passed"),
         "gate_details": result.get("gate_details"),
         "gate_failed_reasons": result.get("gate_failed_reasons"),
-        "absolute_score_version": result.get("absolute_score_version"),
-        "absolute_score": result.get("absolute_score"),
-        "absolute_score_coverage": result.get("absolute_score_coverage"),
-        "absolute_score_proxy_dimension_count": result.get("absolute_score_proxy_dimension_count"),
-        "absolute_score_proxy_dimensions": result.get("absolute_score_proxy_dimensions"),
-        "absolute_score_missing_dimensions": result.get("absolute_score_missing_dimensions"),
-        "absolute_score_breakdown": result.get("absolute_score_breakdown"),
+        "legacy_score_fields": compatibility_fields,
+        "legacy_score_fields_present": legacy_score_fields_present,
+        "compatibility_only": legacy_score_fields_present,
         "continuation_closure_score": result.get("continuation_closure_score"),
         "continuation_structure_score": result.get("continuation_structure_score"),
         "infilling_integrity_score": result.get("infilling_integrity_score"),
@@ -539,12 +677,49 @@ def _sample_preview(tokens: list[str], limit: int = 24) -> str:
     return " ".join(tokens[:limit]) + " ..."
 
 
-def _case_sample_payload(case: dict[str, Any], record: dict[str, Any], fsm_record: dict[str, Any], *, task: str) -> dict[str, Any]:
+def _continuation_task_specs_for_case(case: dict[str, Any]) -> list[dict[str, Any]]:
+    """返回当前样本需要实际执行的 continuation 类任务 case。"""
+    return [
+        {
+            "task_case_key": "structure_control_case",
+            **dict(case["structure_control_case"]),
+        },
+        {
+            "task_case_key": "local_development_case",
+            **dict(case["local_development_case"]),
+        },
+        {
+            "task_case_key": "long_context_case",
+            **dict(case["long_context_case"]),
+        },
+    ]
+
+
+def _infilling_task_spec_for_case(case: dict[str, Any]) -> dict[str, Any]:
+    """返回当前样本需要实际执行的 infilling 类任务 case。"""
+    return {
+        "task_name": "infilling_consistency",
+        "task_case_key": "infilling_consistency_case",
+        **dict(case["infilling_consistency_case"]),
+    }
+
+
+def _case_sample_payload(
+    case: dict[str, Any],
+    record: dict[str, Any],
+    fsm_record: dict[str, Any],
+    *,
+    task: str,
+    case_payload: dict[str, Any] | None = None,
+    task_variant: str | None = None,
+) -> dict[str, Any]:
+    sample_case_payload = dict(case_payload) if case_payload is not None else dict(case[f"{task}_case"])
     payload = {
         "row_id": case["row_id"],
         "bucket": case["bucket"],
         "meta": dict(case["meta"]),
-        "prompt_tokens": list(case[f"{task}_case"]["prompt_tokens"]),
+        "task_variant": task_variant,
+        "prompt_tokens": list(sample_case_payload["prompt_tokens"]),
         "raw_output_tokens": list(
             record.get("generated_tokens", record.get("generated_middle_tokens", []))
         ),
@@ -585,9 +760,9 @@ def _case_sample_payload(case: dict[str, Any], record: dict[str, Any], fsm_recor
         "rhythm_ngram_repeat_ratio": record.get("rhythm_ngram_repeat_ratio"),
     }
     if task == "continuation":
-        payload["target_tokens"] = list(case["continuation_case"]["target_tokens"])
+        payload["target_tokens"] = list(sample_case_payload["target_tokens"])
     else:
-        payload["target_hole_tokens"] = list(case["infilling_case"]["target_hole_tokens"])
+        payload["target_hole_tokens"] = list(sample_case_payload["target_hole_tokens"])
     return payload
 
 
@@ -684,7 +859,14 @@ def _evaluate_checkpoint_on_manifest(
     build_infilling_trace_fn,
 ) -> tuple[dict[str, Any], dict[str, list[dict[str, Any]]]]:
     # 单个 checkpoint 的完整评估单元：raw/fsm 与 continuation/infilling 都在这里统一执行。
-    from src.utils.benchmarking import enrich_continuation_record, enrich_infilling_record
+    from src.utils.benchmarking import (
+        enrich_continuation_record,
+        enrich_infilling_consistency_record,
+        enrich_infilling_record,
+        enrich_local_development_record,
+        enrich_long_context_record,
+        enrich_structure_control_record,
+    )
     from src.utils.training_metrics import training_metrics_for_step
 
     ckpt_payload = load_checkpoint_fn(torch, ckpt_path)
@@ -739,6 +921,20 @@ def _evaluate_checkpoint_on_manifest(
     continuation_event_ngram_repeat_ratios: list[float] = []
     continuation_rhythm_ngram_repeat_ratios: list[float] = []
     continuation_repetition_metric_valid = 0
+    structure_control_attempted = 0
+    structure_control_boundary_type_hits = 0
+    structure_control_boundary_timing_hits = 0
+    structure_control_post_boundary_realization_scores: list[float] = []
+    local_development_attempted = 0
+    local_development_motif_relation_hits = 0
+    local_development_copy_overuse_penalties: list[float] = []
+    local_development_unrelated_drift_penalties: list[float] = []
+    local_development_quality_scores: list[float] = []
+    long_context_attempted = 0
+    long_context_completion_hits = 0
+    long_context_theme_retention_scores: list[float] = []
+    long_context_section_continuity_scores: list[float] = []
+    long_context_degeneration_penalties: list[float] = []
     continuation_failure_reason_counts: Counter[str] = Counter()
     continuation_syntax_reason_counts: Counter[str] = Counter()
     fsm_cont_structural_valid = 0
@@ -770,6 +966,11 @@ def _evaluate_checkpoint_on_manifest(
     infilling_event_ngram_repeat_ratios: list[float] = []
     infilling_rhythm_ngram_repeat_ratios: list[float] = []
     infilling_repetition_metric_valid = 0
+    infilling_bridge_validity_hits = 0
+    infilling_boundary_compatibility_hits = 0
+    infilling_rhythmic_connection_scores: list[float] = []
+    infilling_pitch_connection_scores: list[float] = []
+    infilling_structural_fit_scores: list[float] = []
     infilling_failure_reason_counts: Counter[str] = Counter()
     infilling_syntax_reason_counts: Counter[str] = Counter()
     fsm_infill_structural_valid = 0
@@ -778,173 +979,228 @@ def _evaluate_checkpoint_on_manifest(
     try:
         for case in manifest["cases"]:
             if run_continuation:
-                continuation_case = dict(case["continuation_case"])
-                prompt_tokens = list(continuation_case["prompt_tokens"])
-                target_tokens = list(continuation_case["target_tokens"])
-                if len(prompt_tokens) >= int(config.max_position_embeddings):
-                    raise ValueError(
-                        f"Benchmark prompt exceeds model context for {checkpoint_name}: row_id={case['row_id']}"
+                for continuation_case in _continuation_task_specs_for_case(case):
+                    prompt_tokens = list(continuation_case["prompt_tokens"])
+                    target_tokens = list(continuation_case["target_tokens"])
+                    if len(prompt_tokens) >= int(config.max_position_embeddings):
+                        raise ValueError(
+                            f"Benchmark prompt exceeds model context for {checkpoint_name}: row_id={case['row_id']}"
+                        )
+
+                    dyn_max_new = min(int(args.max_new_tokens), int(config.max_position_embeddings) - len(prompt_tokens))
+                    raw_generated_tokens, raw_reached_eos, _ = generate_continuation_tokens_fn(
+                        model=model,
+                        torch_mod=torch,
+                        prompt_tokens=prompt_tokens,
+                        token_to_id=token_to_id,
+                        id_to_token=id_to_token,
+                        grammar_fsm=None,
+                        device=device,
+                        use_amp=use_amp,
+                        amp_dtype=amp_dtype,
+                        autocast_context_fn=autocast_context_fn,
+                        max_positions=int(config.max_position_embeddings),
+                        max_new_tokens=dyn_max_new,
+                        temperature=float(getattr(args, "temperature", 0.0)),
+                        top_p=float(getattr(args, "top_p", 1.0)),
                     )
-
-                dyn_max_new = min(int(args.max_new_tokens), int(config.max_position_embeddings) - len(prompt_tokens))
-                raw_generated_tokens, raw_reached_eos, _ = generate_continuation_tokens_fn(
-                    model=model,
-                    torch_mod=torch,
-                    prompt_tokens=prompt_tokens,
-                    token_to_id=token_to_id,
-                    id_to_token=id_to_token,
-                    grammar_fsm=None,
-                    device=device,
-                    use_amp=use_amp,
-                    amp_dtype=amp_dtype,
-                    autocast_context_fn=autocast_context_fn,
-                    max_positions=int(config.max_position_embeddings),
-                    max_new_tokens=dyn_max_new,
-                    temperature=float(getattr(args, "temperature", 0.0)),
-                    top_p=float(getattr(args, "top_p", 1.0)),
-                )
-                fsm_generated_tokens, fsm_reached_eos, fsm_stats = generate_continuation_tokens_fn(
-                    model=model,
-                    torch_mod=torch,
-                    prompt_tokens=prompt_tokens,
-                    token_to_id=token_to_id,
-                    id_to_token=id_to_token,
-                    grammar_fsm=grammar_fsm,
-                    device=device,
-                    use_amp=use_amp,
-                    amp_dtype=amp_dtype,
-                    autocast_context_fn=autocast_context_fn,
-                    max_positions=int(config.max_position_embeddings),
-                    max_new_tokens=dyn_max_new,
-                    temperature=float(getattr(args, "temperature", 0.0)),
-                    top_p=float(getattr(args, "top_p", 1.0)),
-                )
-                raw_record = build_continuation_trace_fn(
-                    prompt_tokens=prompt_tokens,
-                    target_tokens=target_tokens,
-                    generated_tokens=raw_generated_tokens,
-                    reached_eos=raw_reached_eos,
-                    source_tokens=continuation_case["window_tokens"],
-                    grammar_fsm=grammar_fsm,
-                    extra_fields={
-                        "budget_stop": (not raw_reached_eos and len(raw_generated_tokens) >= dyn_max_new),
-                        "auto_closed_with_eos": False,
-                    },
-                )
-                fsm_record = build_continuation_trace_fn(
-                    prompt_tokens=prompt_tokens,
-                    target_tokens=target_tokens,
-                    generated_tokens=fsm_generated_tokens,
-                    reached_eos=fsm_reached_eos,
-                    source_tokens=continuation_case["window_tokens"],
-                    grammar_fsm=grammar_fsm,
-                    extra_fields={
-                        "decoding_step_count": int(fsm_stats["step_count"]),
-                        "illegal_top1_count": int(fsm_stats["illegal_top1_count"]),
-                        "mask_intervention_count": int(fsm_stats["mask_intervention_count"]),
-                        "legal_mass_mean": (
-                            float(fsm_stats["legal_mass_sum"]) / float(fsm_stats["step_count"])
-                            if int(fsm_stats["step_count"]) > 0
-                            else float("nan")
-                        ),
-                        "dead_end_count": int(fsm_stats["dead_end_count"]),
-                        "budget_stop": (not fsm_reached_eos and len(fsm_generated_tokens) >= dyn_max_new),
-                        "auto_closed_with_eos": bool(int(fsm_stats.get("auto_close_count", 0)) > 0),
-                    },
-                )
-                raw_record = enrich_continuation_record(raw_record, target_tokens=target_tokens)
-                fsm_record = enrich_continuation_record(fsm_record, target_tokens=target_tokens)
-
-                continuation_attempted += 1
-                continuation_stop_success += int(bool(raw_record["stop_success"]))
-                continuation_structural_valid += int(bool(raw_record["structural_match_without_eos"]))
-                continuation_time_order_valid += int(bool(raw_record["time_order_valid"]))
-                continuation_budget_stop += int(bool(raw_record["budget_stop"]))
-                continuation_append_eos_recoverable += int(
-                    (not bool(raw_record["reached_eos"])) and bool(raw_record["append_eos_would_validate"])
-                )
-                continuation_missing_eos += int(not bool(raw_record["reached_eos"]))
-                continuation_syntax_invalid += int(not bool(raw_record["append_eos_would_validate"]))
-                if raw_record.get("first_unit_match") is not None:
-                    continuation_first_event_total += 1
-                    continuation_first_event_hits += int(bool(raw_record["first_unit_match"]))
-                continuation_empty_bar_rates.append(float(raw_record["empty_bar_rate"]))
-                continuation_low_density_rates.append(float(raw_record["low_density_bar_rate"]))
-                continuation_multi_empty_runs += int(bool(raw_record["has_multi_empty_bar_run"]))
-                continuation_bar_deltas.append(float(raw_record["generated_bar_delta"]))
-                continuation_event_deltas.append(float(raw_record["generated_event_delta"]))
-                continuation_pitch_span_deltas.append(float(raw_record["pitch_span_delta"]))
-                continuation_onset_position_l1.append(float(raw_record["onset_position_l1_distance"]))
-                continuation_duration_l1.append(float(raw_record["duration_bin_l1_distance"]))
-                _append_if_finite(
-                    continuation_same_pitch_overlap_rates,
-                    raw_record.get("same_pitch_overlap_rate"),
-                )
-                pitch_metric_present = False
-                pitch_metric_present = _append_if_finite(
-                    continuation_most_common_pitch_ratios,
-                    raw_record.get("most_common_pitch_ratio"),
-                ) or pitch_metric_present
-                pitch_metric_present = _append_if_finite(
-                    continuation_longest_same_pitch_run_ratios,
-                    raw_record.get("longest_same_pitch_run_ratio"),
-                ) or pitch_metric_present
-                pitch_metric_present = _append_if_finite(
-                    continuation_pitch_diversity_scores,
-                    raw_record.get("pitch_diversity_score"),
-                ) or pitch_metric_present
-                continuation_pitch_collapse_valid += int(pitch_metric_present)
-                rhythm_metric_present = False
-                rhythm_metric_present = _append_if_finite(
-                    continuation_onset_position_entropies,
-                    raw_record.get("onset_position_entropy"),
-                ) or rhythm_metric_present
-                rhythm_metric_present = _append_if_finite(
-                    continuation_bar_start_onset_ratios,
-                    raw_record.get("bar_start_onset_ratio"),
-                ) or rhythm_metric_present
-                rhythm_metric_present = _append_if_finite(
-                    continuation_strong_beat_onset_ratios,
-                    raw_record.get("strong_beat_onset_ratio"),
-                ) or rhythm_metric_present
-                rhythm_metric_present = _append_if_finite(
-                    continuation_duration_diversity_scores,
-                    raw_record.get("duration_diversity_score"),
-                ) or rhythm_metric_present
-                rhythm_metric_present = _append_if_finite(
-                    continuation_rhythm_diversity_scores,
-                    raw_record.get("rhythm_diversity_score"),
-                ) or rhythm_metric_present
-                continuation_rhythm_metric_valid += int(rhythm_metric_present)
-                repetition_metric_present = False
-                repetition_metric_present = _append_if_finite(
-                    continuation_event_ngram_repeat_ratios,
-                    raw_record.get("event_ngram_repeat_ratio"),
-                ) or repetition_metric_present
-                repetition_metric_present = _append_if_finite(
-                    continuation_rhythm_ngram_repeat_ratios,
-                    raw_record.get("rhythm_ngram_repeat_ratio"),
-                ) or repetition_metric_present
-                continuation_repetition_metric_valid += int(repetition_metric_present)
-                continuation_failure_reason_counts[str(raw_record["failure_reason"])] += 1
-                continuation_syntax_reason_counts[str(raw_record["syntax_reason"])] += 1
-
-                fsm_cont_structural_valid += int(bool(fsm_record["structural_match_without_eos"]))
-                fsm_cont_time_order_valid += int(bool(fsm_record["time_order_valid"]))
-                fsm_illegal_top1_count += int(fsm_stats["illegal_top1_count"])
-                fsm_mask_intervention_count += int(fsm_stats["mask_intervention_count"])
-                fsm_decoding_step_count += int(fsm_stats["step_count"])
-                fsm_dead_end_count += int(fsm_stats["dead_end_count"])
-                fsm_legal_mass_sum += float(fsm_stats["legal_mass_sum"])
-
-                if capture_row_ids is not None and int(case["row_id"]) in capture_row_ids:
-                    # 只抓固定 case 作为样本产物，避免为了导出样本再多跑一轮 benchmark。
-                    capture_samples["continuation"].append(
-                        _case_sample_payload(case, raw_record, fsm_record, task="continuation")
+                    fsm_generated_tokens, fsm_reached_eos, fsm_stats = generate_continuation_tokens_fn(
+                        model=model,
+                        torch_mod=torch,
+                        prompt_tokens=prompt_tokens,
+                        token_to_id=token_to_id,
+                        id_to_token=id_to_token,
+                        grammar_fsm=grammar_fsm,
+                        device=device,
+                        use_amp=use_amp,
+                        amp_dtype=amp_dtype,
+                        autocast_context_fn=autocast_context_fn,
+                        max_positions=int(config.max_position_embeddings),
+                        max_new_tokens=dyn_max_new,
+                        temperature=float(getattr(args, "temperature", 0.0)),
+                        top_p=float(getattr(args, "top_p", 1.0)),
                     )
+                    raw_record = build_continuation_trace_fn(
+                        prompt_tokens=prompt_tokens,
+                        target_tokens=target_tokens,
+                        generated_tokens=raw_generated_tokens,
+                        reached_eos=raw_reached_eos,
+                        source_tokens=continuation_case["window_tokens"],
+                        grammar_fsm=grammar_fsm,
+                        extra_fields={
+                            "budget_stop": (not raw_reached_eos and len(raw_generated_tokens) >= dyn_max_new),
+                            "auto_closed_with_eos": False,
+                        },
+                    )
+                    fsm_record = build_continuation_trace_fn(
+                        prompt_tokens=prompt_tokens,
+                        target_tokens=target_tokens,
+                        generated_tokens=fsm_generated_tokens,
+                        reached_eos=fsm_reached_eos,
+                        source_tokens=continuation_case["window_tokens"],
+                        grammar_fsm=grammar_fsm,
+                        extra_fields={
+                            "decoding_step_count": int(fsm_stats["step_count"]),
+                            "illegal_top1_count": int(fsm_stats["illegal_top1_count"]),
+                            "mask_intervention_count": int(fsm_stats["mask_intervention_count"]),
+                            "legal_mass_mean": (
+                                float(fsm_stats["legal_mass_sum"]) / float(fsm_stats["step_count"])
+                                if int(fsm_stats["step_count"]) > 0
+                                else float("nan")
+                            ),
+                            "dead_end_count": int(fsm_stats["dead_end_count"]),
+                            "budget_stop": (not fsm_reached_eos and len(fsm_generated_tokens) >= dyn_max_new),
+                            "auto_closed_with_eos": bool(int(fsm_stats.get("auto_close_count", 0)) > 0),
+                        },
+                    )
+                    raw_record = enrich_continuation_record(raw_record, target_tokens=target_tokens)
+                    fsm_record = enrich_continuation_record(fsm_record, target_tokens=target_tokens)
+
+                    continuation_attempted += 1
+                    continuation_stop_success += int(bool(raw_record["stop_success"]))
+                    continuation_structural_valid += int(bool(raw_record["structural_match_without_eos"]))
+                    continuation_time_order_valid += int(bool(raw_record["time_order_valid"]))
+                    continuation_budget_stop += int(bool(raw_record["budget_stop"]))
+                    continuation_append_eos_recoverable += int(
+                        (not bool(raw_record["reached_eos"])) and bool(raw_record["append_eos_would_validate"])
+                    )
+                    continuation_missing_eos += int(not bool(raw_record["reached_eos"]))
+                    continuation_syntax_invalid += int(not bool(raw_record["append_eos_would_validate"]))
+                    if raw_record.get("first_unit_match") is not None:
+                        continuation_first_event_total += 1
+                        continuation_first_event_hits += int(bool(raw_record["first_unit_match"]))
+                    continuation_empty_bar_rates.append(float(raw_record["empty_bar_rate"]))
+                    continuation_low_density_rates.append(float(raw_record["low_density_bar_rate"]))
+                    continuation_multi_empty_runs += int(bool(raw_record["has_multi_empty_bar_run"]))
+                    continuation_bar_deltas.append(float(raw_record["generated_bar_delta"]))
+                    continuation_event_deltas.append(float(raw_record["generated_event_delta"]))
+                    continuation_pitch_span_deltas.append(float(raw_record["pitch_span_delta"]))
+                    continuation_onset_position_l1.append(float(raw_record["onset_position_l1_distance"]))
+                    continuation_duration_l1.append(float(raw_record["duration_bin_l1_distance"]))
+                    _append_if_finite(
+                        continuation_same_pitch_overlap_rates,
+                        raw_record.get("same_pitch_overlap_rate"),
+                    )
+                    pitch_metric_present = False
+                    pitch_metric_present = _append_if_finite(
+                        continuation_most_common_pitch_ratios,
+                        raw_record.get("most_common_pitch_ratio"),
+                    ) or pitch_metric_present
+                    pitch_metric_present = _append_if_finite(
+                        continuation_longest_same_pitch_run_ratios,
+                        raw_record.get("longest_same_pitch_run_ratio"),
+                    ) or pitch_metric_present
+                    pitch_metric_present = _append_if_finite(
+                        continuation_pitch_diversity_scores,
+                        raw_record.get("pitch_diversity_score"),
+                    ) or pitch_metric_present
+                    continuation_pitch_collapse_valid += int(pitch_metric_present)
+                    rhythm_metric_present = False
+                    rhythm_metric_present = _append_if_finite(
+                        continuation_onset_position_entropies,
+                        raw_record.get("onset_position_entropy"),
+                    ) or rhythm_metric_present
+                    rhythm_metric_present = _append_if_finite(
+                        continuation_bar_start_onset_ratios,
+                        raw_record.get("bar_start_onset_ratio"),
+                    ) or rhythm_metric_present
+                    rhythm_metric_present = _append_if_finite(
+                        continuation_strong_beat_onset_ratios,
+                        raw_record.get("strong_beat_onset_ratio"),
+                    ) or rhythm_metric_present
+                    rhythm_metric_present = _append_if_finite(
+                        continuation_duration_diversity_scores,
+                        raw_record.get("duration_diversity_score"),
+                    ) or rhythm_metric_present
+                    rhythm_metric_present = _append_if_finite(
+                        continuation_rhythm_diversity_scores,
+                        raw_record.get("rhythm_diversity_score"),
+                    ) or rhythm_metric_present
+                    continuation_rhythm_metric_valid += int(rhythm_metric_present)
+                    repetition_metric_present = False
+                    repetition_metric_present = _append_if_finite(
+                        continuation_event_ngram_repeat_ratios,
+                        raw_record.get("event_ngram_repeat_ratio"),
+                    ) or repetition_metric_present
+                    repetition_metric_present = _append_if_finite(
+                        continuation_rhythm_ngram_repeat_ratios,
+                        raw_record.get("rhythm_ngram_repeat_ratio"),
+                    ) or repetition_metric_present
+                    continuation_repetition_metric_valid += int(repetition_metric_present)
+
+                    task_name = str(continuation_case["task_name"])
+                    if task_name == "structure_control":
+                        structure_control_attempted += 1
+                        structure_control_record = enrich_structure_control_record(
+                            raw_record,
+                            target_tokens=target_tokens,
+                        )
+                        structure_control_boundary_type_hits += int(bool(structure_control_record["boundary_type_hit"]))
+                        structure_control_boundary_timing_hits += int(
+                            bool(structure_control_record["boundary_timing_hit"])
+                        )
+                        structure_control_post_boundary_realization_scores.append(
+                            float(structure_control_record["post_boundary_realization_score"])
+                        )
+                    elif task_name == "local_development":
+                        local_development_attempted += 1
+                        local_development_record = enrich_local_development_record(
+                            raw_record,
+                            target_tokens=target_tokens,
+                        )
+                        local_development_motif_relation_hits += int(
+                            bool(local_development_record["motif_relation_hit"])
+                        )
+                        local_development_copy_overuse_penalties.append(
+                            float(local_development_record["copy_overuse_penalty"])
+                        )
+                        local_development_unrelated_drift_penalties.append(
+                            float(local_development_record["unrelated_drift_penalty"])
+                        )
+                        local_development_quality_scores.append(float(local_development_record["quality_score"]))
+                    elif task_name == "long_context_coherence":
+                        long_context_attempted += 1
+                        long_context_record = enrich_long_context_record(
+                            raw_record,
+                            target_tokens=target_tokens,
+                        )
+                        long_context_completion_hits += int(bool(long_context_record["completion_rate"]))
+                        long_context_theme_retention_scores.append(
+                            float(long_context_record["theme_retention_score"])
+                        )
+                        long_context_section_continuity_scores.append(
+                            float(long_context_record["section_continuity_score"])
+                        )
+                        long_context_degeneration_penalties.append(float(long_context_record["degeneration_penalty"]))
+                    else:
+                        raise ValueError(f"Unsupported continuation benchmark task_name: {task_name}")
+
+                    continuation_failure_reason_counts[str(raw_record["failure_reason"])] += 1
+                    continuation_syntax_reason_counts[str(raw_record["syntax_reason"])] += 1
+
+                    fsm_cont_structural_valid += int(bool(fsm_record["structural_match_without_eos"]))
+                    fsm_cont_time_order_valid += int(bool(fsm_record["time_order_valid"]))
+                    fsm_illegal_top1_count += int(fsm_stats["illegal_top1_count"])
+                    fsm_mask_intervention_count += int(fsm_stats["mask_intervention_count"])
+                    fsm_decoding_step_count += int(fsm_stats["step_count"])
+                    fsm_dead_end_count += int(fsm_stats["dead_end_count"])
+                    fsm_legal_mass_sum += float(fsm_stats["legal_mass_sum"])
+
+                    if capture_row_ids is not None and int(case["row_id"]) in capture_row_ids:
+                        # 只抓固定 case 作为样本产物，避免为了导出样本再多跑一轮 benchmark。
+                        capture_samples["continuation"].append(
+                            _case_sample_payload(
+                                case,
+                                raw_record,
+                                fsm_record,
+                                task="continuation",
+                                case_payload=continuation_case,
+                                task_variant=task_name,
+                            )
+                        )
 
             if run_infilling:
-                infilling_case = dict(case["infilling_case"])
+                infilling_case = _infilling_task_spec_for_case(case)
                 prompt_tokens = list(infilling_case["prompt_tokens"])
                 prefix_tokens = list(infilling_case["prefix_tokens"])
                 suffix_tokens = list(infilling_case["suffix_tokens"])
@@ -1022,6 +1278,10 @@ def _evaluate_checkpoint_on_manifest(
                 )
                 raw_infill_record = enrich_infilling_record(raw_infill_record, target_hole_tokens=target_hole_tokens)
                 fsm_infill_record = enrich_infilling_record(fsm_infill_record, target_hole_tokens=target_hole_tokens)
+                infilling_consistency_record = enrich_infilling_consistency_record(
+                    raw_infill_record,
+                    target_hole_tokens=target_hole_tokens,
+                )
 
                 infilling_attempted += 1
                 infilling_structural_valid += int(bool(raw_infill_record["is_structurally_valid"]))
@@ -1080,6 +1340,19 @@ def _evaluate_checkpoint_on_manifest(
                     raw_infill_record.get("rhythm_ngram_repeat_ratio"),
                 ) or repetition_metric_present
                 infilling_repetition_metric_valid += int(repetition_metric_present)
+                infilling_bridge_validity_hits += int(bool(infilling_consistency_record["bridge_validity"]))
+                infilling_boundary_compatibility_hits += int(
+                    bool(infilling_consistency_record["boundary_compatibility_hit"])
+                )
+                infilling_rhythmic_connection_scores.append(
+                    float(infilling_consistency_record["rhythmic_connection_score"])
+                )
+                infilling_pitch_connection_scores.append(
+                    float(infilling_consistency_record["pitch_connection_score"])
+                )
+                infilling_structural_fit_scores.append(
+                    float(infilling_consistency_record["structural_fit_score"])
+                )
                 infilling_failure_reason_counts[str(raw_infill_record["failure_reason"])] += 1
                 infilling_syntax_reason_counts[str(raw_infill_record["syntax_reason"])] += 1
                 fsm_infill_structural_valid += int(bool(fsm_infill_record["is_structurally_valid"]))
@@ -1093,7 +1366,14 @@ def _evaluate_checkpoint_on_manifest(
                 if capture_row_ids is not None and int(case["row_id"]) in capture_row_ids:
                     # infilling 样本同样直接在主评估过程中顺手采集。
                     capture_samples["infilling"].append(
-                        _case_sample_payload(case, raw_infill_record, fsm_infill_record, task="infilling")
+                        _case_sample_payload(
+                            case,
+                            raw_infill_record,
+                            fsm_infill_record,
+                            task="infilling",
+                            case_payload=infilling_case,
+                            task_variant=str(infilling_case["task_name"]),
+                        )
                     )
     finally:
         del model
@@ -1153,6 +1433,32 @@ def _evaluate_checkpoint_on_manifest(
             continuation_repetition_metric_valid,
             continuation_attempted,
         ),
+        "structure_control_boundary_type_hit_rate": _safe_rate(
+            structure_control_boundary_type_hits,
+            structure_control_attempted,
+        ),
+        "structure_control_boundary_timing_hit_rate": _safe_rate(
+            structure_control_boundary_timing_hits,
+            structure_control_attempted,
+        ),
+        "structure_control_post_boundary_realization_score": _safe_mean(
+            structure_control_post_boundary_realization_scores
+        ),
+        "local_development_motif_relation_hit_rate": _safe_rate(
+            local_development_motif_relation_hits,
+            local_development_attempted,
+        ),
+        "local_development_copy_overuse_penalty": _safe_mean(
+            local_development_copy_overuse_penalties
+        ),
+        "local_development_unrelated_drift_penalty": _safe_mean(
+            local_development_unrelated_drift_penalties
+        ),
+        "local_development_quality_score": _safe_mean(local_development_quality_scores),
+        "long_context_completion_rate": _safe_rate(long_context_completion_hits, long_context_attempted),
+        "long_context_theme_retention_score": _safe_mean(long_context_theme_retention_scores),
+        "long_context_section_continuity_score": _safe_mean(long_context_section_continuity_scores),
+        "long_context_degeneration_penalty": _safe_mean(long_context_degeneration_penalties),
         "infilling_most_common_pitch_ratio": _safe_mean(infilling_most_common_pitch_ratios),
         "infilling_longest_same_pitch_run_ratio": _safe_mean(infilling_longest_same_pitch_run_ratios),
         "infilling_pitch_diversity_score": _safe_mean(infilling_pitch_diversity_scores),
@@ -1170,6 +1476,17 @@ def _evaluate_checkpoint_on_manifest(
             infilling_repetition_metric_valid,
             infilling_attempted,
         ),
+        "infilling_bridge_validity_rate": _safe_rate(
+            infilling_bridge_validity_hits,
+            infilling_attempted,
+        ),
+        "infilling_boundary_compatibility_hit_rate": _safe_rate(
+            infilling_boundary_compatibility_hits,
+            infilling_attempted,
+        ),
+        "infilling_rhythmic_connection_score": _safe_mean(infilling_rhythmic_connection_scores),
+        "infilling_pitch_connection_score": _safe_mean(infilling_pitch_connection_scores),
+        "infilling_structural_fit_score": _safe_mean(infilling_structural_fit_scores),
         "overall_most_common_pitch_ratio": _safe_mean(
             continuation_most_common_pitch_ratios + infilling_most_common_pitch_ratios
         ),
@@ -1782,6 +2099,8 @@ def _build_summary_markdown(
 _PERCENT_METRICS_V2 = {
     "balanced_score",
     "balanced_score_coverage",
+    "task_capability_score_coverage",
+    "vs_baseline_win_rate",
     "continuation_stop_success_rate",
     "continuation_budget_stop_rate",
     "continuation_structural_validity_rate",
@@ -1848,6 +2167,15 @@ _METRIC_LABELS_V2 = {
     "evaluation_tier": "评估层级",
     "balanced_rank": "相对排名",
     "balanced_score": "相对分",
+    "task_capability_score": "任务型能力分",
+    "task_capability_score_coverage": "任务型能力分覆盖率",
+    "task_control_score": "任务控制分",
+    "task_realization_score": "音乐实现分",
+    "structure_control_score": "结构控制能力",
+    "local_development_score": "局部发展能力",
+    "long_context_coherence_score": "长程连贯能力",
+    "infilling_consistency_score": "补全一致性能力",
+    "vs_baseline_win_rate": "基线胜率",
     "absolute_score": "绝对分",
     "absolute_score_coverage": "绝对分覆盖率",
     "continuation_closure_score": "续写收束",
@@ -2019,12 +2347,17 @@ def _core_metric_specs_v2(task_scope: str) -> list[tuple[str, str]]:
         ("balanced_rank", "排名"),
         ("checkpoint_name", "Checkpoint"),
         ("evaluation_tier", "评估层级"),
-        ("balanced_score", "相对分"),
-        ("absolute_score", "绝对分"),
+        ("task_capability_score", "任务型能力分"),
+        ("vs_baseline_win_rate", "基线胜率"),
+        ("task_control_score", "任务控制分"),
+        ("task_realization_score", "音乐实现分"),
     ]
     if task_scope == "continuation":
         return [
             *base,
+            ("structure_control_score", "结构控制能力"),
+            ("local_development_score", "局部发展能力"),
+            ("long_context_coherence_score", "长程连贯能力"),
             ("continuation_closure_score", "续写收束"),
             ("continuation_structure_score", "续写结构"),
             ("musical_expression_score", "音乐表达力"),
@@ -2034,6 +2367,7 @@ def _core_metric_specs_v2(task_scope: str) -> list[tuple[str, str]]:
     if task_scope == "infilling":
         return [
             *base,
+            ("infilling_consistency_score", "补全一致性能力"),
             ("infilling_integrity_score", "补全完整性"),
             ("phrase_coherence_score", "乐句连贯性"),
             ("musical_expression_score", "音乐表达力"),
@@ -2218,62 +2552,58 @@ def _plot_metric_specs_v2(task_scope: str, *, diagnostics: bool) -> list[dict[st
         ]
     if task_scope == "continuation":
         return [
-            {"key": "balanced_score", "label": "相对分", "goal": "max", "color": "#111827"},
-            {"key": "absolute_score", "label": "绝对分", "goal": "max", "color": "#1d4ed8"},
-            {"key": "continuation_closure_score", "label": "续写收束", "goal": "max", "color": "#2563eb"},
-            {"key": "continuation_structure_score", "label": "续写结构", "goal": "max", "color": "#16a34a"},
-            {"key": "musical_expression_score", "label": "音乐表达力", "goal": "max", "color": "#ea580c"},
-            {"key": "long_context_stability_score", "label": "长上下文稳定性", "goal": "max", "color": "#7c3aed"},
+            {"key": "task_capability_score", "label": "任务型能力分", "goal": "max", "color": "#111827"},
+            {"key": "vs_baseline_win_rate", "label": "基线胜率", "percent": True, "goal": "max", "color": "#1d4ed8"},
+            {"key": "task_control_score", "label": "任务控制分", "goal": "max", "color": "#2563eb"},
+            {"key": "task_realization_score", "label": "音乐实现分", "goal": "max", "color": "#16a34a"},
+            {"key": "structure_control_score", "label": "结构控制能力", "goal": "max", "color": "#ea580c"},
+            {"key": "local_development_score", "label": "局部发展能力", "goal": "max", "color": "#7c3aed"},
         ]
     if task_scope == "infilling":
         return [
-            {"key": "balanced_score", "label": "相对分", "goal": "max", "color": "#111827"},
-            {"key": "absolute_score", "label": "绝对分", "goal": "max", "color": "#1d4ed8"},
-            {"key": "infilling_integrity_score", "label": "补全完整性", "goal": "max", "color": "#2563eb"},
-            {"key": "phrase_coherence_score", "label": "乐句连贯性", "goal": "max", "color": "#16a34a"},
-            {"key": "musical_expression_score", "label": "音乐表达力", "goal": "max", "color": "#ea580c"},
-            {"key": "training_health_score", "label": "训练健康度", "goal": "max", "color": "#7c3aed"},
+            {"key": "task_capability_score", "label": "任务型能力分", "goal": "max", "color": "#111827"},
+            {"key": "vs_baseline_win_rate", "label": "基线胜率", "percent": True, "goal": "max", "color": "#1d4ed8"},
+            {"key": "task_control_score", "label": "任务控制分", "goal": "max", "color": "#2563eb"},
+            {"key": "task_realization_score", "label": "音乐实现分", "goal": "max", "color": "#16a34a"},
+            {"key": "infilling_consistency_score", "label": "补全一致性能力", "goal": "max", "color": "#7c3aed"},
         ]
     return [
-        {"key": "balanced_score", "label": "相对分", "goal": "max", "color": "#111827"},
-        {"key": "absolute_score", "label": "绝对分", "goal": "max", "color": "#1d4ed8"},
-        {"key": "continuation_closure_score", "label": "续写收束", "goal": "max", "color": "#2563eb"},
-        {"key": "continuation_structure_score", "label": "续写结构", "goal": "max", "color": "#16a34a"},
-        {"key": "infilling_integrity_score", "label": "补全完整性", "goal": "max", "color": "#0891b2"},
-        {"key": "phrase_coherence_score", "label": "乐句连贯性", "goal": "max", "color": "#ea580c"},
-        {"key": "musical_expression_score", "label": "音乐表达力", "goal": "max", "color": "#dc2626"},
-        {"key": "long_context_stability_score", "label": "长上下文稳定性", "goal": "max", "color": "#7c3aed"},
+        {"key": "task_capability_score", "label": "任务型能力分", "goal": "max", "color": "#111827"},
+        {"key": "vs_baseline_win_rate", "label": "基线胜率", "percent": True, "goal": "max", "color": "#1d4ed8"},
+        {"key": "task_control_score", "label": "任务控制分", "goal": "max", "color": "#2563eb"},
+        {"key": "task_realization_score", "label": "音乐实现分", "goal": "max", "color": "#16a34a"},
+        {"key": "structure_control_score", "label": "结构控制能力", "goal": "max", "color": "#0891b2"},
+        {"key": "local_development_score", "label": "局部发展能力", "goal": "max", "color": "#ea580c"},
+        {"key": "long_context_coherence_score", "label": "长程连贯能力", "goal": "max", "color": "#dc2626"},
+        {"key": "infilling_consistency_score", "label": "补全一致性能力", "goal": "max", "color": "#7c3aed"},
     ]
 
 
 def _absolute_plot_metric_specs_v2(task_scope: str) -> list[dict[str, Any]]:
     if task_scope == "continuation":
         return [
-            {"key": "absolute_score", "label": "绝对分", "goal": "max", "color": "#1d4ed8"},
-            {"key": "continuation_closure_score", "label": "续写收束", "goal": "max", "color": "#2563eb"},
-            {"key": "continuation_structure_score", "label": "续写结构", "goal": "max", "color": "#16a34a"},
-            {"key": "musical_expression_score", "label": "音乐表达力", "goal": "max", "color": "#ea580c"},
-            {"key": "long_context_stability_score", "label": "长上下文稳定性", "goal": "max", "color": "#7c3aed"},
-            {"key": "training_health_score", "label": "训练健康度", "goal": "max", "color": "#ea580c"},
+            {"key": "task_capability_score", "label": "任务型能力分", "goal": "max", "color": "#1d4ed8"},
+            {"key": "task_control_score", "label": "任务控制分", "goal": "max", "color": "#2563eb"},
+            {"key": "task_realization_score", "label": "音乐实现分", "goal": "max", "color": "#16a34a"},
+            {"key": "structure_control_score", "label": "结构控制能力", "goal": "max", "color": "#ea580c"},
+            {"key": "local_development_score", "label": "局部发展能力", "goal": "max", "color": "#7c3aed"},
+            {"key": "long_context_coherence_score", "label": "长程连贯能力", "goal": "max", "color": "#0f766e"},
         ]
     if task_scope == "infilling":
         return [
-            {"key": "absolute_score", "label": "绝对分", "goal": "max", "color": "#1d4ed8"},
-            {"key": "infilling_integrity_score", "label": "补全完整性", "goal": "max", "color": "#2563eb"},
-            {"key": "phrase_coherence_score", "label": "乐句连贯性", "goal": "max", "color": "#16a34a"},
-            {"key": "musical_expression_score", "label": "音乐表达力", "goal": "max", "color": "#ea580c"},
-            {"key": "long_context_stability_score", "label": "长上下文稳定性", "goal": "max", "color": "#7c3aed"},
-            {"key": "training_health_score", "label": "训练健康度", "goal": "max", "color": "#ea580c"},
+            {"key": "task_capability_score", "label": "任务型能力分", "goal": "max", "color": "#1d4ed8"},
+            {"key": "task_control_score", "label": "任务控制分", "goal": "max", "color": "#2563eb"},
+            {"key": "task_realization_score", "label": "音乐实现分", "goal": "max", "color": "#16a34a"},
+            {"key": "infilling_consistency_score", "label": "补全一致性能力", "goal": "max", "color": "#ea580c"},
         ]
     return [
-        {"key": "absolute_score", "label": "绝对分", "goal": "max", "color": "#1d4ed8"},
-        {"key": "continuation_closure_score", "label": "续写收束", "goal": "max", "color": "#2563eb"},
-        {"key": "continuation_structure_score", "label": "续写结构", "goal": "max", "color": "#16a34a"},
-        {"key": "infilling_integrity_score", "label": "补全完整性", "goal": "max", "color": "#0891b2"},
-        {"key": "phrase_coherence_score", "label": "乐句连贯性", "goal": "max", "color": "#ea580c"},
-        {"key": "musical_expression_score", "label": "音乐表达力", "goal": "max", "color": "#dc2626"},
-        {"key": "long_context_stability_score", "label": "长上下文稳定性", "goal": "max", "color": "#7c3aed"},
-        {"key": "training_health_score", "label": "训练健康度", "goal": "max", "color": "#b45309"},
+        {"key": "task_capability_score", "label": "任务型能力分", "goal": "max", "color": "#1d4ed8"},
+        {"key": "task_control_score", "label": "任务控制分", "goal": "max", "color": "#2563eb"},
+        {"key": "task_realization_score", "label": "音乐实现分", "goal": "max", "color": "#16a34a"},
+        {"key": "structure_control_score", "label": "结构控制能力", "goal": "max", "color": "#0891b2"},
+        {"key": "local_development_score", "label": "局部发展能力", "goal": "max", "color": "#ea580c"},
+        {"key": "long_context_coherence_score", "label": "长程连贯能力", "goal": "max", "color": "#dc2626"},
+        {"key": "infilling_consistency_score", "label": "补全一致性能力", "goal": "max", "color": "#7c3aed"},
     ]
 
 
@@ -2657,11 +2987,11 @@ def _build_summary_markdown_v3(
         [
             "## 评分说明",
             "",
-            "- `balanced_score` 是相对分，只在当前 leaderboard 内部有效。",
-            "- `absolute_score` 是固定 0-100 标尺下的能力分，适合跨 run 追踪。",
-            "- `fast` leaderboard 只用于 checkpoint 预筛选与趋势观察。",
-            "- 最终推荐和 `samples/final_top3/` 现在只来自 `formal` leaderboard。",
-            "- 排序会保留结构门槛，并加入贴合度与重复度指标，尽量避免保守但重复的推荐。",
+            "- `task_capability_score` 是当前 benchmark 的主分，用于 fast/formal 排序与最终推荐。",
+            "- `vs_baseline_win_rate` 是任务维度对战率代理：综合 benchmark 会按 7 个任务字段逐项和基线比较；scope-specific 报告则只对当前可比较的任务字段取均值。未显式指定基线时，fast/formal 各自默认取本阶段结果里 step 最小的 checkpoint。",
+            "- `task_control_score` 与 `task_realization_score` 用来分别观察任务控制和音乐实现两侧表现。",
+            "- 4 个一级任务分分别对应结构控制、局部发展、长程连贯和补全一致性。",
+            "- 统计型指标、训练健康度和旧相对分字段仅保留为诊断或兼容信息，不再作为主推荐文案。",
             "",
         ]
     )
@@ -2676,9 +3006,14 @@ def _build_summary_markdown_v3(
                 f"- Checkpoint：`{recommended.get('checkpoint_name')}`",
                 f"- Step：{_format_metric_value_v2(recommended.get('step'), key='step')}",
                 f"- 评估层级：{_format_eval_tier_v2(recommended.get('evaluation_tier'))}",
-                f"- 相对分：{_format_metric_value_v2(recommended.get('balanced_score'), key='balanced_score')}",
-                f"- 绝对分：{_format_metric_value_v2(recommended.get('absolute_score'), key='absolute_score')}",
-                f"- 绝对分覆盖率：{_format_metric_value_v2(recommended.get('absolute_score_coverage'), key='absolute_score_coverage')}",
+                f"- 任务型能力分：{_format_metric_value_v2(recommended.get('task_capability_score'), key='task_capability_score')}",
+                f"- 基线胜率：{_format_metric_value_v2(recommended.get('vs_baseline_win_rate'), key='vs_baseline_win_rate')}",
+                f"- 任务控制分：{_format_metric_value_v2(recommended.get('task_control_score'), key='task_control_score')}",
+                f"- 音乐实现分：{_format_metric_value_v2(recommended.get('task_realization_score'), key='task_realization_score')}",
+                f"- 结构控制能力：{_format_metric_value_v2(recommended.get('structure_control_score'), key='structure_control_score')}",
+                f"- 局部发展能力：{_format_metric_value_v2(recommended.get('local_development_score'), key='local_development_score')}",
+                f"- 长程连贯能力：{_format_metric_value_v2(recommended.get('long_context_coherence_score'), key='long_context_coherence_score')}",
+                f"- 补全一致性能力：{_format_metric_value_v2(recommended.get('infilling_consistency_score'), key='infilling_consistency_score')}",
                 f"- 推荐来源：{recommended.get('recommendation_source', 'formal')}",
                 "",
             ]
@@ -2786,9 +3121,12 @@ def _build_summary_markdown_v3(
     lines.extend(_markdown_table_v2([label for _key, label in core_specs], _result_table_rows_v2(top_results, core_specs)))
 
     if recommended is not None:
+        primary_score_breakdown = recommended.get("primary_score_breakdown")
+        if not isinstance(primary_score_breakdown, dict):
+            primary_score_breakdown = recommended.get("task_capability_score_breakdown")
         recommended_dimensions = (
-            dict(recommended.get("absolute_score_breakdown", {}).get("dimensions", {}))
-            if isinstance(recommended.get("absolute_score_breakdown"), dict)
+            dict(primary_score_breakdown.get("dimensions", {}))
+            if isinstance(primary_score_breakdown, dict)
             else {}
         )
         capability_rows: list[list[str]] = []
@@ -2797,14 +3135,15 @@ def _build_summary_markdown_v3(
                 [
                     str(payload.get("label", dimension_key)),
                     _format_metric_value_v2(payload.get("score"), key=dimension_key),
-                    _format_metric_value_v2(payload.get("coverage"), key="absolute_score_coverage"),
+                    _format_metric_value_v2(payload.get("coverage"), key="task_capability_score_coverage"),
                     _format_metric_value_v2(payload.get("weight")),
-                    _format_capability_type_v2(bool(payload.get("proxy"))),
+                    str(payload.get("coverage_semantics", "")),
                 ]
             )
-        lines.extend(["## 推荐 Checkpoint 能力面板", ""])
-        lines.extend(_markdown_table_v2(["维度", "分数", "覆盖率", "权重", "类型"], capability_rows))
+        lines.extend(["## 推荐 Checkpoint 任务型主分拆解", ""])
+        lines.extend(_markdown_table_v2(["维度", "分数", "覆盖率", "权重", "说明"], capability_rows))
 
+        lines.extend(["娴犺濮熼崹瀣╁瘜閸掑棙濯剁憴?", ""])
         gate_rows: list[list[str]] = []
         for metric_key, payload in sorted(recommended.get("gate_details", {}).items()):
             gate_rows.append(
@@ -2820,35 +3159,55 @@ def _build_summary_markdown_v3(
         lines.extend(_markdown_table_v2(["指标", "方向", "阈值", "实际值", "是否通过"], gate_rows))
 
         relative_rows: list[list[str]] = []
-        for metric_key, payload in recommended.get("score_breakdown", {}).items():
+        for tie_breaker in recommended.get("selection_breakdown", {}).get("tie_breakers", []):
+            metric_key = str(tie_breaker.get("metric_key", ""))
             relative_rows.append(
                 [
                     _METRIC_LABELS_V2.get(metric_key, metric_key),
-                    _format_goal_v2(payload.get("goal", "")),
-                    _format_metric_value_v2(payload.get("weight")),
-                    _format_metric_value_v2(payload.get("value"), key=metric_key),
-                    _format_metric_value_v2(payload.get("rank_score")),
-                    _format_metric_value_v2(payload.get("weighted_contribution")),
+                    _format_goal_v2(tie_breaker.get("goal", "")),
+                    _format_metric_value_v2(tie_breaker.get("value"), key=metric_key),
+                    _format_metric_value_v2(recommended.get("primary_score"), key="task_capability_score"),
+                    _format_metric_value_v2(
+                        recommended.get("selection_breakdown", {}).get("primary_score_coverage"),
+                        key="task_capability_score_coverage",
+                    ),
+                    _format_metric_value_v2(
+                        recommended.get("selection_breakdown", {}).get("primary_score_comparison_digits")
+                    ),
                 ]
             )
-        lines.extend(["## 推荐 Checkpoint 相对分拆解", ""])
-        lines.extend(_markdown_table_v2(["指标", "方向", "权重", "原始值", "排序分", "加权贡献"], relative_rows))
+        lines.extend(["## 推荐 Checkpoint 选择排序拆解", ""])
+        lines.extend(_markdown_table_v2(["指标", "方向", "当前值", "主分", "主分覆盖率", "比较精度"], relative_rows))
 
-        absolute_rows: list[list[str]] = []
+        lines.extend(["## 推荐 Checkpoint 任务型子指标预览", ""])
+        task_detail_rows: list[list[str]] = []
+        component_labels = {
+            "control_hit": "控制命中",
+            "music_realization": "音乐实现",
+        }
         for dimension_key, payload in recommended_dimensions.items():
-            for metric_key, metric_payload in dict(payload.get("submetrics", {})).items():
-                absolute_rows.append(
-                    [
-                        str(payload.get("label", dimension_key)),
-                        str(metric_payload.get("label", _METRIC_LABELS_V2.get(metric_key, metric_key))),
-                        _format_metric_value_v2(metric_payload.get("raw_value"), key=metric_key),
-                        _format_metric_value_v2(metric_payload.get("score")),
-                        _format_metric_value_v2(metric_payload.get("weight")),
-                        str(metric_payload.get("status", "")),
-                    ]
-                )
-        lines.extend(["## 推荐 Checkpoint 绝对分拆解", ""])
-        lines.extend(_markdown_table_v2(["维度", "指标", "原始值", "映射分", "权重", "状态"], absolute_rows))
+            for component_key, component_payload in dict(payload.get("submetrics", {})).items():
+                component_label = component_labels.get(component_key, component_key)
+                for metric_key, metric_payload in dict(component_payload.get("submetrics", {})).items():
+                    metric_score = metric_payload.get("normalized_value")
+                    task_detail_rows.append(
+                        [
+                            str(payload.get("label", dimension_key)),
+                            component_label,
+                            str(_METRIC_LABELS_V2.get(metric_key, metric_key)),
+                            _format_metric_value_v2(metric_payload.get("raw_value"), key=metric_key),
+                            _format_metric_value_v2(metric_score),
+                            _format_metric_value_v2(metric_payload.get("weight")),
+                            "missing" if metric_score is None else "ok",
+                        ]
+                    )
+        lines.extend(["## 推荐 Checkpoint 任务型子指标明细", ""])
+        lines.extend(
+            _markdown_table_v2(
+                ["维度", "组件", "指标", "原始值", "映射分", "权重", "状态"],
+                task_detail_rows,
+            )
+        )
 
     lines.extend(["## 图表", ""])
     if plot_artifacts:
@@ -2982,6 +3341,7 @@ def main(*, task_scope: str = "all", argv: list[str] | None = None) -> None:
     from src.utils.checkpoint_selection import score_checkpoint_results
     from src.utils.config_io import dump_json_file
     from src.utils.report_plots import write_eval_report_plot, write_training_metrics_dashboard
+    from src.utils.task_benchmark_scoring import attach_task_capability_scores
     from src.utils.torch_utils import lazy_import_torch, resolve_torch_device
     from src.utils.training_metrics import (
         load_training_metrics,
@@ -3047,12 +3407,14 @@ def main(*, task_scope: str = "all", argv: list[str] | None = None) -> None:
         eval_tok_path=eval_tok_path.resolve(),
         config=fast_config,
         max_positions=int(reference_config.max_position_embeddings),
+        task_scope=task_scope,
     )
     formal_manifest = build_benchmark_manifest(
         eval_jsonl_path=eval_jsonl_path.resolve(),
         eval_tok_path=eval_tok_path.resolve(),
         config=formal_config,
         max_positions=int(reference_config.max_position_embeddings),
+        task_scope=task_scope,
     )
     fast_manifest_name, formal_manifest_name = _artifact_file_names(task_scope)
     fast_manifest_path = benchmark_root / fast_manifest_name
@@ -3107,7 +3469,17 @@ def main(*, task_scope: str = "all", argv: list[str] | None = None) -> None:
         fast_samples_by_checkpoint[str(ckpt_path)] = captured
 
     selection_profile = _TASK_PROFILE_NAMES[task_scope]
+    fast_results = attach_task_capability_scores(fast_results)
     fast_results = attach_absolute_capability_scores(fast_results)
+    baseline_checkpoint_name = _resolve_baseline_checkpoint_name(
+        fast_results,
+        requested_baseline=args.baseline_checkpoint,
+    )
+    fast_results = _attach_baseline_win_rates(
+        fast_results,
+        baseline_checkpoint_name=baseline_checkpoint_name,
+        stage_name="fast",
+    )
     fast_results, fast_selection = score_checkpoint_results(fast_results, profile=selection_profile)
     candidate_rows = fast_selection["leaderboard"][: max(1, int(fast_config["sample_export_top_k"]))]
     candidate_paths = [Path(str(row["checkpoint_path"])) for row in candidate_rows]
@@ -3141,7 +3513,17 @@ def main(*, task_scope: str = "all", argv: list[str] | None = None) -> None:
         )
         formal_results.append(result)
 
+    formal_results = attach_task_capability_scores(formal_results)
     formal_results = attach_absolute_capability_scores(formal_results)
+    baseline_checkpoint_name = _resolve_baseline_checkpoint_name(
+        formal_results,
+        requested_baseline=args.baseline_checkpoint,
+    )
+    formal_results = _attach_baseline_win_rates(
+        formal_results,
+        baseline_checkpoint_name=baseline_checkpoint_name,
+        stage_name="formal",
+    )
     formal_results, formal_selection = score_checkpoint_results(formal_results, profile=selection_profile)
     recommended_source = "formal"
     recommended = formal_selection.get("recommended_checkpoint")
@@ -3195,7 +3577,7 @@ def main(*, task_scope: str = "all", argv: list[str] | None = None) -> None:
     if plot_results:
         core_plot_path = benchmark_root / f"{_TASK_LABELS[task_scope]}_core_metrics.png"
         diagnostic_plot_path = benchmark_root / f"{_TASK_LABELS[task_scope]}_diagnostics.png"
-        absolute_plot_path = benchmark_root / f"{_TASK_LABELS[task_scope]}_absolute_capabilities.png"
+        task_capability_plot_path = benchmark_root / _task_capability_plot_filename(task_scope)
         write_eval_report_plot(
             report_path=report_path,
             report={"run_id": run_id, "results": plot_results},
@@ -3213,13 +3595,13 @@ def main(*, task_scope: str = "all", argv: list[str] | None = None) -> None:
         write_eval_report_plot(
             report_path=report_path,
             report={"run_id": run_id, "results": plot_results},
-            title=f"{_TASK_TITLES[task_scope]} - 绝对能力面板",
+            title=f"{_TASK_TITLES[task_scope]} - 任务型能力面板",
             metric_specs=_absolute_plot_metric_specs_v2(task_scope),
-            chart_path=absolute_plot_path,
+            chart_path=task_capability_plot_path,
         )
         plot_artifacts["核心指标"] = str(core_plot_path)
         plot_artifacts["诊断指标"] = str(diagnostic_plot_path)
-        plot_artifacts["绝对能力面板"] = str(absolute_plot_path)
+        plot_artifacts["任务型能力面板"] = str(task_capability_plot_path)
     if training_metrics_payload.get("train_by_step") or training_metrics_payload.get("eval_by_step"):
         training_plot_path = benchmark_root / f"{_TASK_LABELS[task_scope]}_training_health.png"
         write_training_metrics_dashboard(
@@ -3325,7 +3707,7 @@ def main(*, task_scope: str = "all", argv: list[str] | None = None) -> None:
         print(
             f"[{_TASK_LABELS[task_scope]}] recommended checkpoint -> "
             f"{recommended.get('checkpoint_name')} "
-            f"(step={recommended.get('step')}, score={float(recommended.get('balanced_score', float('nan'))):.4f})"
+            f"(step={recommended.get('step')}, score={float(recommended.get('task_capability_score', float('nan'))):.4f})"
         )
     print(f"[{_TASK_LABELS[task_scope]}] report -> {report_path}")
     print(f"[{_TASK_LABELS[task_scope]}] summary -> {summary_path}")

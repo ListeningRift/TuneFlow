@@ -8,10 +8,14 @@ from typing import Any
 
 _PROFILE_SPECS: dict[str, dict[str, Any]] = {
     "continuation": {
-        "display_name": "Benchmark 续写排序",
+        "primary_score_key": "task_capability_score",
+        "primary_score_coverage_key": "task_capability_score_coverage",
+        "primary_score_comparison_digits": 2,
+        "selection_version": "task_capability_v1",
+        "display_name": "Benchmark 续写任务排序",
         "notes": [
-            "把结构与停止行为作为底线，真正拉开排序的主要是乐句质量、节奏表达与重复控制。",
-            "FSM 可以承担一部分语法约束，因此这里会继续弱化结构分，把排序主导权交给音乐表达代理指标。",
+            "continuation scope 已切到任务型主排序，主分使用 task_capability_score，stop 与结构合法性继续只做 gate。",
+            "续写场景下的任务型拆解重点观察结构控制、局部发展和长程连贯，旧 balanced_score 仅保留为兼容字段。",
         ],
         "gates": [
             {"key": "continuation_stop_success_rate", "goal": "max", "threshold": 0.20},
@@ -37,24 +41,23 @@ _PROFILE_SPECS: dict[str, dict[str, Any]] = {
             {"key": "continuation_rhythm_ngram_repeat_ratio", "weight": 0.05, "goal": "min"},
         ],
         "tie_breakers": [
-            ("phrase_coherence_score", "max"),
-            ("continuation_rhythm_diversity_score", "max"),
-            ("continuation_pitch_diversity_score", "max"),
-            ("long_context_stability_score", "max"),
-            ("continuation_first_event_hit_rate", "max"),
-            ("duration_bin_l1_distance", "min"),
-            ("continuation_event_ngram_repeat_ratio", "min"),
-            ("continuation_same_pitch_overlap_rate", "min"),
-            ("continuation_structural_validity_rate", "max"),
-            ("valid_loss_from_training", "min"),
+            ("vs_baseline_win_rate", "max"),
+            ("task_realization_score", "max"),
+            ("long_context_coherence_score", "max"),
+            ("local_development_score", "max"),
+            ("structure_control_score", "max"),
             ("step", "max"),
         ],
     },
     "infilling": {
-        "display_name": "Benchmark 补全排序",
+        "primary_score_key": "task_capability_score",
+        "primary_score_coverage_key": "task_capability_score_coverage",
+        "primary_score_comparison_digits": 2,
+        "selection_version": "task_capability_v1",
+        "display_name": "Benchmark 补全任务排序",
         "notes": [
-            "补全任务仍保留结构门槛，但门槛通过后应更多比较音乐内容是否自然、有层次、不过度重复。",
-            "FSM 和结构合法率负责兜底，真正排序会把一部分权重转交给节奏、音高和重复度指标。",
+            "infilling scope 已切到任务型主排序，主分使用 task_capability_score，结构合法性继续只做 gate。",
+            "补全场景下的任务型拆解重点观察补全一致性，旧 balanced_score 仅保留为兼容字段。",
         ],
         "gates": [
             {"key": "infilling_structural_validity_rate", "goal": "max", "threshold": 0.60},
@@ -72,16 +75,15 @@ _PROFILE_SPECS: dict[str, dict[str, Any]] = {
             {"key": "infilling_onset_position_l1_distance", "weight": 0.02, "goal": "min"},
         ],
         "tie_breakers": [
-            ("infilling_pitch_diversity_score", "max"),
-            ("infilling_rhythm_diversity_score", "max"),
-            ("infilling_event_ngram_repeat_ratio", "min"),
-            ("infilling_structural_validity_rate", "max"),
-            ("infilling_time_order_validity_rate", "max"),
-            ("valid_loss_from_training", "min"),
+            ("vs_baseline_win_rate", "max"),
+            ("task_realization_score", "max"),
+            ("infilling_consistency_score", "max"),
             ("step", "max"),
         ],
     },
     "overall": {
+        "primary_score_key": "balanced_score",
+        "selection_version": "balanced_v7_expression_first",
         "display_name": "Benchmark 综合排序",
         "notes": [
             "结构主要作为门槛存在，进入可用区间后，排序应更多由乐句连贯性与整体听感主导。",
@@ -132,6 +134,10 @@ _PROFILE_SPECS: dict[str, dict[str, Any]] = {
         ],
     },
     "benchmark_overall": {
+        "primary_score_key": "task_capability_score",
+        "primary_score_coverage_key": "task_capability_score_coverage",
+        "primary_score_comparison_digits": 2,
+        "selection_version": "task_capability_v1",
         "display_name": "Benchmark 综合排序",
         "notes": [
             "结构主要作为门槛存在，进入可用区间后，排序应更多由乐句连贯性与整体听感主导。",
@@ -166,22 +172,21 @@ _PROFILE_SPECS: dict[str, dict[str, Any]] = {
             {"key": "overall_rhythm_ngram_repeat_ratio", "weight": 0.025, "goal": "min"},
         ],
         "tie_breakers": [
-            ("phrase_coherence_score", "max"),
-            ("overall_rhythm_diversity_score", "max"),
-            ("overall_pitch_diversity_score", "max"),
-            ("long_context_stability_score", "max"),
-            ("continuation_first_event_hit_rate", "max"),
-            ("duration_bin_l1_distance", "min"),
-            ("continuation_event_ngram_repeat_ratio", "min"),
-            ("overall_event_ngram_repeat_ratio", "min"),
-            ("overall_same_pitch_overlap_rate", "min"),
-            ("continuation_structural_validity_rate", "max"),
-            ("infilling_structural_validity_rate", "max"),
-            ("valid_loss_from_training", "min"),
+            ("vs_baseline_win_rate", "max"),
+            ("task_realization_score", "max"),
+            ("structure_control_score", "max"),
+            ("local_development_score", "max"),
+            ("long_context_coherence_score", "max"),
+            ("infilling_consistency_score", "max"),
             ("step", "max"),
         ],
     },
 }
+
+_PROFILE_SPECS["benchmark_overall"]["notes"] = [
+    "benchmark_overall 已改为 task-capability 主排序，task_capability_score 是主分，结构指标继续作为门槛。",
+    "task_capability_score_coverage 会参与排序，主分接近时优先选择 coverage 更完整的结果，缺失主分的结果不参与推荐。",
+]
 
 _COMMON_SUMMARY_KEYS = (
     "absolute_score_version",
@@ -258,7 +263,40 @@ _COMMON_SUMMARY_KEYS = (
     "fsm_mask_intervention_rate",
     "fsm_dead_end_count",
     "fsm_legal_mass_mean",
+    "task_capability_score",
+    "task_capability_score_coverage",
+    "task_control_score",
+    "task_realization_score",
+    "structure_control_score",
+    "local_development_score",
+    "long_context_coherence_score",
+    "infilling_consistency_score",
+    "vs_baseline_win_rate",
 )
+
+_BENCHMARK_OVERALL_PRIMARY_FIELDS = (
+    "task_capability_score",
+    "task_control_score",
+    "task_realization_score",
+    "structure_control_score",
+    "local_development_score",
+    "long_context_coherence_score",
+    "infilling_consistency_score",
+    "vs_baseline_win_rate",
+)
+
+_BENCHMARK_OVERALL_LEGACY_FLAT_KEYS = {
+    "balanced_score",
+    "balanced_score_coverage",
+    "balanced_score_breakdown",
+    "absolute_score_version",
+    "absolute_score",
+    "absolute_score_coverage",
+    "absolute_score_proxy_dimension_count",
+    "absolute_score_proxy_dimensions",
+    "absolute_score_missing_dimensions",
+    "absolute_score_breakdown",
+}
 
 
 def _to_finite_float(value: Any) -> float | None:
@@ -350,6 +388,152 @@ def _leaderboard_metric_keys(profile_spec: dict[str, Any]) -> list[str]:
     return keys
 
 
+def _primary_score_breakdown_for_result(
+    result: dict[str, Any],
+    *,
+    profile: str,
+    primary_score_key: str,
+) -> Any:
+    """返回主分拆解；任务型 profile 优先使用 task_capability_score 拆解。"""
+    if primary_score_key == "task_capability_score":
+        return result.get(f"{primary_score_key}_breakdown")
+    return result.get("balanced_score_breakdown")
+
+
+def _selection_breakdown_for_result(
+    result: dict[str, Any],
+    *,
+    profile: str,
+    primary_score_key: str,
+    primary_score_coverage_key: str | None,
+    primary_score_comparison_digits: int | None,
+    tie_breakers: list[tuple[str, str]],
+) -> Any:
+    """返回主排序解释；任务型 profile 不再把 balanced_score_breakdown 当主入口。"""
+    if primary_score_key != "task_capability_score":
+        return result.get("balanced_score_breakdown")
+
+    tie_breaker_rows: list[dict[str, Any]] = []
+    for metric_key, goal in tie_breakers:
+        tie_breaker_rows.append(
+            {
+                "metric_key": metric_key,
+                "goal": goal,
+                "value": result.get(metric_key),
+            }
+        )
+
+    return {
+        "ranking_basis": primary_score_key,
+        "primary_score": result.get("primary_score"),
+        "primary_score_coverage_key": primary_score_coverage_key,
+        "primary_score_coverage": result.get("primary_score_coverage"),
+        "primary_score_comparison_digits": primary_score_comparison_digits,
+        "tie_breakers": tie_breaker_rows,
+        "gate_passed": result.get("gate_passed"),
+        "gate_failed_reasons": result.get("gate_failed_reasons"),
+    }
+
+
+def _legacy_score_fields_for_result(result: dict[str, Any], *, profile: str) -> dict[str, Any]:
+    """返回旧分数字段兼容容器，避免 benchmark_overall 继续把旧字段当主骨架。"""
+    legacy_fields = {
+        "balanced_score": result.get("balanced_score"),
+        "balanced_rank": result.get("balanced_rank"),
+        "balanced_score_coverage": result.get("balanced_score_coverage"),
+        "balanced_score_breakdown": result.get("balanced_score_breakdown"),
+        "absolute_score_version": result.get("absolute_score_version"),
+        "absolute_score": result.get("absolute_score"),
+        "absolute_score_coverage": result.get("absolute_score_coverage"),
+        "absolute_score_proxy_dimension_count": result.get("absolute_score_proxy_dimension_count"),
+        "absolute_score_proxy_dimensions": result.get("absolute_score_proxy_dimensions"),
+        "absolute_score_missing_dimensions": result.get("absolute_score_missing_dimensions"),
+        "absolute_score_breakdown": result.get("absolute_score_breakdown"),
+    }
+    if profile != "benchmark_overall":
+        return {}
+    return {
+        key: value
+        for key, value in legacy_fields.items()
+        if value is not None
+    }
+
+
+def _primary_score_sort_value(result: dict[str, Any], primary_score_key: str) -> float:
+    """返回主排序分数字段对应的可排序值。"""
+    return _transform_for_sort(result.get(primary_score_key), "max")
+
+
+def _sortable_primary_score(
+    result: dict[str, Any],
+    primary_score_key: str,
+    primary_score_coverage_key: str | None,
+) -> tuple[bool, float, float]:
+    """返回结果是否具备可排序主分，以及主分和 coverage 数值。"""
+    primary_score = _to_finite_float(result.get(primary_score_key))
+    if primary_score is None:
+        return False, float("nan"), float("nan")
+
+    coverage = 1.0
+    if primary_score_coverage_key:
+        coverage_value = _to_finite_float(result.get(primary_score_coverage_key))
+        if coverage_value is not None:
+            coverage = coverage_value
+    return True, primary_score, coverage
+
+
+def _normalized_primary_score_for_comparison(primary_score: float) -> float:
+    """把主分规整到可比较尺度，兼容 0-1 与 0-100 两种输入。"""
+    if abs(primary_score) > 1.0:
+        return primary_score / 100.0
+    return primary_score
+
+
+def _sort_key_for_result(
+    result: dict[str, Any],
+    *,
+    profile: str,
+    primary_score_key: str,
+    primary_score_coverage_key: str | None,
+    primary_score_comparison_digits: int | None,
+    tie_breakers: list[tuple[str, str]],
+) -> tuple[Any, ...]:
+    """生成排序键，benchmark_overall 会显式把 coverage 纳入主排序语义。"""
+    _has_primary_score, primary_score, primary_score_coverage = _sortable_primary_score(
+        result,
+        primary_score_key,
+        primary_score_coverage_key,
+    )
+    if profile == "benchmark_overall":
+        comparable_primary = float("-inf")
+        if math.isfinite(primary_score):
+            digits = 3 if primary_score_comparison_digits is None else primary_score_comparison_digits
+            comparable_primary = round(_normalized_primary_score_for_comparison(primary_score), digits)
+        return (
+            comparable_primary,
+            primary_score_coverage,
+            primary_score,
+            *[_transform_for_sort(result.get(metric_key), goal) for metric_key, goal in tie_breakers],
+        )
+
+    if primary_score_coverage_key is not None:
+        comparable_primary = float("-inf")
+        if math.isfinite(primary_score):
+            digits = 3 if primary_score_comparison_digits is None else primary_score_comparison_digits
+            comparable_primary = round(_normalized_primary_score_for_comparison(primary_score), digits)
+        return (
+            comparable_primary,
+            primary_score_coverage,
+            primary_score,
+            *[_transform_for_sort(result.get(metric_key), goal) for metric_key, goal in tie_breakers],
+        )
+
+    return (
+        _transform_for_sort(result.get(primary_score_key), "max"),
+        *[_transform_for_sort(result.get(metric_key), goal) for metric_key, goal in tie_breakers],
+    )
+
+
 def score_checkpoint_results(
     results: list[dict[str, Any]],
     *,
@@ -360,6 +544,13 @@ def score_checkpoint_results(
         raise ValueError(f"Unsupported checkpoint selection profile: {profile}")
 
     profile_spec = _PROFILE_SPECS[profile]
+    primary_score_key = str(profile_spec.get("primary_score_key", "balanced_score"))
+    primary_score_coverage_key_value = profile_spec.get("primary_score_coverage_key")
+    primary_score_coverage_key = (
+        str(primary_score_coverage_key_value) if primary_score_coverage_key_value is not None else None
+    )
+    primary_score_comparison_digits = profile_spec.get("primary_score_comparison_digits")
+    selection_version = str(profile_spec.get("selection_version", "balanced_v7_expression_first"))
     metric_specs = list(profile_spec["metrics"])
     gate_specs = list(profile_spec.get("gates", []))
     total_weight = sum(float(spec["weight"]) for spec in metric_specs)
@@ -414,7 +605,18 @@ def score_checkpoint_results(
     gated_sortable: list[dict[str, Any]] = []
     fallback_sortable: list[dict[str, Any]] = []
     for result in enriched_results:
-        if _to_finite_float(result.get("balanced_score")) is None:
+        has_primary_score, primary_score, primary_score_coverage = _sortable_primary_score(
+            result,
+            primary_score_key,
+            primary_score_coverage_key,
+        )
+        has_balanced_score = _to_finite_float(result.get("balanced_score")) is not None
+        result["primary_score"] = primary_score if has_primary_score else None
+        result["primary_score_coverage"] = primary_score_coverage if has_primary_score else None
+        if profile == "benchmark_overall":
+            if not has_primary_score:
+                continue
+        elif not has_primary_score and not has_balanced_score:
             continue
         fallback_sortable.append(result)
         if bool(result.get("gate_passed")):
@@ -423,9 +625,13 @@ def score_checkpoint_results(
     sortable = gated_sortable if gated_sortable else fallback_sortable
     tie_breakers = list(profile_spec.get("tie_breakers", []))
     sortable.sort(
-        key=lambda item: (
-            _transform_for_sort(item.get("balanced_score"), "max"),
-            *[_transform_for_sort(item.get(metric_key), goal) for metric_key, goal in tie_breakers],
+        key=lambda item: _sort_key_for_result(
+            item,
+            profile=profile,
+            primary_score_key=primary_score_key,
+            primary_score_coverage_key=primary_score_coverage_key,
+            primary_score_comparison_digits=primary_score_comparison_digits,
+            tie_breakers=tie_breakers,
         ),
         reverse=True,
     )
@@ -440,6 +646,20 @@ def score_checkpoint_results(
     metric_weights = {str(spec["key"]): float(spec["weight"]) for spec in metric_specs}
     leaderboard = []
     for result in sortable:
+        primary_score_breakdown = _primary_score_breakdown_for_result(
+            result,
+            profile=profile,
+            primary_score_key=primary_score_key,
+        )
+        selection_breakdown = _selection_breakdown_for_result(
+            result,
+            profile=profile,
+            primary_score_key=primary_score_key,
+            primary_score_coverage_key=primary_score_coverage_key,
+            primary_score_comparison_digits=primary_score_comparison_digits,
+            tie_breakers=tie_breakers,
+        )
+        legacy_score_fields = _legacy_score_fields_for_result(result, profile=profile)
         row = {
             "rank": int(result["balanced_rank"]),
             "checkpoint_name": result.get("checkpoint_name"),
@@ -447,43 +667,82 @@ def score_checkpoint_results(
             "step": result.get("step"),
             "task_scope": result.get("task_scope"),
             "evaluation_tier": result.get("evaluation_tier"),
-            "balanced_score": result.get("balanced_score"),
-            "balanced_score_coverage": result.get("balanced_score_coverage"),
+            "primary_score_key": primary_score_key,
+            "primary_score": result.get("primary_score"),
+            "primary_score_coverage": result.get("primary_score_coverage"),
+            "primary_score_breakdown": primary_score_breakdown,
+            "selection_breakdown": selection_breakdown,
+            "task_capability_score": result.get("task_capability_score"),
+            "task_capability_score_breakdown": result.get("task_capability_score_breakdown"),
+            "task_control_score": result.get("task_control_score"),
+            "task_realization_score": result.get("task_realization_score"),
+            "structure_control_score": result.get("structure_control_score"),
+            "local_development_score": result.get("local_development_score"),
+            "long_context_coherence_score": result.get("long_context_coherence_score"),
+            "infilling_consistency_score": result.get("infilling_consistency_score"),
+            "vs_baseline_win_rate": result.get("vs_baseline_win_rate"),
             "gate_passed": result.get("gate_passed"),
             "gate_failed_reasons": result.get("gate_failed_reasons"),
             "gate_details": result.get("gate_details"),
-            "balanced_score_breakdown": result.get("balanced_score_breakdown"),
         }
         for key in leaderboard_metric_keys:
             if key in row:
                 continue
+            if profile == "benchmark_overall" and key in _BENCHMARK_OVERALL_LEGACY_FLAT_KEYS:
+                continue
             row[key] = result.get(key)
+        row["legacy_score_fields"] = legacy_score_fields
+        row["compatibility_only"] = bool(legacy_score_fields)
         leaderboard.append(row)
 
     recommended: dict[str, Any] | None = None
     if sortable:
         top = sortable[0]
+        legacy_score_fields = _legacy_score_fields_for_result(top, profile=profile)
         recommended = {
             "checkpoint_name": top.get("checkpoint_name"),
             "checkpoint_path": top.get("checkpoint_path"),
             "step": top.get("step"),
             "task_scope": top.get("task_scope"),
             "evaluation_tier": top.get("evaluation_tier"),
-            "balanced_score": top.get("balanced_score"),
-            "balanced_rank": top.get("balanced_rank"),
-            "balanced_score_coverage": top.get("balanced_score_coverage"),
-            "gate_passed": top.get("gate_passed"),
-            "gate_details": top.get("gate_details"),
-            "score_breakdown": top.get("balanced_score_breakdown"),
+            "primary_score_key": primary_score_key,
+            "primary_score": top.get("primary_score"),
+            "primary_score_coverage": top.get("primary_score_coverage"),
+            "primary_score_breakdown": _primary_score_breakdown_for_result(
+                top,
+                profile=profile,
+                primary_score_key=primary_score_key,
+            ),
+            "selection_breakdown": _selection_breakdown_for_result(
+                top,
+                profile=profile,
+                primary_score_key=primary_score_key,
+                primary_score_coverage_key=primary_score_coverage_key,
+                primary_score_comparison_digits=primary_score_comparison_digits,
+                tie_breakers=tie_breakers,
+            ),
         }
+        for key in _BENCHMARK_OVERALL_PRIMARY_FIELDS:
+            recommended[key] = top.get(key)
+        recommended["task_capability_score_breakdown"] = top.get("task_capability_score_breakdown")
+        recommended["gate_passed"] = top.get("gate_passed")
+        recommended["gate_details"] = top.get("gate_details")
+        recommended["gate_failed_reasons"] = top.get("gate_failed_reasons")
+        if profile != "benchmark_overall":
+            recommended["score_breakdown"] = top.get("balanced_score_breakdown")
         for key in leaderboard_metric_keys:
             if key not in recommended:
+                if profile == "benchmark_overall" and key in _BENCHMARK_OVERALL_LEGACY_FLAT_KEYS:
+                    continue
                 recommended[key] = top.get(key)
+        recommended["legacy_score_fields"] = legacy_score_fields
+        recommended["compatibility_only"] = bool(legacy_score_fields)
 
     selection = {
         "profile": profile,
         "display_name": profile_spec["display_name"],
-        "selection_version": "balanced_v7_expression_first",
+        "selection_version": selection_version,
+        "primary_score_key": primary_score_key,
         "gate_metrics": gate_specs,
         "gate_enabled": bool(gate_specs),
         "eligible_checkpoint_count": len(sortable),

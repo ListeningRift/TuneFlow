@@ -377,17 +377,153 @@ def build_infilling_case(
     }
 
 
+def build_structure_control_case(
+    source_tokens: list[str],
+    *,
+    max_positions: int,
+    min_prefix_tokens: int,
+    prefix_ratio_min: float,
+    prefix_ratio_max: float,
+    seed: int,
+) -> dict[str, Any] | None:
+    """基于 continuation case 构造结构控制任务样本。"""
+    base_case = build_continuation_case(
+        source_tokens,
+        max_positions=max_positions,
+        min_prefix_tokens=min_prefix_tokens,
+        prefix_ratio_min=prefix_ratio_min,
+        prefix_ratio_max=prefix_ratio_max,
+        seed=seed,
+    )
+    if base_case is None:
+        return None
+
+    target_core = [token for token in base_case["target_tokens"] if token != "EOS"]
+    boundary_label = "start_new_phrase" if target_core and target_core[0] == "PHRASE" else "continue_inside_phrase"
+    return {
+        **base_case,
+        "task_name": "structure_control",
+        "boundary_label": boundary_label,
+    }
+
+
+def build_local_development_case(
+    source_tokens: list[str],
+    *,
+    max_positions: int,
+    min_prefix_tokens: int,
+    prefix_ratio_min: float,
+    prefix_ratio_max: float,
+    seed: int,
+) -> dict[str, Any] | None:
+    """基于 continuation case 构造局部展开任务样本。"""
+    base_case = build_continuation_case(
+        source_tokens,
+        max_positions=max_positions,
+        min_prefix_tokens=min_prefix_tokens,
+        prefix_ratio_min=prefix_ratio_min,
+        prefix_ratio_max=prefix_ratio_max,
+        seed=seed,
+    )
+    if base_case is None:
+        return None
+
+    return {
+        **base_case,
+        "task_name": "local_development",
+        "development_label": "develop",
+    }
+
+
+def build_long_context_case(
+    source_tokens: list[str],
+    *,
+    max_positions: int,
+    min_prefix_tokens: int,
+    prefix_ratio_min: float,
+    prefix_ratio_max: float,
+    seed: int,
+) -> dict[str, Any] | None:
+    """基于 continuation case 构造长上下文续写任务样本。"""
+    base_case = build_continuation_case(
+        source_tokens,
+        max_positions=max_positions,
+        min_prefix_tokens=min_prefix_tokens,
+        prefix_ratio_min=max(float(prefix_ratio_min), 0.60),
+        prefix_ratio_max=max(float(prefix_ratio_max), 0.85),
+        seed=seed,
+    )
+    if base_case is None:
+        return None
+
+    return {
+        **base_case,
+        "task_name": "long_context_coherence",
+        "section_label": "continue_section",
+    }
+
+
+def build_infilling_consistency_case(
+    source_tokens: list[str],
+    *,
+    max_positions: int,
+    hole_ratio_min: float,
+    hole_ratio_max: float,
+    seed: int,
+) -> dict[str, Any] | None:
+    """基于 infilling case 构造补全一致性任务样本。"""
+    base_case = build_infilling_case(
+        source_tokens,
+        max_positions=max_positions,
+        hole_ratio_min=hole_ratio_min,
+        hole_ratio_max=hole_ratio_max,
+        seed=seed,
+    )
+    if base_case is None:
+        return None
+
+    target_hole_tokens = list(base_case["target_hole_tokens"])
+    structure_label = "across_boundary" if target_hole_tokens and target_hole_tokens[0] in {"BAR", "PHRASE"} else "inside_phrase"
+    return {
+        **base_case,
+        "task_name": "infilling_consistency",
+        "structure_label": structure_label,
+    }
+
+
+def _required_task_case_keys(task_scope: str) -> tuple[str, ...]:
+    """返回指定 benchmark scope 真正必须成功构造的任务 case 键。"""
+    if task_scope == "continuation":
+        return (
+            "structure_control_case",
+            "local_development_case",
+            "long_context_case",
+        )
+    if task_scope == "infilling":
+        return ("infilling_consistency_case",)
+    if task_scope == "all":
+        return (
+            "structure_control_case",
+            "local_development_case",
+            "long_context_case",
+            "infilling_consistency_case",
+        )
+    raise ValueError(f"Unsupported benchmark task_scope: {task_scope}")
+
+
 def build_benchmark_manifest(
     *,
     eval_jsonl_path: Path,
     eval_tok_path: Path,
     config: dict[str, Any],
     max_positions: int,
+    task_scope: str = "all",
 ) -> dict[str, Any]:
     """构建可复现的 benchmark manifest。"""
     rows = load_eval_rows(eval_jsonl_path, eval_tok_path)
     note_thresholds = _quartile_thresholds([float(row["meta"]["note_count"]) for row in rows])
     duration_thresholds = _quartile_thresholds([float(row["meta"]["duration_sec"]) for row in rows])
+    required_task_case_keys = set(_required_task_case_keys(task_scope))
 
     valid_cases: list[dict[str, Any]] = []
     for row in rows:
@@ -396,7 +532,7 @@ def build_benchmark_manifest(
         note_bucket = _quartile_bucket(float(meta["note_count"]), note_thresholds)
         duration_bucket = _quartile_bucket(float(meta["duration_sec"]), duration_thresholds)
         bucket = _bucket_label(note_bucket, duration_bucket)
-        continuation_case = build_continuation_case(
+        structure_control_case = build_structure_control_case(
             tokens,
             max_positions=max_positions,
             min_prefix_tokens=int(config["min_prefix_tokens"]),
@@ -404,15 +540,59 @@ def build_benchmark_manifest(
             prefix_ratio_max=float(config["continuation_prefix_ratio_max"]),
             seed=int(config["seed"]) + (int(row["row_id"]) * 17) + 1,
         )
-        infilling_case = build_infilling_case(
+        local_development_case = build_local_development_case(
+            tokens,
+            max_positions=max_positions,
+            min_prefix_tokens=int(config["min_prefix_tokens"]),
+            prefix_ratio_min=float(config["continuation_prefix_ratio_min"]),
+            prefix_ratio_max=float(config["continuation_prefix_ratio_max"]),
+            seed=int(config["seed"]) + (int(row["row_id"]) * 17) + 3,
+        )
+        long_context_case = build_long_context_case(
+            tokens,
+            max_positions=max_positions,
+            min_prefix_tokens=int(config["min_prefix_tokens"]),
+            prefix_ratio_min=float(config["continuation_prefix_ratio_min"]),
+            prefix_ratio_max=float(config["continuation_prefix_ratio_max"]),
+            seed=int(config["seed"]) + (int(row["row_id"]) * 17) + 5,
+        )
+        infilling_consistency_case = build_infilling_consistency_case(
             tokens,
             max_positions=max_positions,
             hole_ratio_min=float(config["infilling_hole_ratio_min"]),
             hole_ratio_max=float(config["infilling_hole_ratio_max"]),
             seed=int(config["seed"]) + (int(row["row_id"]) * 17) + 7,
         )
-        if continuation_case is None or infilling_case is None:
+        task_cases = {
+            "structure_control_case": structure_control_case,
+            "local_development_case": local_development_case,
+            "long_context_case": long_context_case,
+            "infilling_consistency_case": infilling_consistency_case,
+        }
+        if any(task_cases[case_key] is None for case_key in required_task_case_keys):
             continue
+
+        continuation_case = None
+        if structure_control_case is not None:
+            continuation_case = {
+                "prompt_tokens": list(structure_control_case["prompt_tokens"]),
+                "target_tokens": list(structure_control_case["target_tokens"]),
+                "prefix_len": int(structure_control_case["prefix_len"]),
+                "target_len": int(structure_control_case["target_len"]),
+                "window_tokens": list(structure_control_case["window_tokens"]),
+                "window_len": int(structure_control_case["window_len"]),
+            }
+        infilling_case = None
+        if infilling_consistency_case is not None:
+            infilling_case = {
+                "prompt_tokens": list(infilling_consistency_case["prompt_tokens"]),
+                "prefix_tokens": list(infilling_consistency_case["prefix_tokens"]),
+                "suffix_tokens": list(infilling_consistency_case["suffix_tokens"]),
+                "target_hole_tokens": list(infilling_consistency_case["target_hole_tokens"]),
+                "window_tokens": list(infilling_consistency_case["window_tokens"]),
+                "window_len": int(infilling_consistency_case["window_len"]),
+                "hole_len": int(infilling_consistency_case["hole_len"]),
+            }
 
         valid_cases.append(
             {
@@ -430,6 +610,10 @@ def build_benchmark_manifest(
                 },
                 "continuation_case": continuation_case,
                 "infilling_case": infilling_case,
+                "structure_control_case": structure_control_case,
+                "local_development_case": local_development_case,
+                "long_context_case": long_context_case,
+                "infilling_consistency_case": infilling_consistency_case,
             }
         )
 
@@ -1025,6 +1209,118 @@ def _infilling_boundary_time_order_stats(
     }
 
 
+def _clamp_score(value: float) -> float:
+    return max(0.0, min(1.0, float(value)))
+
+
+def _finite_score(value: Any) -> float | None:
+    """把可用分值统一转换成有限浮点数。"""
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(numeric):
+        return None
+    return numeric
+
+
+def _mean_score(
+    values: Sequence[Any],
+    *,
+    expected_count: int | None = None,
+    missing_value: float = 0.0,
+) -> float:
+    """对有限分数求均值，并允许把缺失证据按指定分值补齐。"""
+    numeric_values: list[float] = []
+    for value in values:
+        numeric = _finite_score(value)
+        if numeric is not None:
+            numeric_values.append(numeric)
+    if expected_count is None:
+        if not numeric_values:
+            return 0.0
+        return _clamp_score(sum(numeric_values) / float(len(numeric_values)))
+
+    normalized_expected_count = max(0, int(expected_count))
+    if normalized_expected_count <= 0:
+        return 0.0
+    missing_count = max(0, normalized_expected_count - len(numeric_values))
+    total_score = sum(numeric_values) + (float(missing_value) * float(missing_count))
+    denominator = max(normalized_expected_count, len(numeric_values), 1)
+    return _clamp_score(total_score / float(denominator))
+
+
+def _bool_hit(value: Any) -> float:
+    """把布尔型命中结果转换成 0/1 分值。"""
+    return 1.0 if bool(value) else 0.0
+
+
+def _normalized_l1_similarity(distance: Any) -> float:
+    """把 [0, 2] 区间附近的 L1 距离映射成 [0, 1] 相似度。"""
+    numeric = _finite_score(distance)
+    if numeric is None:
+        return 0.0
+    return _clamp_score(1.0 - max(0.0, numeric))
+
+
+def _pitch_span_similarity(generated_pitch_span: Any, target_pitch_span: Any) -> float:
+    """根据生成段与目标段的音高跨度差异估计相似度。"""
+    generated_value = _finite_score(generated_pitch_span)
+    target_value = _finite_score(target_pitch_span)
+    if generated_value is None or target_value is None:
+        return 0.0
+    scale = max(abs(generated_value), abs(target_value), 1.0)
+    return _clamp_score(1.0 - (abs(generated_value - target_value) / scale))
+
+
+def _boundary_kind(tokens: Sequence[str]) -> str | None:
+    """提取序列起始边界的结构类型。"""
+    first_unit = _extract_first_unit(tokens)
+    if first_unit is None:
+        return None
+    if first_unit[0] == "BAR":
+        return "bar"
+    if first_unit[0] == "PHRASE":
+        return "phrase"
+    return "event"
+
+
+def _first_event_position(tokens: Sequence[str]) -> int | None:
+    """提取序列中的首个事件位置，用于比较边界后的落点时序。"""
+    values = list(tokens)
+    idx = 0
+    while idx < len(values):
+        token = str(values[idx])
+        if token in {"BOS", "EOS", "FIM_HOLE", "FIM_MID", "BAR"}:
+            idx += 1
+            continue
+        if token.startswith("TEMPO_") or token.startswith("KEY_"):
+            idx += 1
+            continue
+        if token == "PHRASE":
+            if idx + 5 >= len(values):
+                return None
+            return _parse_prefixed_int(str(values[idx + 1]), "POS_")
+        if token.startswith("POS_"):
+            return _parse_prefixed_int(token, "POS_")
+        idx += 1
+    return None
+
+
+def _has_generated_content(
+    enriched: dict[str, Any],
+    *,
+    generated_len_key: str,
+    generated_event_count_key: str = "generated_event_count",
+) -> bool:
+    """判断当前任务输出是否包含足够的实际生成内容。"""
+    generated_len = _finite_score(enriched.get(generated_len_key))
+    if generated_len is not None and generated_len > 0.0:
+        return True
+    generated_event_count = _finite_score(enriched.get(generated_event_count_key))
+    return bool(generated_event_count is not None and generated_event_count > 0.0)
+
+
 def enrich_continuation_record(record: dict[str, Any], *, target_tokens: Sequence[str]) -> dict[str, Any]:
     """为 continuation decode 轨迹补充面向音乐的诊断字段。"""
     generated_analysis = analyze_token_sequence(record.get("generated_tokens", []))
@@ -1084,6 +1380,157 @@ def enrich_continuation_record(record: dict[str, Any], *, target_tokens: Sequenc
                 generated_analysis["duration_counts"],
                 target_analysis["duration_counts"],
             ),
+        }
+    )
+    return enriched
+
+
+def enrich_structure_control_record(record: dict[str, Any], *, target_tokens: Sequence[str]) -> dict[str, Any]:
+    """补充结构控制任务的任务级原始指标。"""
+    enriched = dict(record)
+    if "first_unit_match" not in enriched or "duration_bin_l1_distance" not in enriched:
+        enriched = enrich_continuation_record(enriched, target_tokens=target_tokens)
+    target_core = [token for token in target_tokens if token != "EOS"]
+    target_boundary_kind = _boundary_kind(target_core)
+    boundary_type_hit = _bool_hit(
+        _boundary_kind(enriched.get("generated_tokens", [])) == target_boundary_kind
+        and target_boundary_kind is not None
+    )
+    target_boundary_pos = _first_event_position(target_core)
+    boundary_timing_hit = _bool_hit(
+        _first_event_position(enriched.get("generated_tokens", [])) == target_boundary_pos
+        and target_boundary_pos is not None
+    )
+    post_boundary_realization_score = _mean_score(
+        [
+            boundary_type_hit,
+            boundary_timing_hit,
+            _bool_hit(enriched.get("first_unit_match")),
+        ]
+    )
+    enriched.update(
+        {
+            "boundary_type_hit": boundary_type_hit,
+            "boundary_timing_hit": boundary_timing_hit,
+            "post_boundary_realization_score": post_boundary_realization_score,
+        }
+    )
+    return enriched
+
+
+def enrich_local_development_record(record: dict[str, Any], *, target_tokens: Sequence[str]) -> dict[str, Any]:
+    """补充局部展开任务的任务级原始指标。"""
+    enriched = dict(record)
+    if "first_unit_match" not in enriched or "duration_bin_l1_distance" not in enriched:
+        enriched = enrich_continuation_record(enriched, target_tokens=target_tokens)
+    motif_relation_hit = _bool_hit(enriched.get("first_unit_match"))
+    copy_overuse_penalty = _mean_score(
+        [
+            enriched.get("event_ngram_repeat_ratio"),
+            enriched.get("rhythm_ngram_repeat_ratio"),
+            enriched.get("most_common_pitch_ratio"),
+            enriched.get("longest_same_pitch_run_ratio"),
+        ],
+        expected_count=4,
+        missing_value=1.0,
+    )
+    unrelated_drift_penalty = _mean_score(
+        [
+            1.0 - _normalized_l1_similarity(enriched.get("onset_position_l1_distance")),
+            1.0 - _normalized_l1_similarity(enriched.get("duration_bin_l1_distance")),
+            1.0 - _pitch_span_similarity(
+                enriched.get("generated_pitch_span"),
+                enriched.get("target_pitch_span"),
+            ),
+        ],
+        expected_count=3,
+        missing_value=1.0,
+    )
+    quality_score = _mean_score(
+        [
+            motif_relation_hit,
+            1.0 - copy_overuse_penalty,
+            1.0 - unrelated_drift_penalty,
+            enriched.get("pitch_diversity_score"),
+            enriched.get("rhythm_diversity_score"),
+        ],
+        expected_count=5,
+        missing_value=0.0,
+    )
+    enriched.update(
+        {
+            "motif_relation_hit": motif_relation_hit,
+            "copy_overuse_penalty": copy_overuse_penalty,
+            "unrelated_drift_penalty": unrelated_drift_penalty,
+            "quality_score": quality_score,
+        }
+    )
+    return enriched
+
+
+def enrich_long_context_record(record: dict[str, Any], *, target_tokens: Sequence[str]) -> dict[str, Any]:
+    """补充长上下文任务的任务级原始指标。"""
+    enriched = dict(record)
+    if "first_unit_match" not in enriched or "duration_bin_l1_distance" not in enriched:
+        enriched = enrich_continuation_record(enriched, target_tokens=target_tokens)
+    has_generated_content = _has_generated_content(enriched, generated_len_key="generated_len")
+    completion_rate = _bool_hit(enriched.get("stop_success") and has_generated_content)
+    theme_retention_score = (
+        _mean_score(
+            [
+                _normalized_l1_similarity(enriched.get("onset_position_l1_distance")),
+                _normalized_l1_similarity(enriched.get("duration_bin_l1_distance")),
+                _pitch_span_similarity(
+                    enriched.get("generated_pitch_span"),
+                    enriched.get("target_pitch_span"),
+                ),
+            ],
+            expected_count=3,
+            missing_value=0.0,
+        )
+        if has_generated_content
+        else 0.0
+    )
+    section_continuity_score = (
+        _mean_score(
+            [
+                _bool_hit(enriched.get("time_order_valid")),
+                _bool_hit(enriched.get("structural_match_without_eos")),
+                _bool_hit(enriched.get("first_unit_match")),
+            ],
+            expected_count=3,
+            missing_value=0.0,
+        )
+        if has_generated_content
+        else 0.0
+    )
+    degeneration_penalty = _mean_score(
+        [
+            enriched.get("same_pitch_overlap_rate"),
+            enriched.get("most_common_pitch_ratio"),
+            enriched.get("longest_same_pitch_run_ratio"),
+            enriched.get("event_ngram_repeat_ratio"),
+            enriched.get("rhythm_ngram_repeat_ratio"),
+            (
+                1.0 - float(enriched["pitch_diversity_score"])
+                if _finite_score(enriched.get("pitch_diversity_score")) is not None
+                else None
+            ),
+            (
+                1.0 - float(enriched["rhythm_diversity_score"])
+                if _finite_score(enriched.get("rhythm_diversity_score")) is not None
+                else None
+            ),
+        ],
+        expected_count=7,
+        missing_value=1.0,
+    )
+    enriched.update(
+        {
+            "completion_rate": completion_rate,
+            "theme_retention_score": theme_retention_score,
+            "section_continuity_score": section_continuity_score,
+            "degeneration_penalty": degeneration_penalty,
         }
     )
     return enriched
@@ -1155,6 +1602,79 @@ def enrich_infilling_record(record: dict[str, Any], *, target_hole_tokens: Seque
                 generated_analysis["duration_counts"],
                 target_analysis["duration_counts"],
             ),
+        }
+    )
+    return enriched
+
+
+def enrich_infilling_consistency_record(
+    record: dict[str, Any],
+    *,
+    target_hole_tokens: Sequence[str],
+) -> dict[str, Any]:
+    """补充补全一致性任务的任务级原始指标。"""
+    enriched = dict(record)
+    if "boundary_time_order_valid" not in enriched or "duration_bin_l1_distance" not in enriched:
+        enriched = enrich_infilling_record(enriched, target_hole_tokens=target_hole_tokens)
+    has_generated_content = _has_generated_content(
+        enriched,
+        generated_len_key="generated_middle_len",
+    )
+    bridge_validity = _bool_hit(
+        bool(enriched.get("is_structurally_valid"))
+        and bool(enriched.get("time_order_valid"))
+        and bool(enriched.get("internal_time_order_valid"))
+        and has_generated_content
+    )
+    boundary_compatibility_hit = _bool_hit(enriched.get("boundary_time_order_valid") and has_generated_content)
+    rhythmic_connection_score = (
+        _mean_score(
+            [
+                _normalized_l1_similarity(enriched.get("onset_position_l1_distance")),
+                _normalized_l1_similarity(enriched.get("duration_bin_l1_distance")),
+            ],
+            expected_count=2,
+            missing_value=0.0,
+        )
+        if has_generated_content
+        else 0.0
+    )
+    pitch_connection_score = (
+        _mean_score(
+            [
+                _pitch_span_similarity(
+                    enriched.get("generated_pitch_span"),
+                    enriched.get("target_pitch_span"),
+                ),
+                (
+                    1.0 - float(enriched["same_pitch_overlap_rate"])
+                    if _finite_score(enriched.get("same_pitch_overlap_rate")) is not None
+                    else None
+                ),
+            ],
+            expected_count=2,
+            missing_value=0.0,
+        )
+        if has_generated_content
+        else 0.0
+    )
+    structural_fit_score = _mean_score(
+        [
+            bridge_validity,
+            boundary_compatibility_hit,
+            rhythmic_connection_score,
+            pitch_connection_score,
+        ],
+        expected_count=4,
+        missing_value=0.0,
+    )
+    enriched.update(
+        {
+            "bridge_validity": bridge_validity,
+            "boundary_compatibility_hit": boundary_compatibility_hit,
+            "rhythmic_connection_score": rhythmic_connection_score,
+            "pitch_connection_score": pitch_connection_score,
+            "structural_fit_score": structural_fit_score,
         }
     )
     return enriched
